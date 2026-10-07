@@ -92,4 +92,43 @@ public class InlinedConstructorRecoveryTests
         Assert.That(InlinedConstructorRecovery.Recover(caller,allocation,shape=="ambiguous"?[template,template]:[template]),Is.False);
         Assert.That(call.Operands[0],Is.SameAs(f.Base));Assert.That(a.OpCode,Is.EqualTo(OpCode.Move));
     }
+
+    [Test]
+    public void EarlierBfsDefinitionOnAnotherPathIsNotAnAvailableArgument()
+    {
+        var f=Fixture();var template=InlinedConstructorRecovery.Extract(f.Ctor)!;
+        var caller=new InjectedMethodAnalysisContext(f.Type,"Caller",f.Ctor.ReturnType,MethodAttributes.Public|MethodAttributes.Static,[]);
+        var obj=Local("obj",f.Type);var p=Local("p",f.A.FieldType);
+        var allocation=new Instruction(0,OpCode.Newobj,obj,f.Type);
+        var call=new Instruction(1,OpCode.CallVoid,f.Base,obj);
+        var graph=new ISILControlFlowGraph([]);
+        var left=new Block{ID=2};var right=new Block{ID=3};var join=new Block{ID=4};
+        graph.Blocks.AddRange([left,right,join]);
+        graph.EntryBlock.Successors.AddRange([left,right]);left.Predecessors.Add(graph.EntryBlock);right.Predecessors.Add(graph.EntryBlock);
+        left.Successors.Add(join);right.Successors.Add(join);join.Predecessors.AddRange([left,right]);
+        join.Successors.Add(graph.ExitBlock);graph.ExitBlock.Predecessors.Add(join);
+        left.Instructions.Add(new(10,OpCode.Move,p,new Immediate(42)));
+        join.Instructions.AddRange([allocation,call,new(2,OpCode.Move,new FieldReference(f.A,obj,16),p),
+            new(3,OpCode.Move,new FieldReference(f.B,obj,20),new FloatLiteral(1.5f)),new(4,OpCode.Return)]);
+        caller.ControlFlowGraph=graph;
+        Assert.That(InlinedConstructorRecovery.Recover(caller,allocation,[template]),Is.False);
+        Assert.That(call.Operands[0],Is.SameAs(f.Base));
+    }
+
+    [Test]
+    public void LaterCounterUpdateDoesNotInvalidateTheCurrentArgumentValue()
+    {
+        var f=Fixture();var template=InlinedConstructorRecovery.Extract(f.Ctor)!;
+        var caller=new InjectedMethodAnalysisContext(f.Type,"Caller",f.Ctor.ReturnType,MethodAttributes.Public|MethodAttributes.Static,[]);
+        var obj=Local("obj",f.Type);var counter=Local("counter",f.A.FieldType);
+        var allocation=new Instruction(1,OpCode.Newobj,obj,f.Type);
+        var call=new Instruction(2,OpCode.CallVoid,f.Base,obj);
+        caller.ControlFlowGraph=new([new(0,OpCode.Move,counter,new Immediate(0)),allocation,call,
+            new(3,OpCode.Move,new FieldReference(f.A,obj,16),counter),
+            new(4,OpCode.Move,new FieldReference(f.B,obj,20),new FloatLiteral(1.5f)),
+            new(5,OpCode.Add,counter,counter,new Immediate(1)),new(6,OpCode.Return)]);
+        Assert.That(InlinedConstructorRecovery.Recover(caller,allocation,[template]),Is.True);
+        Assert.That(call.Operands[2],Is.SameAs(counter));
+        Assert.That(caller.ControlFlowGraph.Instructions.Any(i=>i.OpCode==OpCode.Add),Is.True);
+    }
 }

@@ -73,7 +73,7 @@ public static class InlinedConstructorRecovery
         while (current.Successors.Count == 1 && current.Successors[0].Predecessors.Count == 1
             && visited.Add(current.Successors[0]))
         { current = current.Successors[0]; scan.AddRange(current.Instructions); }
-        var dominance = new DominatorInfo(method.ControlFlowGraph);
+        DominatorInfo? dominance = null;
         var aliases = new HashSet<LocalVariable> {obj};
         Instruction? baseCall = null;
         var stores = new List<Instruction>();
@@ -89,7 +89,7 @@ public static class InlinedConstructorRecovery
             if (baseCall == null || instruction is not { OpCode: OpCode.Move, Operands: [FieldReference field, var value] }
                 || !aliases.Contains(field.Local) || field.Field.DeclaringType != type || field.Field.IsStatic
                 || stores.Any(s => ((FieldReference)s.Operands[0]).Field == field.Field)
-                || !AvailableBeforeAllocation(value, method, instructions, index, allocationBlock, dominance, aliases)) break;
+                || !AvailableBeforeAllocation(value, method, instructions, index, allocationBlock, ref dominance, aliases)) break;
             stores.Add(instruction);
             matches.Clear();
             foreach (var template in templates.Where(t => t.Constructor.DeclaringType == type && t.Assignments.Count == stores.Count))
@@ -117,15 +117,24 @@ public static class InlinedConstructorRecovery
 
     private static bool AvailableBeforeAllocation(IOperand value, MethodAnalysisContext method,
         List<Instruction> instructions, int allocationIndex, Block allocationBlock,
-        DominatorInfo dominance, ISet<LocalVariable> aliases)
+        ref DominatorInfo? dominance, ISet<LocalVariable> aliases)
     {
         if (value is Immediate or FloatLiteral or DoubleLiteral or StringLiteral) return true;
         if (value is not LocalVariable local || aliases.Contains(local)) return false;
         var definitions = instructions.Select((i,n)=>(i,n)).Where(x => ReferenceEquals(x.i.Destination,local)).ToList();
         if (definitions.Count == 0) return method.ParameterLocals.Contains(local);
-        if (definitions.Count != 1 || definitions[0].n >= allocationIndex) return false;
-        var definitionBlock = method.ControlFlowGraph!.Blocks.Single(b => b.Instructions.Contains(definitions[0].i));
-        return dominance.Dominates(definitionBlock, allocationBlock);
+        // A loop local can be assigned again AFTER initialization. We load its
+        // current value at allocation, not a frozen SSA version. The scanned
+        // initialization contains no writes to argument locals, so subsequent
+        // loop increments cannot change any value moved to the constructor call.
+        foreach (var definition in definitions.Where(d => d.n < allocationIndex))
+        {
+            var definitionBlock = method.ControlFlowGraph!.Blocks.Single(b => b.Instructions.Contains(definition.i));
+            if (definitionBlock == allocationBlock) return true;
+            dominance ??= new DominatorInfo(method.ControlFlowGraph);
+            if (dominance.Dominates(definitionBlock, allocationBlock)) return true;
+        }
+        return false;
     }
 
     private static bool SameValue(IOperand a, IOperand b) => ReferenceEquals(a,b) || (a,b) switch
