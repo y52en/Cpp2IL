@@ -600,6 +600,14 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
     public override ulong GetVirtualAddressOfPrimaryExecutableSection() => _elfSectionHeaderEntries.FirstOrDefault(s => s.Name == ".text")?.VirtualAddress ?? 0;
 
+    // Only pointer-sized aligned entries within a real .got section qualify.
+    // Arbitrary writable globals must never be frozen to their file contents.
+    public bool IsGlobalOffsetTableEntry(ulong address) => _elfSectionHeaderEntries.Any(section =>
+        section.Name == ".got" && section.Size >= (ulong)PointerSizeBytes
+        && address >= section.VirtualAddress
+        && address - section.VirtualAddress <= section.Size - (ulong)PointerSizeBytes
+        && (address - section.VirtualAddress) % (ulong)PointerSizeBytes == 0);
+
     public override ReadOnlySpan<byte> GetEntirePrimaryExecutableSection()
     {
         var primarySection = _elfSectionHeaderEntries.FirstOrDefault(s => s.Name == ".text");

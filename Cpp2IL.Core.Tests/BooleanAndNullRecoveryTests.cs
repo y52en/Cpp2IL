@@ -91,6 +91,23 @@ public class BooleanAndNullRecoveryTests
         Assert.That(result.Type, Is.SameAs(integer));
     }
 
+    [TestCase(0, true, 1)]
+    [TestCase(1, true, 0)]
+    [TestCase(2, true, 0)]
+    [TestCase(-1, true, 0)]
+    [TestCase(0, false, -1)]
+    [TestCase(1, false, -2)]
+    public void ConstantNot_SeparatesLogicalNegationFromBitwiseComplement(int input, bool boolean, int expected)
+    {
+        var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
+        var result = new LocalVariable("result", new Register(null, "result"), boolean ? types.SystemBooleanType : types.SystemInt32Type);
+        var instruction = new Instruction(0, OpCode.Not, result, Imm(input));
+        var context = Context([instruction, new(1, OpCode.Return)], result);
+        Assert.That(ConstantFolder.Run(context), Is.True);
+        Assert.That(instruction.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(instruction.Operands[1], Is.EqualTo(Imm(expected)));
+    }
+
     [TestCase(OpCode.CheckEqual, false, true)]
     [TestCase(OpCode.CheckEqual, true, true)]
     [TestCase(OpCode.CheckNotEqual, false, true)]

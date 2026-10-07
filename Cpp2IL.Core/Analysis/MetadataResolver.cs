@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -8,6 +9,7 @@ using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
+using LibCpp2IL.Elf;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -67,6 +69,14 @@ public static class MetadataResolver
     private static void ResolveMetadataUsages(MethodAnalysisContext method)
     {
         var libContext = method.AppContext.LibCpp2IlContext;
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+
+        ulong? ReadGot(ulong slot) => method.AppContext.Binary is ElfFile elf && elf.IsGlobalOffsetTableEntry(slot)
+            ? elf.ReadPointerAtVirtualAddress(slot) : null;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -80,7 +90,7 @@ public static class MetadataResolver
             {
                 MemoryOperand { Base: null, Index: null, Scale: 0 } memory => (ulong)memory.Addend,
                 Immediate immediate => immediate.UnsignedValue,
-                _ => 0ul,
+                _ => IndirectMetadataAddress(instruction.Operands[1], definitions, ReadGot) ?? 0ul,
             };
 
             if (address == 0)
@@ -121,6 +131,20 @@ public static class MetadataResolver
                 && method.AppContext.ResolveContextForField(fieldUsage.AsField()) is { DeclaringType.DeclaringAssembly: { } fieldAssembly } fieldContext)
                 instruction.SetOperand(1, new RuntimeFieldInfoAnalysisContext(fieldContext, fieldAssembly));
         }
+    }
+
+    // LDR pointer, [GOT slot]; LDR value, [pointer] loads a metadata usage,
+    // not the usage's address. Resolve only the second load; normal DCE can
+    // remove the first once dead. All returned addresses still need an exact
+    // authoritative metadata-usage match in ResolveMetadataUsages.
+    internal static ulong? IndirectMetadataAddress(IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, Func<ulong, ulong?> readGot)
+    {
+        if (operand is not MemoryOperand { Base: LocalVariable pointer, Index: null, Scale: 0, Addend: 0 }
+            || !definitions.TryGetValue(pointer, out var definition)
+            || definition is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null, Scale: 0 } slot] })
+            return null;
+        return readGot(unchecked((ulong)slot.Addend));
     }
 
     /// <summary>
