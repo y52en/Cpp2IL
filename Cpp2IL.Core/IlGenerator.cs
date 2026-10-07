@@ -506,13 +506,16 @@ public static class IlGenerator
                 // Float arithmetic on a promoted integer operand needs an explicit conversion, so both
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatArithmeticConversion(instruction);
+                var bitwiseType = instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
+                    && DestinationType(instruction.Operands[0]) is { FullName: "System.Int32" or "System.UInt32" } resultType
+                    ? resultType : null;
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine,
-                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual ? DestinationType(instruction.Operands[2]) : null);
+                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual ? DestinationType(instruction.Operands[2]) : bitwiseType);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
                 LoadOperand(instruction.Operands[2], method, locals, writeLine,
-                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual ? DestinationType(instruction.Operands[1]) : null);
+                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual ? DestinationType(instruction.Operands[1]) : bitwiseType);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 
@@ -645,6 +648,12 @@ public static class IlGenerator
 
         switch (operand)
         {
+            case Immediate { Value: > int.MaxValue and <= uint.MaxValue } mask
+                when expectedType is { FullName: "System.Int32" or "System.UInt32" }:
+                // An Int32 bitmask such as 0x80000000 is an I4 bit pattern,
+                // not an I8 operand merely because its unsigned spelling is positive.
+                instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)mask.Value));
+                break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
                 instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
                 break;

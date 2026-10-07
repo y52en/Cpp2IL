@@ -108,6 +108,34 @@ public class BooleanAndNullRecoveryTests
         Assert.That(instruction.Operands[1], Is.EqualTo(Imm(expected)));
     }
 
+    [TestCase(0x80000000L, false)]
+    [TestCase(0xffffffffL, false)]
+    [TestCase(0x100000000L, false)]
+    [TestCase(0x80000000L, true)]
+    public void BitwiseMask_RespectsDeclaredIntegerWidth(long mask, bool wide)
+    {
+        var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
+        var integer = wide ? types.SystemInt64Type : types.SystemInt32Type;
+        var input = new LocalVariable("input", new Register(null, "input"), integer);
+        var result = new LocalVariable("result", new Register(null, "result"), integer);
+        var context = Context([new(0, OpCode.And, result, input, Imm(mask)), new(1, OpCode.Return)], input, result);
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var corlib = new ModuleDefinition("mscorlib.dll");
+        var definition = new TypeDefinition("System", integer.Name, TypeAttributes.Public);
+        corlib.TopLevelTypes.Add(definition);
+        integer.PutExtraData("AsmResolverType", definition);
+        var type = new TypeDefinition("Cpp2IL.Core.Tests", "BitwiseMask", TypeAttributes.Public);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+        IlGenerator.GenerateIl(context, method);
+        var body = method.CilMethodBody!;
+        Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldc_I8), Is.EqualTo(wide || mask > uint.MaxValue));
+        if (!wide && mask <= uint.MaxValue)
+            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldc_I4 && i.Operand is int value && value == unchecked((int)mask)), Is.True);
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void ManagedByrefStore_WritesReferentAndPreservesPointer(bool reference)
