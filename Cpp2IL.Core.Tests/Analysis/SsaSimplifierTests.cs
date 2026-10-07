@@ -8,6 +8,37 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class SsaSimplifierTests
 {
+    [TestCase(false)]
+    [TestCase(true)]
+    public void AddressedSlotDefinitionSurvivesCopyPropagation(bool copied)
+    {
+        var slot = Local("slot");
+        var parameter = Local("param");
+        var move = new Instruction(0,OpCode.Move,slot,copied ? parameter : Imm(42));
+        var call = new Instruction(1,OpCode.CallVoid,Str("read-address"),new AddressOf(slot));
+        Run([move,call,new(2,OpCode.Return)],parameter);
+        Assert.That(move.OpCode,Is.EqualTo(OpCode.Move),"address refers to storage whose value must remain initialized");
+        Assert.That(((AddressOf)call.Operands[1]).Target,Is.SameAs(slot));
+    }
+
+    [TestCase("element")]
+    [TestCase("element-address")]
+    [TestCase("length")]
+    public void NestedArrayOperandKeepsDefinition(string shape)
+    {
+        var array = Local("array");
+        var parameter = Local("param");
+        var index = Local("index");
+        var element = new ArrayAccess(array,index);
+        IOperand value = shape=="length" ? new ArrayLength(array)
+            : shape=="element-address" ? new AddressOf(element) : element;
+        var copy = new Instruction(0,OpCode.Move,array,parameter);
+        var indexCopy = new Instruction(1,OpCode.Move,index,Imm(3));
+        Run([copy,indexCopy,new(2,OpCode.CallVoid,Str("consume"),value),new(3,OpCode.Return)],parameter);
+        Assert.That(copy.OpCode,Is.EqualTo(OpCode.Move));
+        if (shape!="length") Assert.That(indexCopy.OpCode,Is.EqualTo(OpCode.Move));
+    }
+
     private static LocalVariable Local(string name) => new(name, new Register(null, name));
 
     private static List<Instruction> Run(List<Instruction> instructions, params LocalVariable[] parameters)

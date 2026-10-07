@@ -128,6 +128,20 @@ public static class SsaSimplifier
                         case FieldReference field when field.Local is { } fieldLocal:
                             reads.Add(fieldLocal);
                             break;
+                        case AddressOf { Target: LocalVariable addressed }:
+                            reads.Add(addressed);
+                            break;
+                        case AddressOf { Target: ArrayAccess element }:
+                            reads.Add(element.Array);
+                            if (element.Index is LocalVariable elementIndex) reads.Add(elementIndex);
+                            break;
+                        case ArrayAccess access:
+                            reads.Add(access.Array);
+                            if (access.Index is LocalVariable index) reads.Add(index);
+                            break;
+                        case ArrayLength length:
+                            reads.Add(length.Array);
+                            break;
                     }
                 }
             }
