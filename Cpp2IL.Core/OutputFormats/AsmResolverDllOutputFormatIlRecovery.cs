@@ -9,6 +9,7 @@ using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AssetRipper.CIL;
 using Cpp2IL.Core.Extensions;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
@@ -35,6 +36,36 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         return base.BuildAssemblies(context);
     }
 
+    protected override void PrepareMethodBodies(ApplicationAnalysisContext context)
+    {
+        // Build immutable templates before parallel emission, which mutates/releases
+        // method graphs. Never analyze a constructor concurrently from a caller.
+        var count = 0;
+        foreach (var type in context.Assemblies.SelectMany(a => a.Types))
+        {
+            var templates = new List<InlinedConstructorRecovery.Template>();
+            if (type.IsValueType || type.BaseType?.FullName != "System.Object") continue;
+            foreach (var ctor in type.Methods.Where(m => m.Name == ".ctor" && !m.IsStatic
+                && m.UnderlyingPointer != 0 && m.Parameters.Count is > 0 and <= 8))
+            {
+                if (SkipAssemblyRecovery(type.DeclaringAssembly.Name + ".dll", ctor.UnderlyingPointer,
+                    Environment.GetEnvironmentVariable("CPP2IL_RECOVERY_INCLUDE_FRAMEWORKS") == "1")) continue;
+                try
+                {
+                    ctor.EnsureRawBytes();
+                    if (ctor.RawBytes.Length > 512) continue;
+                    ctor.Analyze();
+                    if (InlinedConstructorRecovery.Extract(ctor) is { } template) templates.Add(template);
+                }
+                catch { /* Unproved constructors remain unmodified and diagnostic. */ }
+                finally { ctor.ReleaseAnalysisData(); }
+            }
+            type.PutExtraData(InlinedConstructorRecovery.CacheKey, templates.ToArray());
+            count += templates.Count;
+        }
+        Logger.InfoNewline($"Prepared {count} pure field-initialization constructor templates.");
+    }
+
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
         var module = methodDefinition.DeclaringModule!;
@@ -59,6 +90,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             Interlocked.Increment(ref TotalMethodCount);
 
             methodContext.Analyze();
+
+            InlinedConstructorRecovery.Run(methodContext);
 
             if (methodContext.ConvertedIsil.Count == 0)
                 FillMethodBodyWithStub(methodDefinition);
