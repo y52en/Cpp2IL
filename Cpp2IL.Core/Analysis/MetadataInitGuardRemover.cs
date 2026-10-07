@@ -231,6 +231,7 @@ public static class MetadataInitGuardRemover
             switch (instruction.OpCode)
             {
                 case OpCode.Jump:
+                case OpCode.ConditionalJump:
                     break;
 
                 // Behind an initialized_and_no_error test the callee is the class initializer, even if we didn't resolve it.

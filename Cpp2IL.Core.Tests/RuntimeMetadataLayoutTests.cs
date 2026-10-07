@@ -110,4 +110,30 @@ public class RuntimeMetadataLayoutTests
         Assert.That(context.ControlFlowGraph!.Instructions.Contains(init), Is.EqualTo(!removed));
         Assert.That(context.ControlFlowGraph.Instructions.Contains(merge), Is.True, "application effects must remain");
     }
+
+    [TestCase(false, false, true)]
+    [TestCase(true, false, false)]
+    [TestCase(false, true, false)]
+    public void NestedCctorGuard_OnlyExcisesKnownInitWithoutApplicationEffects(bool managedCall, bool memoryStore, bool removed)
+    {
+        var owner = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType;
+        var klass = new LocalVariable("klass", new Register(null, "klass"), new RuntimeClassTypeAnalysisContext(owner, owner.DeclaringAssembly));
+        var flag = new LocalVariable("flag", new Register(null, "flag"));
+        var finished = new LocalVariable("finished", new Register(null, "finished"));
+        var merge = new Instruction(7, OpCode.CallVoid, new StringLiteral("managed-effect"));
+        var init = new Instruction(4, OpCode.CallVoid, new StringLiteral(managedCall ? "application-callback" : "il2cpp_runtime_class_init_actual"), klass);
+        var store = new Instruction(5, memoryStore ? OpCode.Move : OpCode.Nop);
+        if (memoryStore)
+            store.SetOperands(new MemoryOperand(klass, addend: 0x200), new Immediate(1));
+        var context = Context([
+            new(0, OpCode.And, flag, new MemoryOperand(klass, addend: 0x127), new Immediate(2)),
+            new(1, OpCode.ConditionalJump, merge, flag),
+            new(2, OpCode.CheckEqual, finished, new MemoryOperand(klass, addend: 0xD8), new Immediate(0)),
+            new(3, OpCode.ConditionalJump, merge, finished), init, store,
+            new(6, OpCode.Jump, merge), merge, new(8, OpCode.Return)
+        ], klass, flag, finished);
+        MetadataInitGuardRemover.Run(context.ControlFlowGraph!, Legacy.InitializedFlag);
+        Assert.That(context.ControlFlowGraph!.Instructions.Contains(init), Is.EqualTo(!removed));
+        Assert.That(context.ControlFlowGraph.Instructions.Contains(merge), Is.True);
+    }
 }
