@@ -125,5 +125,8 @@ public enum OpCode
     /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
-    Throw
+    Throw,
+
+    /// <summary>Tests op 3 against the type in op 2, storing the object or null in op 1.</summary>
+    IsInst
 }
