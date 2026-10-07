@@ -58,12 +58,18 @@ public static class ThrowHelperRecovery
         if (address == wanted)
             return true;
 
-        if (depth >= MaxRaiserDepth || !visited.Add(address))
+        if (depth >= MaxRaiserDepth || !visited.Add(address)
+            || !appContext.InstructionSet.HasExceptionWrapperShape(appContext, address))
             return false;
 
         var (_, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
 
-        return callTargets.Any(target => ReachesCall(appContext, target, wanted, depth + 1, visited));
+        // Only the last transport call can establish an unconditional raise.
+        // A function which merely calls a throwing routine along some path is not a raiser.
+        var last = callTargets.LastOrDefault();
+        var thunk = appContext.InstructionSet.GetThunkTarget(appContext, address);
+        return (thunk != 0 && ReachesCall(appContext, thunk, wanted, depth + 1, visited))
+            || (last != 0 && ReachesCall(appContext, last, wanted, depth + 1, visited));
     }
 
     private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address, int depth)
@@ -77,7 +83,14 @@ public static class ThrowHelperRecovery
         // Insert before recursing so a cycle terminates
         appContext.ThrowHelperNamesByAddress[address] = null;
 
+        if (!appContext.InstructionSet.HasExceptionWrapperShape(appContext, address))
+            return null;
+
         var (dataReferences, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
+
+        // Calls to managed application functions are not pure runtime transport.
+        if (callTargets.Any(target => appContext.MethodsByAddress.ContainsKey(target)))
+            return null;
 
         var name = FindExceptionName(appContext, dataReferences);
 
@@ -90,6 +103,8 @@ public static class ThrowHelperRecovery
                 if (name != null)
                     break;
             }
+            if (name == null && appContext.InstructionSet.GetThunkTarget(appContext, address) is var thunk && thunk != 0)
+                name = ResolveName(appContext, thunk, depth + 1);
         }
 
         appContext.ThrowHelperNamesByAddress[address] = name;

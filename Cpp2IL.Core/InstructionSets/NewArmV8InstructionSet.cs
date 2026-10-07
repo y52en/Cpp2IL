@@ -136,6 +136,57 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return (dataReferences, callTargets);
     }
 
+    public override bool HasExceptionWrapperShape(ApplicationAnalysisContext context, ulong address)
+    {
+        try
+        {
+            var raw = (int)context.Binary.MapVirtualAddressToRaw(address);
+            var content = context.Binary.GetRawBinaryContent();
+            if (raw <= 0 || raw >= content.Length) return false;
+            var bytes = content.Slice(raw, Math.Min(48 * 4, content.Length - raw));
+            var body = Disassembler.Disassemble(bytes, address, new(true, true, false)).ToList();
+            var keys = context.GetOrCreateKeyFunctionAddresses();
+            var raises = new HashSet<ulong> { keys.il2cpp_raise_exception, keys.il2cpp_vm_exception_raise,
+                keys.il2cpp_codegen_raise_exception };
+            raises.Remove(0);
+            return HasExceptionWrapperShape(body, raises);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    internal static bool HasExceptionWrapperShape(IReadOnlyList<Arm64Instruction> body, ISet<ulong> raises)
+    {
+        foreach (var instruction in body)
+        {
+            if (instruction.Mnemonic is Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB)
+                return true;
+            if (instruction.Mnemonic == Arm64Mnemonic.BL && raises.Contains(instruction.BranchTarget))
+                return true; // positively resolved non-returning runtime raise
+            if (instruction.Mnemonic == Arm64Mnemonic.B)
+                return instruction.MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL
+                    && instruction.BranchTarget != instruction.Address;
+            switch (instruction.Mnemonic)
+            {
+                case Arm64Mnemonic.STP or Arm64Mnemonic.STR or Arm64Mnemonic.STUR:
+                    if (instruction.MemBase != Arm64Register.X31)
+                        return false; // output/object/global mutation is application behavior
+                    break;
+                case Arm64Mnemonic.NOP or Arm64Mnemonic.ADR or Arm64Mnemonic.ADRP
+                    or Arm64Mnemonic.ADD or Arm64Mnemonic.SUB or Arm64Mnemonic.MOV
+                    or Arm64Mnemonic.MOVZ or Arm64Mnemonic.MOVK
+                    or Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR or Arm64Mnemonic.LDP
+                    or Arm64Mnemonic.BL:
+                    break;
+                default:
+                    return false; // conditional flow, indirect calls, unknown effects
+            }
+        }
+        return false; // a bounded scan with no terminal is incomplete evidence
+    }
+
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
     {
         var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer);
