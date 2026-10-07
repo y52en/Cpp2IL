@@ -10,6 +10,44 @@ public class InjectedCheckRemoverTests
 {
     private static Immediate Imm(long value) => new() { Value=value };
 
+    [TestCase(true, false, false)]
+    [TestCase(true, true, false)]
+    [TestCase(false, false, false)]
+    [TestCase(true, false, true)]
+    public void InvertedComparisonRequiresBooleanTypesAndPreservesPreThrowEffects(bool typed, bool copy, bool preThrowEffect)
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var exception=app.SystemTypes.SystemExceptionType.DeclaringAssembly.GetTypeByFullName("System.NullReferenceException")!;
+        var value=new LocalVariable("value",new Register(null,"value"),app.SystemTypes.SystemObjectType);
+        var cmp=new LocalVariable("cmp",new Register(null,"cmp"),typed?app.SystemTypes.SystemBooleanType:null);
+        var cond=new LocalVariable("cond",new Register(null,"cond"),typed?app.SystemTypes.SystemBooleanType:null);
+        var forwarded=new LocalVariable("forwarded",new Register(null,"forwarded"),typed?app.SystemTypes.SystemBooleanType:null);
+        var check=new Instruction(0,OpCode.CheckEqual,cmp,value,Imm(0));
+        var invert=new Instruction(1,OpCode.Not,cond,cmp);
+        var throwing=new Instruction(5,OpCode.Throw,exception);
+        var success=new Instruction(8,OpCode.Return,value);
+        var jump=new Instruction(3,OpCode.ConditionalJump,success,copy?forwarded:cond);
+        var deadEffect=new Instruction(6,OpCode.Move,new MemoryOperand(value,null,24,0),Imm(2));
+        var beforeEffect=new Instruction(4,OpCode.Move,new MemoryOperand(value,null,16,0),Imm(1));
+        var list=new List<Instruction>{check,invert};
+        if(copy) list.Add(new(2,OpCode.Move,forwarded,cond));
+        list.Add(jump);
+        if(preThrowEffect) list.Add(beforeEffect);
+        list.AddRange([throwing,deadEffect,new(7,OpCode.Return),success]);
+        var graph=new ISILControlFlowGraph(list);
+        InjectedCheckRemover.Run(graph);
+        Assert.That(graph.Instructions.Contains(deadEffect),Is.False);
+        Assert.That(graph.Instructions.Contains(success),Is.True);
+        Assert.That(jump.OpCode,Is.EqualTo(typed&&!preThrowEffect?OpCode.Jump:OpCode.ConditionalJump));
+        if(preThrowEffect) Assert.That(graph.Instructions.Contains(beforeEffect),Is.True);
+        if(!typed||preThrowEffect)
+        {
+            var throwBlock=graph.Blocks.Single(b=>b.Instructions.Contains(throwing));
+            Assert.That(throwBlock.Successors,Is.EqualTo(new[]{graph.ExitBlock}));
+            Assert.That(throwBlock.BlockType,Is.EqualTo(BlockType.Return));
+        }
+    }
+
     [TestCase(true,false)]
     [TestCase(true,true)]
     [TestCase(false,false)]

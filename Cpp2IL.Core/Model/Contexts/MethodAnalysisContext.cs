@@ -409,6 +409,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         LocalVariables.ResolveTypesAndFields(this);
 
+        // Boolean Not/copy wrappers cannot safely be followed until types are resolved.
+        InjectedCheckRemover.Run(this);
+
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
         MetadataInitGuardRemover.RunRgctx(this);
 

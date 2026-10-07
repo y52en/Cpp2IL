@@ -9,10 +9,21 @@ namespace Cpp2IL.Core.Analysis;
 // Remove null and bounds checks which are explicit in il2cpp but implicit in IL
 public static class InjectedCheckRemover
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method)
+    {
+        if (System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_CHECK_RVA") is { } requested
+            && string.Equals(requested, method.UnderlyingPointer.ToString("X"), System.StringComparison.OrdinalIgnoreCase))
+        {
+            System.Console.Error.WriteLine("Injected-check CFG before removal: " + method.FullName);
+            foreach (var block in method.ControlFlowGraph!.Blocks)
+                System.Console.Error.WriteLine(block + "Successors: " + string.Join(",", block.Successors.Select(s=>s.ID)));
+        }
+        Run(method.ControlFlowGraph!);
+    }
 
     public static void Run(ISILControlFlowGraph cfg)
     {
+        NormalizeThrowTerminators(cfg);
         var defOf = BuildDefMap(cfg);
         var removedAny = false;
 
@@ -40,7 +51,7 @@ public static class InjectedCheckRemover
             var surviving = throwsWhenTrue ? fall : target;
 
             if (terminator.Operands[1] is not LocalVariable condition
-                || !defOf.TryGetValue(condition, out var definition)
+                || !TryResolveCondition(condition, defOf, ref throwsWhenTrue, out var definition)
                 || !IsInjectedCheck(definition, thrownType, throwsWhenTrue))
                 continue;
 
@@ -61,6 +72,50 @@ public static class InjectedCheckRemover
         // delete any throw blocks
         cfg.RemoveUnreachableBlocks();
         DeadCodeEliminator.Run(cfg);
+    }
+
+    // Metadata recovery turns non-returning native exception helpers into Throw.
+    // The native CFG was built earlier and may still contain a fallthrough edge
+    // and instructions after the helper. Only code AFTER the throw is dead.
+    private static void NormalizeThrowTerminators(ISILControlFlowGraph cfg)
+    {
+        foreach (var block in cfg.Blocks)
+        {
+            var index = block.Instructions.FindIndex(i => i.OpCode == OpCode.Throw);
+            if (index < 0) continue;
+            block.Instructions.RemoveRange(index + 1, block.Instructions.Count - index - 1);
+            foreach (var successor in block.Successors)
+                successor.Predecessors.Remove(block);
+            block.Successors.Clear();
+            block.Successors.Add(cfg.ExitBlock);
+            if (!cfg.ExitBlock.Predecessors.Contains(block)) cfg.ExitBlock.Predecessors.Add(block);
+            block.CalculateBlockType();
+        }
+        cfg.RemoveUnreachableBlocks();
+    }
+
+    private static bool TryResolveCondition(LocalVariable condition,
+        Dictionary<LocalVariable, Instruction> defs, ref bool throwsWhenTrue, out Instruction definition)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (visited.Add(condition) && defs.TryGetValue(condition, out var current))
+        {
+            if (current.OpCode is OpCode.Not or OpCode.Move
+                && current.Operands.Count == 2 && current.Operands[1] is LocalVariable source)
+            {
+                // Not also represents integer bitwise complement. Do not treat
+                // an untyped or integer operation as a logical inversion.
+                if (condition.Type?.FullName != "System.Boolean" || source.Type?.FullName != "System.Boolean")
+                    break;
+                if (current.OpCode == OpCode.Not) throwsWhenTrue = !throwsWhenTrue;
+                condition = source;
+                continue;
+            }
+            definition = current;
+            return true;
+        }
+        definition = null!;
+        return false;
     }
 
     private static bool IsInjectedCheck(Instruction definition, string thrownType, bool throwsWhenTrue) =>
