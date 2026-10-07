@@ -26,19 +26,31 @@ public static class InjectedCheckRemover
             if (terminator.OpCode != OpCode.ConditionalJump)
                 continue;
 
-            if (terminator.Operands[0] is not Block target || GetInjectedThrowType(target) is not { } thrownType)
+            if (terminator.Operands[0] is not Block target || block.Successors.Count != 2)
                 continue;
+
+            var fall = block.Successors.SingleOrDefault(s => !ReferenceEquals(s,target));
+            if (fall == null) continue;
+            var targetThrow = GetInjectedThrowType(target);
+            var fallThrow = GetInjectedThrowType(fall);
+            if ((targetThrow == null) == (fallThrow == null)) continue;
+            var throwsWhenTrue = targetThrow != null;
+            var thrownType = targetThrow ?? fallThrow!;
+            var throwing = throwsWhenTrue ? target : fall;
+            var surviving = throwsWhenTrue ? fall : target;
 
             if (terminator.Operands[1] is not LocalVariable condition
                 || !defOf.TryGetValue(condition, out var definition)
-                || !IsInjectedCheck(definition, thrownType))
+                || !IsInjectedCheck(definition, thrownType, throwsWhenTrue))
                 continue;
 
-            terminator.OpCode = OpCode.Nop;
-            terminator.SetOperands();
+            // Removing a fallthrough throw must still branch to the surviving
+            // target; simply nopping the branch would execute the throw.
+            terminator.OpCode = OpCode.Jump;
+            terminator.SetOperands(surviving);
 
-            block.Successors.Remove(target);
-            target.Predecessors.Remove(block);
+            block.Successors.Remove(throwing);
+            throwing.Predecessors.Remove(block);
             block.CalculateBlockType();
             removedAny = true;
         }
@@ -51,11 +63,13 @@ public static class InjectedCheckRemover
         DeadCodeEliminator.Run(cfg);
     }
 
-    private static bool IsInjectedCheck(Instruction definition, string thrownType) =>
+    private static bool IsInjectedCheck(Instruction definition, string thrownType, bool throwsWhenTrue) =>
         thrownType switch
         {
-            "System.NullReferenceException" => definition is { OpCode: OpCode.CheckEqual } && definition.Operands[2] is Immediate { Value: 0 },
-            "System.IndexOutOfRangeException" => definition.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual,
+            "System.NullReferenceException" => definition.Operands.Count == 3
+                && (definition.Operands[1] is Immediate { Value: 0 } || definition.Operands[2] is Immediate { Value: 0 })
+                && (throwsWhenTrue ? definition.OpCode == OpCode.CheckEqual : definition.OpCode == OpCode.CheckNotEqual),
+            "System.IndexOutOfRangeException" => throwsWhenTrue && definition.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual,
             _ => false
         };
 
