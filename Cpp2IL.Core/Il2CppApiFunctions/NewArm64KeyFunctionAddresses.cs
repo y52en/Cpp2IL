@@ -106,9 +106,14 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 
         // An icall wrapper may be a single unconditional tail branch. Follow
         // only that exact thunk, not arbitrary application calls or branches.
-        if (instructions.Count == 1 && instructions[0].Mnemonic == Arm64Mnemonic.B
-            && instructions[0].MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL)
+        var visited = new HashSet<ulong> { typeIsInstanceOfType.MethodPointer };
+        for (var depth = 0; depth < 8 && instructions.Count == 1 && instructions[0].Mnemonic == Arm64Mnemonic.B
+            && instructions[0].MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL; depth++)
+        {
+            if (!visited.Add(instructions[0].BranchTarget))
+                return 0;
             instructions = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(_appContext, instructions[0].BranchTarget, false);
+        }
 
         var target = FindIsInstAnchorCall(instructions);
         if (target == 0)
