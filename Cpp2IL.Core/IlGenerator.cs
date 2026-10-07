@@ -507,10 +507,12 @@ public static class IlGenerator
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatArithmeticConversion(instruction);
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                LoadOperand(instruction.Operands[1], method, locals, writeLine,
+                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual ? DestinationType(instruction.Operands[2]) : null);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
-                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                LoadOperand(instruction.Operands[2], method, locals, writeLine,
+                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual ? DestinationType(instruction.Operands[1]) : null);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 

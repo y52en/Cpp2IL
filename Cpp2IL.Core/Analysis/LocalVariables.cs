@@ -432,12 +432,30 @@ public static class LocalVariables
                     break;
                 case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
-                    changed |= PropagateIntegerResult(instruction, method);
+                    changed |= PropagateBooleanResult(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
             }
         }
 
         return changed;
+    }
+
+    // ARM flag temporaries are real 0/1 values. Excluding bool from integer
+    // inference is necessary, but leaving !flag / flag & flag untyped makes
+    // their CIL locals default to object and produces invalid CIL at branches.
+    private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method)
+    {
+        if (instruction.Operands[0] is not LocalVariable { Type: null } destination)
+            return false;
+
+        static bool Boolean(IOperand operand) => operand is LocalVariable { Type.FullName: "System.Boolean" };
+        static bool BooleanConstant(IOperand operand) => operand is Immediate { Value: 0 or 1 };
+
+        var isBoolean = instruction.OpCode == OpCode.Not && Boolean(instruction.Operands[1]);
+        if (instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor && instruction.Operands.Count == 3)
+            isBoolean = Boolean(instruction.Operands[1]) && (Boolean(instruction.Operands[2]) || BooleanConstant(instruction.Operands[2]))
+                || Boolean(instruction.Operands[2]) && BooleanConstant(instruction.Operands[1]);
+        return isBoolean && SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
     }
 
     // A local assigned a float/double literal (a lifted rodata constant load) is that float type
