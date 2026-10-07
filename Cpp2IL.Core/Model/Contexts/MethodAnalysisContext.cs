@@ -372,6 +372,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
         StackAnalyzer.Analyze(this);
+        BoxAddressRecovery.Run(this);
 
         // Dominator info must be computed after stack analysis, which removes unreachable/empty
         // blocks and would otherwise leave the dominator tree out of sync with the graph SSA sees.
