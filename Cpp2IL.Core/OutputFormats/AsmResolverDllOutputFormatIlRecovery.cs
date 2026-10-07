@@ -39,9 +39,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
     {
         var module = methodDefinition.DeclaringModule!;
         var moduleName = module.Name!.ToString();
-        var shouldSkip = moduleName.StartsWith("UnityEngine.") || moduleName.StartsWith("Unity.") ||
-                         moduleName.StartsWith("System.") || moduleName == "System" ||
-                         moduleName.StartsWith("mscorlib");
+        var shouldSkip = SkipAssemblyRecovery(moduleName, methodContext.UnderlyingPointer,
+            Environment.GetEnvironmentVariable("CPP2IL_RECOVERY_INCLUDE_FRAMEWORKS") == "1");
 
         if (!methodDefinition.IsManagedMethodWithBody())
             return;
@@ -98,6 +97,15 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         }
 
         methodContext.ReleaseAnalysisData();
+    }
+
+    // Explicit opt-in for native-backed framework methods only. A method
+    // without an original entry must remain a stub rather than fabricate IL.
+    internal static bool SkipAssemblyRecovery(string moduleName, ulong originalPointer, bool includeFrameworks)
+    {
+        var framework = moduleName.StartsWith("UnityEngine.") || moduleName.StartsWith("Unity.")
+            || moduleName.StartsWith("System.") || moduleName == "System" || moduleName.StartsWith("mscorlib");
+        return framework && !(includeFrameworks && originalPointer != 0);
     }
 
     public static void WriteControlFlowGraph(MethodAnalysisContext method, string outputPath)
