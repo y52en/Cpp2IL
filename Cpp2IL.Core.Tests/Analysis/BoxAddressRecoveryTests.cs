@@ -29,6 +29,7 @@ public class BoxAddressRecoveryTests
 
     [TestCase("unknown-call")]
     [TestCase("earlier-use")]
+    [TestCase("earlier-memory-use")]
     [TestCase("pointer-redefined")]
     [TestCase("intervening-call")]
     [TestCase("not-stack")]
@@ -41,6 +42,7 @@ public class BoxAddressRecoveryTests
         var address = new Instruction(0,OpCode.Move,pointer,new AddressOf(slot));
         var list = new List<Instruction>{address};
         if (shape=="earlier-use") list.Add(new(1,OpCode.Move,new Register(null,"copy"),pointer));
+        if (shape=="earlier-memory-use") list.Add(new(1,OpCode.Move,new Register(null,"copy"),new MemoryOperand(pointer,null,0,0)));
         if (shape=="pointer-redefined") list.Add(new(1,OpCode.Move,pointer,Imm(0)));
         if (shape=="intervening-call") list.Add(new(1,OpCode.Call,Imm(0x9999),result));
         if (shape!="no-store") list.Add(new(2,OpCode.Move,slot,Imm(42)));

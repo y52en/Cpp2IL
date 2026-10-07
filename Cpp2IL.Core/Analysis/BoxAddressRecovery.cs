@@ -37,7 +37,7 @@ public static class BoxAddressRecovery
                 for (var i = start + 1; i < instructions.Count; i++)
                 {
                     var instruction = instructions[i];
-                    if (instruction.Sources.Contains(pointer))
+                    if (instruction.Sources.Any(operand => ReadsPointer(operand,pointer)))
                     {
                         if (stored && instruction.OpCode == OpCode.Call
                             && instruction.Operands.Count >= 4
@@ -59,4 +59,13 @@ public static class BoxAddressRecovery
         }
         return changes;
     }
+
+    private static bool ReadsPointer(IOperand operand, Register pointer) => operand switch
+    {
+        Register register => register == pointer,
+        MemoryOperand memory => memory.Base is Register baseRegister && baseRegister == pointer
+            || memory.Index is Register indexRegister && indexRegister == pointer,
+        AddressOf address => ReadsPointer(address.Target,pointer),
+        _ => false
+    };
 }
