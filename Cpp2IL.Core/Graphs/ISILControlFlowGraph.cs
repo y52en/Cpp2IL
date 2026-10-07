@@ -84,6 +84,23 @@ public class ISILControlFlowGraph
         return false;
     }
 
+    // SSA Phi sources are indexed by the destination's predecessor list.
+    // Detaching just the edge silently associates later sources with the wrong path.
+    public void RemoveEdge(Block source, Block target)
+    {
+        var index = target.Predecessors.IndexOf(source);
+        if (index >= 0)
+        {
+            var phis = target.Instructions.Where(i => i.OpCode == OpCode.Phi).ToList();
+            foreach (var phi in phis)
+                if (phi.Operands.Count != target.Predecessors.Count + 1)
+                    throw new InvalidOperationException("Phi/predecessor identity mismatch before edge removal");
+            foreach (var phi in phis) phi.RemoveOperandAt(index + 1);
+            target.Predecessors.RemoveAt(index);
+        }
+        source.Successors.Remove(target);
+    }
+
     public void RemoveUnreachableBlocks()
     {
         if (Blocks.Count == 0)
@@ -122,10 +139,10 @@ public class ISILControlFlowGraph
             // Fully detach the block so no remaining block keeps a dangling reference to it.
             // (A reachable block can have an unreachable predecessor; leaving that reference
             // behind makes later passes such as dominator computation throw.)
-            foreach (var successor in block.Successors)
-                successor.Predecessors.Remove(block);
-            foreach (var predecessor in block.Predecessors)
-                predecessor.Successors.Remove(block);
+            foreach (var successor in block.Successors.ToArray())
+                RemoveEdge(block, successor);
+            foreach (var predecessor in block.Predecessors.ToArray())
+                RemoveEdge(predecessor, block);
 
             block.Successors.Clear();
             block.Predecessors.Clear();

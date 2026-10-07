@@ -60,8 +60,7 @@ public static class InjectedCheckRemover
             terminator.OpCode = OpCode.Jump;
             terminator.SetOperands(surviving);
 
-            block.Successors.Remove(throwing);
-            throwing.Predecessors.Remove(block);
+            cfg.RemoveEdge(block, throwing);
             block.CalculateBlockType();
             removedAny = true;
         }
@@ -84,8 +83,8 @@ public static class InjectedCheckRemover
             var index = block.Instructions.FindIndex(i => i.OpCode == OpCode.Throw);
             if (index < 0) continue;
             block.Instructions.RemoveRange(index + 1, block.Instructions.Count - index - 1);
-            foreach (var successor in block.Successors)
-                successor.Predecessors.Remove(block);
+            foreach (var successor in block.Successors.ToArray())
+                cfg.RemoveEdge(block, successor);
             block.Successors.Clear();
             block.Successors.Add(cfg.ExitBlock);
             if (!cfg.ExitBlock.Predecessors.Contains(block)) cfg.ExitBlock.Predecessors.Add(block);
