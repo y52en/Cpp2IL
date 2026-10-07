@@ -840,6 +840,7 @@ public static class IlGenerator
             LocalVariable local => local.Type,
             FieldReference field => field.Field.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            MemoryOperand { Base: LocalVariable { Type: ByRefTypeAnalysisContext reference }, Index: null, Scale: 0, Addend: 0 } => reference.ElementType,
             _ => null
         };
 
@@ -909,8 +910,19 @@ public static class IlGenerator
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
                 {
-                    // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
-                    instructions.Add(CilOpCodes.Stloc, locals[local2]);
+                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } referent })
+                    {
+                        var value = new CilLocalVariable(referent.ToTypeSignature());
+                        method.CilMethodBody!.LocalVariables.Add(value);
+                        instructions.Add(CilOpCodes.Stloc, value);
+                        LoadLocal(local2, method, locals);
+                        instructions.Add(CilOpCodes.Ldloc, value);
+                        instructions.Add(referent.IsValueType
+                            ? new CilInstruction(CilOpCodes.Stobj, referent.ToTypeSignature().ToTypeDefOrRef())
+                            : new CilInstruction(CilOpCodes.Stind_Ref));
+                    }
+                    else
+                        instructions.Add(CilOpCodes.Stloc, locals[local2]);
                     break;
                 }
                 instructions.Add(CilOpCodes.Pop);

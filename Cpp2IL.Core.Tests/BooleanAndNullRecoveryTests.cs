@@ -108,6 +108,35 @@ public class BooleanAndNullRecoveryTests
         Assert.That(instruction.Operands[1], Is.EqualTo(Imm(expected)));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void ManagedByrefStore_WritesReferentAndPreservesPointer(bool reference)
+    {
+        var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
+        var element = reference ? types.SystemObjectType : types.SystemInt32Type;
+        var pointer = new LocalVariable("output", new Register(null, "output"), new ByRefTypeAnalysisContext(element));
+        var context = Context([new(0, OpCode.Move, new MemoryOperand(pointer), Imm(0)), new(1, OpCode.Return)], pointer);
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var corlib = new ModuleDefinition("mscorlib.dll");
+        var elementDefinition = new TypeDefinition("System", element.Name, TypeAttributes.Public);
+        corlib.TopLevelTypes.Add(elementDefinition);
+        element.PutExtraData("AsmResolverType", elementDefinition);
+        var type = new TypeDefinition("Cpp2IL.Core.Tests", "ByrefStore", TypeAttributes.Public);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void,
+                [(reference ? module.CorLibTypeFactory.Object : module.CorLibTypeFactory.Int32).MakeByReferenceType()]));
+        type.Methods.Add(method);
+        method.ParameterDefinitions.Add(new ParameterDefinition(1, "output", ParameterAttributes.Out));
+        IlGenerator.GenerateIl(context, method);
+        var body = method.CilMethodBody!;
+        Assert.That(body.Instructions.Any(i => i.OpCode == (reference ? CilOpCodes.Stind_Ref : CilOpCodes.Stobj)), Is.True);
+        Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldarg), Is.True);
+        Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.EqualTo(reference));
+        Assert.That(body.Instructions.Where(i => i.OpCode == CilOpCodes.Stloc).All(i => i.Operand != body.LocalVariables[0]), Is.True,
+            "the byref local must not be replaced by the stored value");
+    }
+
     [TestCase(OpCode.CheckEqual, false, true)]
     [TestCase(OpCode.CheckEqual, true, true)]
     [TestCase(OpCode.CheckNotEqual, false, true)]
