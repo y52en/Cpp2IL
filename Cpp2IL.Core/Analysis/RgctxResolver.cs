@@ -12,11 +12,14 @@ namespace Cpp2IL.Core.Analysis;
 public static class RgctxResolver
 {
     public static bool Run(MethodAnalysisContext method)
+        => Run(method, RuntimeMetadataLayout.For(method));
+
+    internal static bool Run(MethodAnalysisContext method, RuntimeMetadataLayout layout)
     {
         var is32Bit = method.AppContext.Binary.is32Bit;
-        var klassOffset = is32Bit ? 0x10 : 0x20;
-        var rgctxOffset = is32Bit ? 0x60 : 0xC0;
-        var methodRgctxOffset = is32Bit ? 0x1C : 0x38; // MethodInfo::rgctx_data
+        var klassOffset = layout.MethodClass;
+        var rgctxOffset = layout.ClassRgctx;
+        var methodRgctxOffset = layout.MethodRgctx;
         var pointerSize = is32Bit ? 4 : 8;
 
         var changed = false;

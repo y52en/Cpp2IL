@@ -18,17 +18,8 @@ public static class MetadataInitGuardRemover
     private const string ClassInitActual = "il2cpp_runtime_class_init_actual";
     private const string ClassInitCodegen = "il2cpp_codegen_runtime_class_init";
 
-    // Byte holding Il2CppClass's bitfield, of which bit 0 is initialized_and_no_error.
-    // TODO this is almost certainly not correct on every version... but which?
-    private const long InitialisedFlagOffset64 = 0x135;
-    private const long InitialisedFlagOffset32 = 0xBD;
-
-    // Offset of MethodInfo::rgctx_data
-    private const long MethodRgctxOffset64 = 0x38;
-    private const long MethodRgctxOffset32 = 0x1C;
-
     public static void Run(MethodAnalysisContext method)
-        => Run(method.ControlFlowGraph!, method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64);
+        => Run(method.ControlFlowGraph!, RuntimeMetadataLayout.For(method).InitializedFlag);
 
     // Rewrite any metadata init calls we didn't remove into movs.
     public static void RewriteUnguardedInits(MethodAnalysisContext method)
@@ -47,7 +38,7 @@ public static class MetadataInitGuardRemover
     public static void RunRgctx(MethodAnalysisContext method)
     {
         var cfg = method.ControlFlowGraph!;
-        var rgctxOffset = method.AppContext.Binary.is32Bit ? MethodRgctxOffset32 : MethodRgctxOffset64;
+        var rgctxOffset = RuntimeMetadataLayout.For(method).MethodRgctx;
 
         var removedAny = false;
 
@@ -131,8 +122,8 @@ public static class MetadataInitGuardRemover
         // see if we're checking Il2CppClass::initialized_and_no_error
         // that means this is runtime_init boilerplate and we can drop the block
         var initialisedFlagTest = guard.Instructions.Any(i => i.OpCode == OpCode.And
-            && i.Operands is [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable } flag, { } mask]
-            && flag.Addend == initialisedFlagOffset && IsOne(mask));
+            && i.Operands is [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable klass } flag, { } mask]
+            && flag.Addend == initialisedFlagOffset && IsOne(mask) && IsRuntimeClassPointer(cfg, klass));
 
         // Either successor could be the init entry; the other is then the merge.
         var first = guard.Successors[0];
@@ -143,6 +134,25 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
+
+    private static bool IsRuntimeClassPointer(ISILControlFlowGraph cfg, LocalVariable local)
+    {
+        var seen = new HashSet<LocalVariable>();
+        while (seen.Add(local))
+        {
+            if (local.Type is RuntimeClassTypeAnalysisContext)
+                return true;
+            var definitions = cfg.Instructions.Where(i => ReferenceEquals(i.Destination, local)).ToList();
+            if (definitions.Count != 1 || definitions[0] is not { OpCode: OpCode.Move, Operands: [_, var source] })
+                return false;
+            if (source is TypeAnalysisContext and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext))
+                return true;
+            if (source is not LocalVariable copy)
+                return false;
+            local = copy;
+        }
+        return false;
+    }
 
     private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, bool initialisedFlagTest)
     {

@@ -55,7 +55,6 @@ public static class InterfaceDispatchRecovery
             DeadCodeEliminator.Run(method);
     }
 
-    private const long VTableOffset = 0x138;
     private const int InvokeDataShift = 4; // sizeof(VirtualInvokeData) == 16
 
     private record struct Match(
@@ -107,7 +106,7 @@ public static class InterfaceDispatchRecovery
         var slot = (int)slotImmediate.Value;
 
         // fast path computes klass + vtableOffset + ((entryOffset + slot) << 4) (the +slot folds away for slot 0)
-        if (MatchVTableEntryChain(definitions, vtableEntry, slot) is not { } klassLocal)
+        if (MatchVTableEntryChain(definitions, vtableEntry, slot, RuntimeMetadataLayout.For(method).VTable) is not { } klassLocal)
             return null;
 
         if (ResolveInterfaceSlot(declaringInterface, slot) is not { } resolved)
@@ -119,7 +118,7 @@ public static class InterfaceDispatchRecovery
         return new Match(resolved, phi, merge, slowCall, klassLocal);
     }
 
-    private static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions, Instruction? vtableEntry, int slot)
+    private static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions, Instruction? vtableEntry, int slot, long vtableOffset)
     {
         if (vtableEntry is not { OpCode: OpCode.Add, Operands: [_, LocalVariable addLeft, LocalVariable addRight] })
             return null;
@@ -131,7 +130,8 @@ public static class InterfaceDispatchRecovery
         if (Definition(definitions, klassCandidate) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] })
             return null;
 
-        if (ChaseCopies(definitions, sum) is not { OpCode: OpCode.Add, Operands: [_, LocalVariable shifted, Immediate { Value: VTableOffset }] })
+        if (ChaseCopies(definitions, sum) is not { OpCode: OpCode.Add, Operands: [_, LocalVariable shifted, Immediate tableOffset] }
+            || tableOffset.Value != vtableOffset)
             return null;
 
         if (ChaseCopies(definitions, shifted) is not { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: InvokeDataShift }] })

@@ -570,17 +570,15 @@ public static class MetadataResolver
         return changed;
     }
 
-    // Offset of Il2CppClass::vtable, VirtualInvokeData entries of {methodPtr, MethodInfo*}.
-    // TODO this is almost certainly not correct on every version
-    private const long VTableOffset64 = 0x138;
-    private const long VTableOffset32 = 0xC0;
-    
     // Resolves virtual dispatch through <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c>
     // as long as the klass local's represented type is known.
     public static bool ResolveVirtualCalls(MethodAnalysisContext method)
+        => ResolveVirtualCalls(method, RuntimeMetadataLayout.For(method));
+
+    internal static bool ResolveVirtualCalls(MethodAnalysisContext method, RuntimeMetadataLayout layout)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
-        var vtableOffset = pointerSize == 8 ? VTableOffset64 : VTableOffset32;
+        var vtableOffset = layout.VTable;
         var invokeDataSize = 2L * pointerSize;
         var changed = false;
 

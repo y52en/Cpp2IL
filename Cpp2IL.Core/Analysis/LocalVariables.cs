@@ -10,8 +10,6 @@ public static class LocalVariables
 {
     public static int MaxTypePropagationLoopCount = 5000;
 
-    private const long StaticFieldsOffset64 = 0xB8;
-    private const long StaticFieldsOffset32 = 0x5C;
 
     public static void CreateAll(MethodAnalysisContext method)
     {
@@ -385,7 +383,7 @@ public static class LocalVariables
 
     private static bool PropagateStaticFieldStorage(MethodAnalysisContext method)
     {
-        var staticFieldsOffset = method.AppContext.Binary.is32Bit ? StaticFieldsOffset32 : StaticFieldsOffset64;
+        var staticFieldsOffset = RuntimeMetadataLayout.For(method).StaticFields;
         var changed = false;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
