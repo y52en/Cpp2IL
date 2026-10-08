@@ -32,16 +32,36 @@ public static class WholeStructInitializationRecovery
         {
             if(!call.IsCall || call.Operands[0] is not Immediate address
                 || !method.AppContext.MethodsByAddress.TryGetValue(address.UnsignedValue,out var callees)
-                || callees.Count!=1 || callees[0] is not {IsStatic:false,DeclaringType.IsValueType:true} callee) continue;
+                || callees.Count!=1) continue;
+            var callee=callees[0];
             var first=call.OpCode==OpCode.CallVoid?1:2;
-            if(call.Operands.Count<=first) continue;
-            var storage=call.Operands[first] switch
+            var resolver=method.AppContext.InstructionSet.CallingConventionResolver!;
+            var raw=resolver.HasRawArgumentLayout(call,method.AppContext);
+            var managed=raw?resolver.ResolveForManaged(callee):null;
+            void AddTarget(int index,TypeAnalysisContext type)
             {
-                AddressOf {Target:Register direct}=>direct,
-                Register pointer=>HiddenStructReturnRecovery.ResolveStackAddress(block,block.Instructions.IndexOf(call),pointer),
-                _=>(Register?)null
-            };
-            if(storage is { } slot && Offset(slot,out _)) targets.Add((slot,callee.DeclaringType,block,call));
+                if(!type.IsValueType) return;
+                IOperand? operand=null;
+                if(raw)
+                {
+                    // Raw layouts have independent integer/floating registers;
+                    // metadata ordinal is not an index into that raw register list.
+                    if(index<managed!.Length && managed[index] is Register expected)
+                        operand=call.Operands.Skip(first).OfType<Register>().FirstOrDefault(r=>r.Name==expected.Name);
+                }
+                else if(first+index<call.Operands.Count) operand=call.Operands[first+index];
+                var storage=operand switch
+                {
+                    AddressOf {Target:Register direct}=>direct,
+                    Register pointer=>HiddenStructReturnRecovery.ResolveStackAddress(block,block.Instructions.IndexOf(call),pointer),
+                    _=>(Register?)null
+                };
+                if(storage is { } slot && Offset(slot,out _)) targets.Add((slot,type,block,call));
+            }
+            if(!callee.IsStatic && callee.DeclaringType is {IsValueType:true} receiver) AddTarget(0,receiver);
+            for(var p=0;p<callee.Parameters.Count;p++)
+                if(callee.Parameters[p].ParameterType is ByRefTypeAnalysisContext {ElementType:{IsValueType:true} referenced})
+                    AddTarget(p+(callee.IsStatic?0:1),referenced);
         }
         if(trace)foreach(var target in targets)System.Console.Error.WriteLine("Typed struct target: "+target.Storage+" "+target.Type.FullName);
         DominatorInfo? dominance=null;

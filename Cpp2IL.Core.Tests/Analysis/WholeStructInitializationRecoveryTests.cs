@@ -5,6 +5,7 @@ using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 using Disarm;
 using Disarm.InternalDisassembly;
 
@@ -12,6 +13,43 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class WholeStructInitializationRecoveryTests
 {
+    [TestCase("ref",true)]
+    [TestCase("value",false)]
+    [TestCase("objectref",false)]
+    [TestCase("ambiguous",false)]
+    [TestCase("raw_float_before_ref",true)]
+    public void ExactMetadataReferenceParametersEstablishStructStorage(string shape,bool expected)
+    {
+        var app=TestGameLoader.LoadSimple2019Game();app.InstructionSet=new NewArmV8InstructionSet();
+        var type=app.Assemblies.SelectMany(a=>a.Types).First(t=>t.IsValueType && TypeSizes.UnboxedSize(t,8)>16 && TypeSizes.UnboxedSize(t,8)<=128);
+        var owner=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,"Test","RefCalls",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        var parameter=shape=="value"?type:new ByRefTypeAnalysisContext(shape=="objectref"?app.SystemTypes.SystemObjectType:type);
+        var target=owner.InjectMethodContext("Consume",app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static,
+            shape=="raw_float_before_ref"?[app.SystemTypes.SystemSingleType,parameter]:[parameter]);
+        const ulong address=0xDEADBEEF;app.MethodsByAddress[address]=shape=="ambiguous"?[target,target]:[target];
+        var caller=owner.InjectMethodContext("Caller",app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static);
+        var root=new Register(null,"stack_-100");var instructions=new System.Collections.Generic.List<Instruction>();
+        var size=(int)TypeSizes.UnboxedSize(type,8);
+        for(var offset=0;offset<size;)
+        {
+            var width=size-offset>=8?8:1;
+            instructions.Add(new Instruction(instructions.Count,OpCode.Move,new Register(null,"stack_-"+(256-offset).ToString("X")),new Immediate(0)){NativeWriteSize=width});
+            offset+=width;
+        }
+        Instruction call;
+        if(shape=="raw_float_before_ref")
+        {
+            instructions.Add(new(instructions.Count,OpCode.Move,new Register(null,"X0"),new AddressOf(root)));
+            call=new(instructions.Count,OpCode.CallVoid,new Immediate((long)address));
+            call.SetOperands(new IOperand[]{new Immediate((long)address)}.Concat(Enumerable.Range(0,8).Select(i=>(IOperand)new Register(null,"X"+i)))
+                .Concat(Enumerable.Range(0,8).Select(i=>(IOperand)new Register(null,"V"+i))).ToList());
+        }
+        else call=new(instructions.Count,OpCode.CallVoid,new Immediate((long)address),new AddressOf(root),new Immediate(0));
+        instructions.Add(call);instructions.Add(new(instructions.Count,OpCode.Return));caller.ControlFlowGraph=new(instructions);
+        Assert.That(WholeStructInitializationRecovery.Run(caller),Is.EqualTo(expected));
+        Assert.That(instructions[0].Operands[1] is DefaultStructValue,Is.EqualTo(expected));
+    }
+
     [TestCase(16,false,true)]
     [TestCase(8,false,false)]
     [TestCase(0,false,false)]
