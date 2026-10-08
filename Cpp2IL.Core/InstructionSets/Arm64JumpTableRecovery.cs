@@ -78,9 +78,15 @@ public static class Arm64JumpTableRecovery
         {
             var instruction = body[i];
             if (instruction.Mnemonic == Arm64Mnemonic.BR && i != start + 6) return null;
-            if (instruction.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BC or Arm64Mnemonic.BL
-                or Arm64Mnemonic.CBZ or Arm64Mnemonic.CBNZ or Arm64Mnemonic.TBZ or Arm64Mnemonic.TBNZ)
-                if (instruction.BranchTarget >= cmp.Address && instruction.BranchTarget <= branch.Address) return null;
+            ulong? target = instruction.Mnemonic switch
+            {
+                Arm64Mnemonic.B or Arm64Mnemonic.BL => instruction.BranchTarget,
+                Arm64Mnemonic.BC => instruction.Op0PcRelImm,
+                Arm64Mnemonic.CBZ or Arm64Mnemonic.CBNZ => unchecked((ulong)((long)instruction.Address + instruction.Op1Imm)),
+                Arm64Mnemonic.TBZ or Arm64Mnemonic.TBNZ => unchecked((ulong)((long)instruction.Address + instruction.Op2Imm)),
+                _ => null,
+            };
+            if (target >= cmp.Address && target <= branch.Address) return null;
         }
         var tableAddress = unchecked((ulong)((long)(page.Address & ~0xfffUL) + page.Op1Imm + address.Op2Imm));
         var count = checked((int)cmp.Op1Imm + 1);

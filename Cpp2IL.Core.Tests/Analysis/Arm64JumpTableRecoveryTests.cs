@@ -130,4 +130,25 @@ public class Arm64JumpTableRecoveryTests
         body.AddRange(Disassembler.Disassemble(Convert.FromHexString(branchBytes), 0x182fb80, new(true,true,false)));
         Assert.That(Arm64JumpTableRecovery.Recognize(body, 1, (_, _) => Data()), Is.Null);
     }
+
+    [TestCase(0x34000000u, false)]
+    [TestCase(0x35000000u, false)]
+    [TestCase(0x36000000u, false)]
+    [TestCase(0x37000000u, false)]
+    [TestCase(0x34000000u, true)]
+    [TestCase(0x35000000u, true)]
+    [TestCase(0x36000000u, true)]
+    [TestCase(0x37000000u, true)]
+    public void CompareAndTestBranchesUseTheirActualRelativeOperand(uint opcode, bool entersRegion)
+    {
+        var body = Body();
+        const ulong from = 0x1830100;
+        var target = entersRegion ? 0x182fb60UL : 0x18300bcUL;
+        var immediate = unchecked((uint)(((long)target - (long)from) / 4));
+        var mask = opcode is 0x36000000u or 0x37000000u ? 0x3fffu : 0x7ffffu;
+        var bytes = new byte[4]; BinaryPrimitives.WriteUInt32LittleEndian(bytes, opcode | ((immediate & mask) << 5));
+        body.AddRange(Disassembler.Disassemble(bytes, from, new(true,true,false)));
+        var table = Arm64JumpTableRecovery.Recognize(body, 1, (_, _) => Data());
+        Assert.That(table != null, Is.EqualTo(!entersRegion));
+    }
 }
