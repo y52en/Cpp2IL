@@ -517,13 +517,19 @@ public static class IlGenerator
                 var bitwiseType = instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
                     && DestinationType(instruction.Operands[0]) is { FullName: "System.Int32" or "System.UInt32" } resultType
                     ? resultType : null;
+                var integralArithmeticType = instruction.OpCode is OpCode.Add or OpCode.Subtract
+                    or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+                    && DestinationType(instruction.Operands[0]) is { FullName: "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64" } integralResult
+                    ? integralResult : null;
+                var comparison = instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
+                    or OpCode.CheckLess or OpCode.CheckGreater or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual;
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine,
-                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual || instruction.UnsignedComparison ? DestinationType(instruction.Operands[2]) : bitwiseType);
+                    comparison ? DestinationType(instruction.Operands[2]) : integralArithmeticType ?? bitwiseType);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
                 LoadOperand(instruction.Operands[2], method, locals, writeLine,
-                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual || instruction.UnsignedComparison ? DestinationType(instruction.Operands[1]) : bitwiseType);
+                    comparison ? DestinationType(instruction.Operands[1]) : integralArithmeticType ?? bitwiseType);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 
