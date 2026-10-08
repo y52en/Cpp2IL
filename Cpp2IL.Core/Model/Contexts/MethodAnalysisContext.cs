@@ -465,6 +465,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // its independently named scalar reads before they become default IL
         // locals and before inlined constructor matching consumes those reads.
         StackFieldRecovery.Run(this);
+        StackFieldZeroRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);
