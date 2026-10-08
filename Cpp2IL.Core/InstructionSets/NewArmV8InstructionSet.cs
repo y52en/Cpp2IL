@@ -336,6 +336,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             addresses.Add(address);
             var newInstruction = new Instruction(instructions.Count, opCode, operands);
+            if (opCode is OpCode.Add or OpCode.Subtract
+                && instruction.Mnemonic is Arm64Mnemonic.ADD or Arm64Mnemonic.SUB or Arm64Mnemonic.ADDS or Arm64Mnemonic.SUBS
+                && operands.Count > 0 && operands[0] is Register destination
+                && destination.Name == NormalizeRegister(instruction.Op0Reg))
+                newInstruction.NativeArithmeticSize = instruction.Op0Reg switch
+                {
+                    >= Arm64Register.X0 and <= Arm64Register.X30 => 8,
+                    >= Arm64Register.W0 and <= Arm64Register.W30 => 4,
+                    _ => 0,
+                };
             instructions.Add(newInstruction);
             return newInstruction;
         }

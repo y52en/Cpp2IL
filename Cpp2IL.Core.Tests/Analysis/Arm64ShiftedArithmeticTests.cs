@@ -10,6 +10,19 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class Arm64ShiftedArithmeticTests
 {
+    [TestCase(0x91,8)]
+    [TestCase(0x11,4)]
+    public void ActualCounterUpdateRetainsNativeArithmeticWidth(byte high,int width)
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var method=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Counter",app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static,[]);
+        var native=Disassembler.Disassemble(new byte[]{0xb5,0x06,0x00,high},0x1b0dfbc,new(true,true,false)).Single();
+        var emitted=new List<Instruction>();var addresses=new List<ulong>();
+        typeof(NewArmV8InstructionSet).GetField("adrpOffsets",BindingFlags.NonPublic|BindingFlags.Static)!.SetValue(null,new Dictionary<string,ulong>());
+        typeof(NewArmV8InstructionSet).GetMethod("ConvertInstructionStatement",BindingFlags.NonPublic|BindingFlags.Instance)!.Invoke(new NewArmV8InstructionSet(),new object[]{native,emitted,addresses,method});
+        Assert.That(emitted.Single(i=>i.OpCode==OpCode.Add).NativeArithmeticSize,Is.EqualTo(width));
+    }
+
     [TestCase(0x8b, OpCode.Add, false)]
     [TestCase(0xcb, OpCode.Subtract, false)]
     [TestCase(0xab, OpCode.Add, true)]

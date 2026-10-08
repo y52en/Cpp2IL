@@ -267,6 +267,9 @@ public static class LocalVariables
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
+            // Only after all ordinary metadata constraints settle, recover a
+            // proven integral induction cycle used as a managed array index.
+            if (!changed) changed = ArrayIndexInductionRecovery.Run(method);
         }
     }
 
