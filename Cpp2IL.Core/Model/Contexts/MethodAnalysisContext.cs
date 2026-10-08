@@ -372,6 +372,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
         StackAnalyzer.Analyze(this);
+        HiddenStructReturnRecovery.Run(this);
         BoxAddressRecovery.Run(this);
 
         // Dominator info must be computed after stack analysis, which removes unreachable/empty
