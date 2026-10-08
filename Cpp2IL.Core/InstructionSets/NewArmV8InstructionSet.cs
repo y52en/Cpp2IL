@@ -670,6 +670,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     var src1 = ConvertOperand(instruction, 1);
                     var src2 = ConvertOperand(instruction, 2);
+                    // The decoder stores a shifted register's modifier separately from Op2.
+                    // ADD x8,x8,x9,LSL #4 must not become ADD x8,x8,x9.
+                    if (instruction.Op2Kind == Arm64OperandKind.Register
+                        && instruction.FinalOpExtendType == Arm64ExtendType.NONE
+                        && instruction.FinalOpShiftType == Arm64ShiftType.LSL
+                        && instruction.Op3Kind == Arm64OperandKind.Immediate
+                        && instruction.Op3Imm != 0)
+                    {
+                        var shifted = new Register(null, "ARITH_SHIFT");
+                        Add(address, OpCode.ShiftLeft, shifted, src2, Imm(instruction.Op3Imm));
+                        src2 = shifted;
+                    }
                     // a discarded result means this is only about the flags
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
 

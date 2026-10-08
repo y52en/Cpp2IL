@@ -136,6 +136,20 @@ public static class InterfaceDispatchRecovery
 
     private static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions, Instruction? vtableEntry, int slot, long vtableOffset)
     {
+        // Native code also groups this as (klass + (index << 4)) + vtableOffset.
+        // Keep both exact associations; never drop or guess the shift/offset.
+        Instruction? groupedShift = null;
+        if (vtableEntry is { OpCode: OpCode.Add, Operands: [_, LocalVariable inner, Immediate outerOffset] }
+            && outerOffset.Value == vtableOffset)
+        {
+            vtableEntry = ChaseCopies(definitions, inner);
+            if (vtableEntry is not { OpCode: OpCode.Add, Operands: [_, LocalVariable left, LocalVariable right] })
+                return null;
+            var shiftedSide = Definition(definitions, right) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 }] }
+                ? left : right;
+            groupedShift = ChaseCopies(definitions, shiftedSide);
+        }
+
         if (vtableEntry is not { OpCode: OpCode.Add, Operands: [_, LocalVariable addLeft, LocalVariable addRight] })
             return null;
 
@@ -146,11 +160,15 @@ public static class InterfaceDispatchRecovery
         if (Definition(definitions, klassCandidate) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] })
             return null;
 
-        if (ChaseCopies(definitions, sum) is not { OpCode: OpCode.Add, Operands: [_, LocalVariable shifted, Immediate tableOffset] }
-            || tableOffset.Value != vtableOffset)
-            return null;
+        if (groupedShift == null)
+        {
+            if (ChaseCopies(definitions, sum) is not { OpCode: OpCode.Add, Operands: [_, LocalVariable shifted, Immediate tableOffset] }
+                || tableOffset.Value != vtableOffset)
+                return null;
+            groupedShift = ChaseCopies(definitions, shifted);
+        }
 
-        if (ChaseCopies(definitions, shifted) is not { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: InvokeDataShift }] })
+        if (groupedShift is not { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: InvokeDataShift }] })
             return null;
 
         var entryOffset = ChaseCopies(definitions, index);
