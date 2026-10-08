@@ -250,6 +250,7 @@ public static class InterfaceDispatchRecovery
         }
 
         dispatch.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+        dispatch.NativeVirtualDispatch = true;
         callingConventions?.RemapRawArguments(dispatch, resolved);
 
         // name [phi+8] as the hidden MethodInfo param, like ResolveVirtualCalls. A tail call's target

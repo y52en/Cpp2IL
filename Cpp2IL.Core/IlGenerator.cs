@@ -438,7 +438,7 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, instructions);
                 }
 
-                instructions.Add(CilOpCodes.Call, importedMethod);
+                instructions.Add(instruction.NativeVirtualDispatch ? CilOpCodes.Callvirt : CilOpCodes.Call, importedMethod);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack

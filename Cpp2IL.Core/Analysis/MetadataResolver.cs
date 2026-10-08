@@ -599,7 +599,7 @@ public static class MetadataResolver
 
         foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
-            if (instruction.OpCode != OpCode.IndirectCall)
+            if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
                 continue;
 
             if (SlotLoad(instruction.Operands[0]) is not { } target
@@ -613,12 +613,42 @@ public static class MetadataResolver
             var slot = (int)(offset / invokeDataSize);
             if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
                 continue;
+            if (resolved.IsStatic)
+                continue;
 
             var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
+            var tail = instruction.OpCode == OpCode.IndirectJump;
+            var resolver = resolved.AppContext.InstructionSet.CallingConventionResolver;
+            LocalVariable? tailResult = null;
+            if (tail)
+            {
+                // A tail branch's operand 1 is a stale native return register use,
+                // not a managed result definition. Never reuse it as the result.
+                if (!method.IsVoid && (resolved.IsVoid || method.ReturnType != resolved.ReturnType)
+                    || resolver == null
+                    || resolver.ResolveForManaged(resolved).Any(o=>o is StackOffset)
+                    || resolved.Parameters.Any(p=>Arm64HfaLayout.Fields(p.ParameterType)!=null))
+                    continue; // These ABI shapes require separate proven recovery.
+                var operands = new List<IOperand>{resolved};
+                if (!resolved.IsVoid)
+                {
+                    tailResult = new LocalVariable("virtualTailCallResult_"+instruction.Index,
+                        new Register(null,"virtual_tail_result_"+instruction.Index), resolved.ReturnType);
+                    method.Locals.Add(tailResult);
+                    operands.Add(tailResult);
+                }
+                operands.AddRange(instruction.Operands.Skip(2));
+                instruction.SetOperands(operands);
+                instruction.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+            }
+            else
+            {
+                instruction.OpCode = OpCode.Call; // same layout as IndirectCall
+                instruction.SetOperand(0, resolved);
+            }
 
-            instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
-            instruction.SetOperand(0, resolved);
-            resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved);
+            resolver?.RemapRawArguments(instruction, resolved);
+            instruction.NativeVirtualDispatch = true;
 
             // the MethodInfo field is also the same method, name it, for cleanliness and so it can
             // serve as a hidden final parameter if needed
@@ -628,6 +658,14 @@ public static class MetadataResolver
                     && ReferenceEquals(methodInfoLoad.Base, klassLocal)
                     && methodInfoLoad.Addend == target.Addend + pointerSize)
                     instruction.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
+            }
+
+            if (tail)
+            {
+                var block = method.ControlFlowGraph.Blocks.Single(b=>b.Instructions.Contains(instruction));
+                block.AddInstruction(new Instruction(-1,OpCode.Return,
+                    method.IsVoid ? [] : new List<IOperand>{tailResult!}));
+                block.CalculateBlockType();
             }
 
             changed = true;

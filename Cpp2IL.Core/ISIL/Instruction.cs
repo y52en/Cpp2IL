@@ -36,6 +36,9 @@ public class Instruction : IOperand
     public int NativeReadSize;
     // Width proven zero by a full native register initialization (not a scalar guess).
     public int NativeZeroSize;
+    // Proven vtable/interface dispatch, distinct from a direct call to a virtual
+    // method (e.g. base.Method). Preserve that distinction in managed IL.
+    public bool NativeVirtualDispatch;
 
     public bool IsFallThrough =>
         OpCode switch

@@ -14,6 +14,29 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    [TestCase(false)]
+    [TestCase(true)]
+    public void VirtualMethodDirectCallAndNativeDispatchRemainDistinct(bool nativeDispatch)
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var owner=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,"Test","Dispatch",app.SystemTypes.SystemObjectType,System.Reflection.TypeAttributes.Public);
+        var target=owner.InjectMethodContext("Target",app.SystemTypes.SystemVoidType,ReflectionMethodAttributes.Public|ReflectionMethodAttributes.Virtual,[]);
+        var caller=new InjectedMethodAnalysisContext(owner,"Caller",app.SystemTypes.SystemVoidType,ReflectionMethodAttributes.Public|ReflectionMethodAttributes.Static,[]);
+        var receiver=new LocalVariable("receiver",new Register(null,"X0"),owner);
+        var call=new Instruction(0,OpCode.CallVoid,target,receiver,new Immediate(0)){NativeVirtualDispatch=nativeDispatch};
+        caller.ControlFlowGraph=new([call,new(1,OpCode.Return)]);
+        caller.Locals=[receiver];caller.ParameterLocals=[];caller.AnalysisWarnings=[];
+        var module=new ModuleDefinition("Dispatch.dll",new AssemblyReference("mscorlib",new Version(4,0,0,0)));
+        var type=new TypeDefinition("Test","Dispatch",TypeAttributes.Public,module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);owner.PutExtraData("AsmResolverType",type);
+        var targetDef=new MethodDefinition("Target",MethodAttributes.Public|MethodAttributes.Virtual,MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        type.Methods.Add(targetDef);target.PutExtraData("AsmResolverMethod",targetDef);
+        var callerDef=new MethodDefinition("Caller",MethodAttributes.Public|MethodAttributes.Static,MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(callerDef);IlGenerator.GenerateIl(caller,callerDef);
+        var actual=callerDef.CilMethodBody!.Instructions.Single(i=>i.Operand is IMethodDescriptor m && m.Name=="Target");
+        Assert.That(actual.OpCode,Is.EqualTo(nativeDispatch?CilOpCodes.Callvirt:CilOpCodes.Call));
+    }
+
     [SetUp]
     public void Setup()
     {
