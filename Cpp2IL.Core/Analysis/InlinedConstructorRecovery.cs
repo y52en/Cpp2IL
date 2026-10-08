@@ -16,6 +16,7 @@ public static class InlinedConstructorRecovery
 
     public static Template? Extract(MethodAnalysisContext ctor)
     {
+        Trace(ctor, "constructor template input");
         if (ctor.Name != ".ctor" || ctor.IsStatic || ctor.DeclaringType?.BaseType?.FullName != "System.Object"
             || ctor.ControlFlowGraph == null || ctor.Parameters.Count == 0) return null;
         var parameters = ctor.ParameterLocals.Where(l => !l.IsThis && !l.IsMethodInfo).ToList();
@@ -51,10 +52,22 @@ public static class InlinedConstructorRecovery
     public static void Run(MethodAnalysisContext method)
     {
         if (method.ControlFlowGraph == null) return;
+        Trace(method, "caller before constructor recovery");
         foreach (var allocation in method.ControlFlowGraph.Instructions.ToArray())
             if (allocation is { OpCode: OpCode.Newobj, Operands: [LocalVariable _, TypeAnalysisContext type] }
                 && type.GetExtraData<Template[]>(CacheKey) is { Length: > 0 } templates)
                 Recover(method, allocation, templates);
+    }
+
+    private static void Trace(MethodAnalysisContext method, string stage)
+    {
+        var requested = System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_CONSTRUCTOR_RVAS");
+        if (requested == null || !requested.Split(',').Any(r => string.Equals(r.Trim(),
+            method.UnderlyingPointer.ToString("X"), System.StringComparison.OrdinalIgnoreCase))) return;
+        System.Console.Error.WriteLine(stage + ": " + method.FullName);
+        if (method.ControlFlowGraph == null) return;
+        foreach (var block in method.ControlFlowGraph.Blocks)
+            System.Console.Error.WriteLine(block + "Successors: " + string.Join(",",block.Successors.Select(s=>s.ID)));
     }
 
     public static bool Recover(MethodAnalysisContext method, Instruction allocation, IReadOnlyList<Template> templates)
