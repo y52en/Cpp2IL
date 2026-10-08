@@ -8,6 +8,31 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class SplitArrayAccessTests
 {
+    [TestCase(false,4,true)]
+    [TestCase(true,4,false)]
+    [TestCase(false,8,false)]
+    [TestCase(false,0,false)]
+    public void Int32LengthRecoveryDoesNotReinterpretHeaderStoresOrLongLength(bool store,int width,bool expected)
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var type=app.SystemTypes.SystemObjectType;
+        var array=new LocalVariable("array",new Register(null,"X19"),new SzArrayTypeAnalysisContext(type));
+        var value=new LocalVariable("length",new Register(null,"X0"));
+        var memory=new MemoryOperand(array,addend:24);
+        var access=store ? new Instruction(0,OpCode.Move,memory,value){NativeWriteSize=width}
+            : new Instruction(0,OpCode.Move,value,memory){NativeReadSize=width};
+        var method=new InjectedMethodAnalysisContext(type,"Length",app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static,[]);
+        method.ControlFlowGraph=new([access,new(1,OpCode.Return)]);
+        Assert.That(ArrayRecovery.RecoverSplitAccesses(method),Is.EqualTo(expected));
+        Assert.That(access.Operands[store?0:1] is ArrayLength,Is.EqualTo(expected));
+        if(expected)
+        {
+            method.Locals=[array,value];method.ParameterLocals=[];method.AnalysisWarnings=[];
+            LocalVariables.ResolveTypesAndFields(method);
+            Assert.That(value.Type?.FullName,Is.EqualTo("System.Int32"));
+        }
+    }
+
     [TestCase(false,8,32,3,true)]
     [TestCase(true,8,32,3,true)]
     [TestCase(false,4,32,3,false)] // Partial reference read.

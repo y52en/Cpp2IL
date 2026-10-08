@@ -45,9 +45,14 @@ public static class ArrayRecovery
                     var arrays=terms.Where(t=>t.Value!=0 && t.Key.Type is SzArrayTypeAnalysisContext).ToArray();
                     if(arrays.Length!=1 || arrays[0].Value!=1) continue;
                     var array=arrays[0].Key;
+                    var indices=terms.Where(t=>t.Value!=0 && !ReferenceEquals(t.Key,array)).ToArray();
+                    // Proven 32-bit length load (not LongLength, a store or a pointer).
+                    if(slot==1 && width==4 && indices.Length==0 && offset==LengthOffset(pointerSize))
+                    {
+                        instruction.SetOperand(slot,new ArrayLength(array));changed=true;continue;
+                    }
                     var stride=ElementSize(((SzArrayTypeAnalysisContext)array.Type!).ElementType,pointerSize);
                     if(stride<=0 || width!=stride) continue;
-                    var indices=terms.Where(t=>t.Value!=0 && !ReferenceEquals(t.Key,array)).ToArray();
                     var delta=checked(offset-ElementsOffset(pointerSize));
                     IOperand index;
                     if(indices.Length==0 && delta>=0 && delta%stride==0) index=new Immediate(delta/stride);

@@ -551,6 +551,9 @@ public static class LocalVariables
         if (destination is LocalVariable arrayDest && source is ArrayAccess { Array.Type: SzArrayTypeAnalysisContext arrayType })
             return SetTypeIfUnknown(arrayDest,arrayType.ElementType);
 
+        if (destination is LocalVariable lengthDest && source is ArrayLength length)
+            return SetTypeIfUnknown(lengthDest,length.Array.Type!.AppContext.SystemTypes.SystemInt32Type);
+
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
             return SetTypeIfUnknown(storeSource, storeField.Field.FieldType);
