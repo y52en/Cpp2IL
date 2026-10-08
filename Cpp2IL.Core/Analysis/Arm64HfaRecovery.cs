@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -24,7 +25,7 @@ public static class Arm64HfaRecovery
             for(var lane=0;lane<item.Fields.Length;lane++)
                 entry.Add(Move(new Register(null,"V"+(item.FirstLane+lane)),new MemoryOperand(item.Storage,addend:item.Fields[lane].Offset)));
         if(entry.Count>0){graph.EntryBlock.Instructions.InsertRange(0,entry);changed=true;}
-        foreach(var block in graph.Blocks)
+        foreach(var block in graph.Blocks.ToArray())
         for(var index=0;index<block.Instructions.Count;index++)
         {
             var instruction=block.Instructions[index];
@@ -51,7 +52,16 @@ public static class Arm64HfaRecovery
                     var result=new Register(null,"hfa_result_"+serial++);
                     instruction.Destination=result;
                     var suffix=fields.Select((field,lane)=>Move(new Register(null,"V"+lane),new MemoryOperand(result,addend:field.Offset))).ToList();
-                    block.Instructions.InsertRange(index+1,suffix);index+=suffix.Count;changed=true;
+                    // Call-block consumers require the actual call to remain
+                    // last. Project lanes on a dedicated successor edge, not
+                    // after the call inside its block.
+                    var projection=new Block {ID=graph.Blocks.Max(b=>b.ID)+1,BlockType=BlockType.Fall,Instructions=suffix};
+                    projection.Predecessors.Add(block);
+                    projection.Successors=block.Successors;
+                    foreach(var successor in projection.Successors)
+                        for(var p=0;p<successor.Predecessors.Count;p++)
+                            if(successor.Predecessors[p]==block) successor.Predecessors[p]=projection;
+                    block.Successors=[projection];graph.Blocks.Add(projection);changed=true;
                 }
             }
             else if(instruction.OpCode==OpCode.Return && Arm64HfaLayout.Fields(method.ReturnType) is { } fields)

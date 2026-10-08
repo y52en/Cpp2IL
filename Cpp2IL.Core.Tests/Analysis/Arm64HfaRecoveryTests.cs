@@ -2,6 +2,7 @@ using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -54,6 +55,7 @@ public class Arm64HfaRecoveryTests
         Assert.That(Arm64HfaRecovery.Run(caller),Is.EqualTo(!ambiguous));
         if(ambiguous) return;
         var instructions=caller.ControlFlowGraph.Instructions;
+        Assert.That(caller.ControlFlowGraph.Blocks.Where(b=>b.BlockType is BlockType.Call or BlockType.TailCall).All(b=>b.Instructions.Last().IsCall),Is.True);
         Assert.That(instructions.Count(i=>i is {OpCode:OpCode.Move,Operands:[_,DefaultStructValue]}),Is.EqualTo(2));
         Assert.That(instructions.Count(i=>i is {OpCode:OpCode.Move,Operands:[MemoryOperand,_]}),Is.EqualTo(6));
         Assert.That(instructions.Where(i=>i is {OpCode:OpCode.Move,Operands:[Register,MemoryOperand]}).Select(i=>((Register)i.Destination!).Name),Is.EqualTo(new[]{"V0","V1","V2"}));
