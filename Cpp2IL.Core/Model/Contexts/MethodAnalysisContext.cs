@@ -372,6 +372,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
         StackAnalyzer.Analyze(this);
+        Arm64HfaRecovery.Run(this);
         HiddenStructReturnRecovery.Run(this);
         WholeStructInitializationRecovery.Run(this);
         BoxAddressRecovery.Run(this);
