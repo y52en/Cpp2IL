@@ -21,6 +21,7 @@ public static class Arm64HfaRecovery
         var changed=false;
         var entry=new List<Instruction>();
         var incoming=resolver.ResolveForManaged(method);
+        changed |= RecoverIncomingStackHfas(method, incoming);
         foreach(var item in Parameters(method,incoming))
             for(var lane=0;lane<item.Fields.Length;lane++)
                 entry.Add(Move(new Register(null,"V"+(item.FirstLane+lane)),new MemoryOperand(item.Storage,addend:item.Fields[lane].Offset)));
@@ -74,6 +75,69 @@ public static class Arm64HfaRecovery
             }
         }
         return changed;
+    }
+
+    // An HFA that does not fit entirely in V0-V7 is passed wholly on the stack.
+    // StackAnalyzer names each scalar load independently; do not seed stack_0
+    // itself as both a whole Vector3 parameter and its first Single lane.
+    internal static bool RecoverIncomingStackHfas(MethodAnalysisContext method, IOperand[] incoming)
+    {
+        var changed=false;
+        var graph=method.ControlFlowGraph!;
+        for(var p=0;p<method.Parameters.Count;p++)
+        {
+            var ordinal=p+(method.IsStatic?0:1);
+            var type=method.Parameters[p].ParameterType;
+            if(Arm64HfaLayout.Fields(type) is not { } fields
+                || incoming[ordinal] is not StackOffset offset
+                || method.ParameterOperands.Count<=ordinal
+                || method.ParameterOperands[ordinal] is not Register parameter
+                || parameter.Name!="stack_"+offset.Offset.ToString("X")) continue;
+            var size=TypeSizes.UnboxedSize(type,8);
+            var loads=new List<(Instruction Load,FieldAnalysisContext Field)>();
+            var valid=true;
+            foreach(var instruction in graph.Instructions)
+            foreach(var operand in instruction.Operands)
+            foreach(var register in StorageRegisters(operand))
+            {
+                if(!register.Name.StartsWith("stack_",System.StringComparison.Ordinal)
+                    || !int.TryParse(register.Name.Substring(6),System.Globalization.NumberStyles.AllowHexSpecifier,
+                        System.Globalization.CultureInfo.InvariantCulture,out var slot)
+                    || slot<offset.Offset || slot>=offset.Offset+size) continue;
+                var field=fields.SingleOrDefault(f=>f.Offset==slot-offset.Offset);
+                // Only exact native scalar reads are proven. Writes, addresses,
+                // ABI call operands, partial/unknown widths and other uses veto
+                // this parameter rather than inventing its contents.
+                if(operand is not Register || instruction.OpCode!=OpCode.Move
+                    || instruction.Operands.Count!=2 || !ReferenceEquals(operand,instruction.Operands[1])
+                    || instruction.Destination is not Register || field==null
+                    || instruction.NativeReadSize<=0
+                    || instruction.NativeReadSize!=TypeSizes.UnboxedSize(field.FieldType,8))
+                { valid=false; break; }
+                loads.Add((instruction,field));
+            }
+            if(!valid || loads.Count==0) continue;
+            var storage=new Register(null,"hfa_stack_arg_"+p);
+            method.ParameterOperands[ordinal]=storage;
+            foreach(var (load,field) in loads)
+                load.SetOperand(1,new MemoryOperand(storage,addend:field.Offset));
+            changed=true;
+        }
+        return changed;
+    }
+
+    private static IEnumerable<Register> StorageRegisters(IOperand operand)
+    {
+        if(operand is Register register) yield return register;
+        else if(operand is AddressOf address)
+            foreach(var nested in StorageRegisters(address.Target)) yield return nested;
+        else if(operand is MemoryOperand memory)
+        {
+            if(memory.Base!=null)
+                foreach(var nested in StorageRegisters(memory.Base)) yield return nested;
+            if(memory.Index!=null)
+                foreach(var nested in StorageRegisters(memory.Index)) yield return nested;
+        }
     }
 
     private static IEnumerable<(Register Storage,TypeAnalysisContext Type,FieldAnalysisContext[] Fields,int FirstLane)> Parameters(MethodAnalysisContext method,IOperand[] operands)
