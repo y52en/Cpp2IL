@@ -177,8 +177,9 @@ public static class MetadataResolver
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? (local.Type is ByRefTypeAnalysisContext byref ? byref.ElementType : local.Type);
-                if(i==0 && instruction.OpCode==OpCode.Move && instruction.NativeWriteSize>0 && staticOwner==null
-                    && NestedFieldAccess.Find(owner,local,memory.Addend,instruction.NativeWriteSize) is { } nested)
+                var nativeWidth=i==0 ? instruction.NativeWriteSize : i==1 ? instruction.NativeReadSize : 0;
+                if(instruction.OpCode==OpCode.Move && nativeWidth>0 && staticOwner==null
+                    && NestedFieldAccess.Find(owner,local,memory.Addend,nativeWidth) is { } nested)
                 {
                     instruction.SetOperand(i,nested);changed=true;continue;
                 }

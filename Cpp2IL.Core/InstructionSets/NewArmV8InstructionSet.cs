@@ -77,6 +77,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             };
 
     // integer register 31 is SP or ZR depending on context, callers must decide which
+    public static int ReadWidth(Arm64Mnemonic mnemonic, Arm64Register register)
+        => mnemonic is Arm64Mnemonic.LDRB or Arm64Mnemonic.LDURB or Arm64Mnemonic.LDRSB or Arm64Mnemonic.LDURSB ? 1
+            : mnemonic is Arm64Mnemonic.LDRH or Arm64Mnemonic.LDURH or Arm64Mnemonic.LDRSH or Arm64Mnemonic.LDURSH ? 2
+            : mnemonic is Arm64Mnemonic.LDRSW or Arm64Mnemonic.LDURSW or Arm64Mnemonic.LDPSW ? 4
+            : StoreWidth(Arm64Mnemonic.STR, register);
+
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
     public override ulong GetUnboxedMethodTarget(MethodAnalysisContext method)
@@ -595,7 +601,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                         Add(address, OpCode.Nop); // load to xzr = prefetch, discard
                     else
-                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), source);
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), source).NativeReadSize=ReadWidth(instruction.Mnemonic,instruction.Op0Reg);
 
                     EmitWriteback(beforeAccess: false);
                     break;
@@ -614,7 +620,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.LDPSW:
             case Arm64Mnemonic.STP:
                 {
-                    var pairSize = instruction.Op0Reg switch
+                    var pairSize = instruction.Mnemonic == Arm64Mnemonic.LDPSW ? 4 : instruction.Op0Reg switch
                     {
                         >= Arm64Register.V0 and <= Arm64Register.V31 => 16,
                         >= Arm64Register.D0 and <= Arm64Register.D31 => 8,
@@ -632,8 +638,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
                     else
                     {
-                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), MemOperand());
-                        Add(address, OpCode.Move, ConvertOperand(instruction, 1), MemOperand(pairSize));
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), MemOperand()).NativeReadSize=pairSize;
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 1), MemOperand(pairSize)).NativeReadSize=pairSize;
                     }
 
                     EmitWriteback(beforeAccess: false);
