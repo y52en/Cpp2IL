@@ -74,6 +74,9 @@ public abstract class Cpp2IlInstructionSet
     /// </summary>
     public virtual ulong GetThunkTarget(ApplicationAnalysisContext context, ulong thunkAddress) => 0;
 
+    /// <summary>Recognized boxed-value receiver adjustor; zero if not proven.</summary>
+    public virtual ulong GetUnboxedMethodTarget(MethodAnalysisContext method) => 0;
+
     /// <summary>
     /// For an internal call, returns the address of the runtime function it tail-calls into.
     /// Unlike a thunk these can do a small amount of work before the jump, so implementations must scan the whole body, unlike for <see cref="GetThunkTarget"/>.

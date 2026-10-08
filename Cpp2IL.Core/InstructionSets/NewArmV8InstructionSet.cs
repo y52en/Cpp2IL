@@ -40,28 +40,56 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
+    public override ulong GetUnboxedMethodTarget(MethodAnalysisContext method)
+    {
+        if (method.IsStatic || method.DeclaringType?.IsValueType != true || method.UnderlyingPointer == 0) return 0;
+        var binary = method.AppContext.Binary;
+        if (!binary.TryMapVirtualAddressToRaw(method.UnderlyingPointer, out var mapped)) return 0;
+        var raw = (int)mapped;
+        if (raw < 0 || raw > binary.RawLength - 8) return 0;
+        var body = Disassembler.Disassemble(binary.GetRawBinaryContent().Slice(raw,8),
+            method.UnderlyingPointer,new(true,true,false)).ToList();
+        var target = RecognizeUnboxingAdjustor(body);
+        return target != 0 && binary.TryMapVirtualAddressToRaw(target,out _) ? target : 0;
+    }
+
+    public static ulong RecognizeUnboxingAdjustor(IReadOnlyList<Arm64Instruction> body)
+    {
+        if (body.Count != 2 || body[0].Mnemonic != Arm64Mnemonic.ADD
+            || body[0].Op0Reg != Arm64Register.X0 || body[0].Op1Reg != Arm64Register.X0
+            || body[0].Op2Kind != Arm64OperandKind.Immediate || body[0].Op2Imm != 16
+            || body[1].Mnemonic != Arm64Mnemonic.B
+            || body[1].MnemonicConditionCode is not (Arm64ConditionCode.NONE or Arm64ConditionCode.AL)) return 0;
+        var target = body[1].BranchTarget;
+        return target != 0 && (target & 3) == 0 && target != body[0].Address && target != body[1].Address ? target : 0;
+    }
+
+    private ulong AnalysisPointer(MethodAnalysisContext context)
+        => GetUnboxedMethodTarget(context) is not 0 and var target ? target : context.UnderlyingPointer;
+
     public override BinarySlice GetRawBytesForMethod(MethodAnalysisContext context, bool isAttributeGenerator)
     {
         var binary = context.AppContext.Binary;
+        var pointer = AnalysisPointer(context);
 
         if (context is not ConcreteGenericMethodAnalysisContext)
         {
             //Managed method or attr gen => grab raw byte range between a and b
-            var startOfNextFunction = context.AppContext.GetAddressOfNextFunctionStart(context.UnderlyingPointer);
-            var count = (int)(startOfNextFunction - context.UnderlyingPointer);
+            var startOfNextFunction = context.AppContext.GetAddressOfNextFunctionStart(pointer);
+            var count = (int)(startOfNextFunction - pointer);
 
             if (startOfNextFunction > 0)
             {
-                var startRaw = (int)binary.MapVirtualAddressToRaw(context.UnderlyingPointer);
+                var startRaw = (int)binary.MapVirtualAddressToRaw(pointer);
                 if (startRaw > 0 && startRaw + count <= binary.RawLength)
                     return new BinarySlice(binary, startRaw, count);
             }
         }
 
-        var result = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer);
+        var result = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, pointer);
         var lastInsn = result.LastValid();
 
-        var start = (int)binary.MapVirtualAddressToRaw(context.UnderlyingPointer);
+        var start = (int)binary.MapVirtualAddressToRaw(pointer);
         // Map the last instruction (always within segment) and add 4 (ARM64 instruction size).
         // This avoids mapping endVa which may land exactly at a segment boundary gap.
         var end = (int)binary.MapVirtualAddressToRaw(lastInsn.Address) + 4;
@@ -189,7 +217,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
     {
-        var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer);
+        var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, AnalysisPointer(context));
 
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
@@ -827,7 +855,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     }
 
-                    if (target < context.UnderlyingPointer || target >= context.UnderlyingPointer + (ulong)context.RawBytes.Length)
+                    var analysisPointer = AnalysisPointer(context);
+                    if (target < analysisPointer || target >= analysisPointer + (ulong)context.RawBytes.Length)
                     {
                         // unconditional branch out of the method is a tail call
                         AddCallAt(target);
@@ -1058,5 +1087,5 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     public override BaseKeyFunctionAddresses CreateKeyFunctionAddressesInstance() => new NewArm64KeyFunctionAddresses();
 
-    public override string PrintAssembly(MethodAnalysisContext context) => context.RawBytes.Length <= 0 ? "" : string.Join("\n", Disassembler.Disassemble(context.RawBytes.AsSpan(), context.UnderlyingPointer, new Disassembler.Options(true, true, false)).ToList());
+    public override string PrintAssembly(MethodAnalysisContext context) => context.RawBytes.Length <= 0 ? "" : string.Join("\n", Disassembler.Disassemble(context.RawBytes.AsSpan(), AnalysisPointer(context), new Disassembler.Options(true, true, false)).ToList());
 }

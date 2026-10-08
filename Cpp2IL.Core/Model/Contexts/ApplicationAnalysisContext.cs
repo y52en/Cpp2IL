@@ -162,6 +162,13 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
                 MethodsByAddress.Add(ptr, []);
 
             MethodsByAddress[ptr].Add(m);
+            var unboxed = InstructionSet.GetUnboxedMethodTarget(m);
+            if (unboxed != 0 && unboxed != ptr)
+            {
+                if (!MethodsByAddress.TryGetValue(unboxed, out var aliases))
+                    MethodsByAddress[unboxed] = aliases = [];
+                if (!aliases.Contains(m)) aliases.Add(m);
+            }
         });
 
         Logger.VerboseNewline("\tProcessing internal calls...");
