@@ -185,6 +185,13 @@ public static class MetadataResolver
                 }
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
+                if (staticOwner == null && GenericInstanceFieldLayout.FindInheritedFieldAtOffset(owner, memory.Addend, nativeWidth) is { } inherited)
+                {
+                    instruction.SetOperand(i, new FieldReference(inherited, local, (int)memory.Addend));
+                    changed = true;
+                    continue;
+                }
+
                 FieldAnalysisContext? field;
                 if (genericOwner != null && staticOwner == null)
                 {

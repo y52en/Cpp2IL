@@ -1,11 +1,64 @@
 using System.Linq;
+using System.Collections.Generic;
+using System.Reflection;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
 //Resolves field offsets on generic types, which are all 0 in the metadata.
 public static class GenericInstanceFieldLayout
 {
+    // Unlike the legacy open-definition layout, this path retains the declaring
+    // generic instance at each inheritance level. Non-generic offsets constrain
+    // the layout; unsupported sizes and open parameters are never guessed.
+    public static FieldAnalysisContext? FindInheritedFieldAtOffset(TypeAnalysisContext owner, long targetOffset, int nativeWidth = 0)
+    {
+        if (targetOffset < 0 || targetOffset > int.MaxValue || nativeWidth < 0 || owner.IsValueType)
+            return null;
+        var hierarchy = new List<TypeAnalysisContext>();
+        var seen = new HashSet<string>();
+        for (var type = owner; type != null; type = type.BaseType)
+        {
+            if (hierarchy.Count >= 64 || !seen.Add(type.FullName))
+                return null;
+            hierarchy.Add(type);
+        }
+        if (!hierarchy.Any(t => t is GenericInstanceTypeAnalysisContext))
+            return null;
+        var pointerSize = owner.AppContext.Binary.PointerSizeBytes;
+        if (pointerSize is not (4 or 8))
+            return null;
+        var end = 2L * pointerSize;
+        FieldAnalysisContext? result = null;
+        foreach (var type in hierarchy.AsEnumerable().Reverse())
+        {
+            var generic = type as GenericInstanceTypeAnalysisContext;
+            var definition = generic?.GenericType ?? type;
+            if (generic != null && (definition.Attributes & TypeAttributes.LayoutMask) != TypeAttributes.AutoLayout)
+                return null; // packing/explicit layout requires separate evidence
+            foreach (var original in definition.Fields.Where(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0))
+            {
+                FieldAnalysisContext field = generic == null ? original : new ConcreteGenericFieldAnalysisContext(original, generic);
+                if (field.FieldType.HasAnyGenericParameters()
+                    || GetSizeAndAlignment(field.FieldType, pointerSize) is not { } layout)
+                    return null;
+                var aligned = (end + layout.Alignment - 1) & ~(layout.Alignment - 1);
+                var offset = generic == null ? original.Offset : aligned;
+                if (offset < aligned || offset > long.MaxValue - layout.Size)
+                    return null;
+                if (offset == targetOffset)
+                {
+                    if (nativeWidth > 0 && nativeWidth != layout.Size) return null;
+                    if (result != null) return null;
+                    result = field;
+                }
+                end = offset + layout.Size;
+            }
+        }
+        return result;
+    }
+
     public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset)
     {
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
