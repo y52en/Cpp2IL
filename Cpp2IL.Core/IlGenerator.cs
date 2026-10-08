@@ -671,6 +671,13 @@ public static class IlGenerator
             case FloatLiteral f:
                 instructions.Add(CilOpCodes.Ldc_R4, f.Value);
                 break;
+            case DefaultStructValue value:
+                var initialized=new CilLocalVariable(value.Type.ToTypeSignature());
+                method.CilMethodBody!.LocalVariables.Add(initialized);
+                instructions.Add(CilOpCodes.Ldloca,initialized);
+                instructions.Add(CilOpCodes.Initobj,value.Type.ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Ldloc,initialized);
+                break;
             case DoubleLiteral d:
                 instructions.Add(CilOpCodes.Ldc_R8, d.Value);
                 break;

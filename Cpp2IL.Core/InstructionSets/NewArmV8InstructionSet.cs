@@ -37,6 +37,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     private static Register Reg(Arm64Register reg) => new(null, NormalizeRegister(reg));
 
+    public static int StoreWidth(Arm64Mnemonic mnemonic,Arm64Register register)
+        => mnemonic is Arm64Mnemonic.STRB or Arm64Mnemonic.STURB ? 1
+            : mnemonic is Arm64Mnemonic.STRH or Arm64Mnemonic.STURH ? 2
+            : register switch
+            {
+                >= Arm64Register.V0 and <= Arm64Register.V31 => 16,
+                >= Arm64Register.X0 and <= Arm64Register.X31 => 8,
+                >= Arm64Register.D0 and <= Arm64Register.D31 => 8,
+                >= Arm64Register.W0 and <= Arm64Register.W31 => 4,
+                >= Arm64Register.S0 and <= Arm64Register.S31 => 4,
+                >= Arm64Register.H0 and <= Arm64Register.H31 => 2,
+                >= Arm64Register.B0 and <= Arm64Register.B31 => 1,
+                _ => 0
+            };
+
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
@@ -566,7 +581,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.STURB:
             case Arm64Mnemonic.STURH:
                 EmitWriteback(beforeAccess: true);
-                Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0));
+                Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0)).NativeWriteSize=StoreWidth(instruction.Mnemonic,instruction.Op0Reg);
                 EmitWriteback(beforeAccess: false);
                 break;
             case Arm64Mnemonic.LDP:
@@ -586,8 +601,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     if (instruction.Mnemonic == Arm64Mnemonic.STP)
                     {
-                        Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0));
-                        Add(address, OpCode.Move, MemOperand(pairSize), ConvertOperand(instruction, 1));
+                        Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0)).NativeWriteSize=pairSize;
+                        Add(address, OpCode.Move, MemOperand(pairSize), ConvertOperand(instruction, 1)).NativeWriteSize=pairSize;
                     }
                     else
                     {

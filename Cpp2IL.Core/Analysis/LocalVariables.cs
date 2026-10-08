@@ -225,6 +225,9 @@ public static class LocalVariables
     /// </summary>
     public static void ResolveTypesAndFields(MethodAnalysisContext method)
     {
+        foreach(var instruction in method.ControlFlowGraph!.Instructions)
+            if(instruction is {OpCode:OpCode.Move,Operands:[LocalVariable destination,DefaultStructValue value]})
+                destination.Type=value.Type;
         // Seed types from fixed ground truth - the method's own signature, and type-metadata global
         // loads. Applied once up front and, being applied first, they win over anything inferred later.
         PropagateFromReturn(method);
@@ -532,6 +535,8 @@ public static class LocalVariables
     {
         var destination = move.Operands[0];
         var source = move.Operands[1];
+        if(destination is LocalVariable defaultLocal && source is DefaultStructValue defaultValue)
+            return SetTypeIfUnknown(defaultLocal,defaultValue.Type);
 
         // Move local, local: copy a known type in whichever direction is missing it.
         if (destination is LocalVariable destLocal && source is LocalVariable sourceLocal)

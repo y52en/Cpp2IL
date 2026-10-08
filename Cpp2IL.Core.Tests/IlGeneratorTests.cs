@@ -22,6 +22,25 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void ProvenDefaultStructEmitsInitobjInsteadOfIntegerZero()
+    {
+        var app=Cpp2IlApi.CurrentAppContext!;
+        var context=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,"Test","Data",app.SystemTypes.SystemValueTypeType,System.Reflection.TypeAttributes.Public);
+        var caller=new InjectedMethodAnalysisContext(context,"Caller",app.SystemTypes.SystemVoidType,ReflectionMethodAttributes.Public|ReflectionMethodAttributes.Static,[]);
+        var local=new LocalVariable("data",new Register(null,"stack_-80"),context);
+        caller.ControlFlowGraph=new([new(0,OpCode.Move,local,new DefaultStructValue(context)),new(1,OpCode.Return)]);
+        caller.Locals=[local];caller.ParameterLocals=[];caller.AnalysisWarnings=[];
+        var module=new ModuleDefinition("Test.dll",new AssemblyReference("mscorlib",new Version(4,0,0,0)));
+        var type=new TypeDefinition("Test","Data",TypeAttributes.Public|TypeAttributes.SequentialLayout,
+            new TypeReference(module,module.CorLibTypeFactory.CorLibScope,"System","ValueType"));
+        module.TopLevelTypes.Add(type);context.PutExtraData("AsmResolverType",type);
+        var method=new MethodDefinition("Caller",MethodAttributes.Public|MethodAttributes.Static,MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);IlGenerator.GenerateIl(caller,method);
+        Assert.That(method.CilMethodBody!.Instructions.Any(i=>i.OpCode==CilOpCodes.Initobj),Is.True);
+        Assert.That(method.CilMethodBody!.Instructions.Any(i=>i.OpCode==CilOpCodes.Ldc_I4_0),Is.False);
+    }
+
+    [Test]
     public void StaticCall_DoesNotLoadMethodInfoOperand()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

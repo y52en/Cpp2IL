@@ -30,6 +30,8 @@ public class Instruction : IOperand
 
     // Exists to clear the return register after a CallVoid, basically.
     public Register? ImplicitDefinition;
+    // Proven byte width of a lifted native store; zero means unknown.
+    public int NativeWriteSize;
 
     public bool IsFallThrough =>
         OpCode switch
