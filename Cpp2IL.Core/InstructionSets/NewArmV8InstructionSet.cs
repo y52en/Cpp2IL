@@ -262,7 +262,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
     {
-        var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, AnalysisPointer(context));
+        var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, AnalysisPointer(context)).ToList();
 
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
@@ -272,8 +272,23 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
 
-        foreach (var instruction in insns)
-            ConvertInstructionStatement(instruction, instructions, addresses, context);
+        var tables = new Dictionary<int, Arm64JumpTableRecovery.Table>();
+        if (context.AppContext.Binary is LibCpp2IL.Elf.ElfFile elf)
+            for (var i = 1; i < insns.Count; i++)
+                if (Arm64JumpTableRecovery.Recognize(insns, i, elf.ReadOnlyMappedData) is { } table)
+                    tables[table.LoadIndex] = table;
+        for (var i = 0; i < insns.Count; i++)
+        {
+            if (!tables.TryGetValue(i, out var table))
+            {
+                ConvertInstructionStatement(insns[i], instructions, addresses, context);
+                continue;
+            }
+            // Snapshot before the target register overwrites the index. Preserve
+            // its exact native value on every selected edge, even if it is live.
+            Arm64JumpTableRecovery.Emit(table, insns[i].Address, instructions, addresses);
+            i = table.BranchIndex;
+        }
 
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)

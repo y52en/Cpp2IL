@@ -570,6 +570,29 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
     public override ReadOnlySpan<byte> GetRawBinaryContent() => _raw;
 
+    // Bounded immutable table reads for control-flow recovery. Never use a
+    // writable mapping, zero-fill tail, ambiguous overlapping load, or host endian.
+    public byte[]? ReadOnlyMappedData(ulong address, int count)
+    {
+        if (_elfFileIdent?.Endianness != 1 || count is <= 0 or > 16384
+            || address > ulong.MaxValue - (ulong)count) return null;
+        var end = address + (ulong)count;
+        if (_elfProgramHeaderEntries.Any(p => p.Type == ElfProgramEntryType.PT_LOAD
+            && p.VirtualAddress > ulong.MaxValue - p.VirtualSize)) return null;
+        var loads = _elfProgramHeaderEntries.Where(p => p.Type == ElfProgramEntryType.PT_LOAD
+            && address < p.VirtualAddress + p.VirtualSize && end > p.VirtualAddress).ToList();
+        if (loads.Count != 1) return null;
+        var load = loads[0];
+        if ((load.Flags & ElfProgramHeaderFlags.PF_W) != 0
+            || (load.Flags & ElfProgramHeaderFlags.PF_R) == 0
+            || address < load.VirtualAddress || end - load.VirtualAddress > load.RawSize) return null;
+        var offset = address - load.VirtualAddress;
+        if (load.RawAddress > ulong.MaxValue - offset) return null;
+        var raw = load.RawAddress + offset;
+        return raw <= (ulong)_raw.Length && (ulong)count <= (ulong)_raw.Length - raw
+            ? _raw.AsSpan((int)raw, count).ToArray() : null;
+    }
+
     public override ulong GetVirtualAddressOfExportedFunctionByName(string toFind)
     {
         if (!_exportNameTable.TryGetValue(toFind, out var exportedSymbol))
