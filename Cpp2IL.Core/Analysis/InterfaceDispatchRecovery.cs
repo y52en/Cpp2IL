@@ -19,6 +19,17 @@ public static class InterfaceDispatchRecovery
             return;
 
         var cfg = method.ControlFlowGraph!;
+        // Opt-in local diagnostics only; do not change recovery or its gates.
+        var trace=System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_INTERFACE_RVAS")?.Split(',')
+            .Any(r=>string.Equals(r.Trim(),method.UnderlyingPointer.ToString("X"),System.StringComparison.OrdinalIgnoreCase))==true;
+        if(trace)
+        {
+            System.Console.Error.WriteLine("INTERFACE BEFORE: "+method.FullName);
+            foreach(var local in method.Locals)
+                System.Console.Error.WriteLine("LOCAL "+local.Name+" TYPE "+local.Type?.FullName);
+            foreach(var block in cfg.Blocks)
+                System.Console.Error.WriteLine(block+"Successors: "+string.Join(",",block.Successors.Select(s=>s.ID)));
+        }
 
         var definitions = new Dictionary<LocalVariable, Instruction>();
         var homeBlock = new Dictionary<Instruction, Block>();
@@ -43,7 +54,12 @@ public static class InterfaceDispatchRecovery
                     continue;
 
                 if (MatchDispatch(method, instruction, definitions, homeBlock) is not { } match)
+                {
+                    if(trace) System.Console.Error.WriteLine("INTERFACE UNMATCHED: "+instruction);
                     continue;
+                }
+
+                if(trace) System.Console.Error.WriteLine("INTERFACE MATCHED: "+match.Resolved.FullName);
 
                 RewriteDispatch(method, instruction, block, match, definitions);
                 TryExciseLookup(cfg, match, definitions, homeBlock);
