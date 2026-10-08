@@ -519,19 +519,19 @@ public static class IlGenerator
                     ? resultType : null;
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine,
-                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual ? DestinationType(instruction.Operands[2]) : bitwiseType);
+                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual || instruction.UnsignedComparison ? DestinationType(instruction.Operands[2]) : bitwiseType);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
                 LoadOperand(instruction.Operands[2], method, locals, writeLine,
-                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual ? DestinationType(instruction.Operands[1]) : bitwiseType);
+                    instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual || instruction.UnsignedComparison ? DestinationType(instruction.Operands[1]) : bitwiseType);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 
                 switch (instruction.OpCode)
                 {
                     case OpCode.CheckEqual: instructions.Add(CilOpCodes.Ceq); break;
-                    case OpCode.CheckGreater: instructions.Add(CilOpCodes.Cgt); break;
-                    case OpCode.CheckLess: instructions.Add(CilOpCodes.Clt); break;
+                    case OpCode.CheckGreater: instructions.Add(instruction.UnsignedComparison ? CilOpCodes.Cgt_Un : CilOpCodes.Cgt); break;
+                    case OpCode.CheckLess: instructions.Add(instruction.UnsignedComparison ? CilOpCodes.Clt_Un : CilOpCodes.Clt); break;
 
                     // a != b  ==  (a == b) == 0
                     case OpCode.CheckNotEqual:
@@ -541,13 +541,13 @@ public static class IlGenerator
                         break;
                     // a >= b  ==  !(a < b)
                     case OpCode.CheckGreaterOrEqual:
-                        instructions.Add(CilOpCodes.Clt);
+                        instructions.Add(instruction.UnsignedComparison ? CilOpCodes.Clt_Un : CilOpCodes.Clt);
                         instructions.Add(CilOpCodes.Ldc_I4_0);
                         instructions.Add(CilOpCodes.Ceq);
                         break;
                     // a <= b  ==  !(a > b)
                     case OpCode.CheckLessOrEqual:
-                        instructions.Add(CilOpCodes.Cgt);
+                        instructions.Add(instruction.UnsignedComparison ? CilOpCodes.Cgt_Un : CilOpCodes.Cgt);
                         instructions.Add(CilOpCodes.Ldc_I4_0);
                         instructions.Add(CilOpCodes.Ceq);
                         break;

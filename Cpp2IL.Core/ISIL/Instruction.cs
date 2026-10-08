@@ -36,6 +36,8 @@ public class Instruction : IOperand
     public int NativeReadSize;
     // Width of a directly lifted integer ADD/SUB result, not an inferred pointer/type.
     public int NativeArithmeticSize;
+    // Signedness is part of the comparison, not inferred from a C# type name.
+    public bool UnsignedComparison;
     // Width proven zero by a full native register initialization (not a scalar guess).
     public int NativeZeroSize;
     // Proven vtable/interface dispatch, distinct from a direct call to a virtual

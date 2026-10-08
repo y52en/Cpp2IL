@@ -122,7 +122,7 @@ public static class FlagConditionRecovery
     {
         op0 = op1 = null;
         var def = Def(local, defOf);
-        if (def is not { OpCode: OpCode.CheckLess } || !IsZeroConstant(def.Operands[2]))
+        if (def is not { OpCode: OpCode.CheckLess, UnsignedComparison: false } || !IsZeroConstant(def.Operands[2]))
             return false;
         return IsSubtraction(AsLocal(def.Operands[1]), defOf, out op0, out op1);
     }

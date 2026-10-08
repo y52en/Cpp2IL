@@ -448,7 +448,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             var temp3 = new Register(null, "TEMP3");
             var temp4 = new Register(null, "TEMP4");
 
-            Add(address, OpCode.CheckLess, flagC, op0, op1); // arm's C is the inverse of a borrow
+            var borrow = Add(address, OpCode.CheckLess, flagC, op0, op1);
+            // CMP/SUB carry means no unsigned borrow. CMN/conditional compare
+            // need their own carry/flag proofs; don't silently reinterpret them.
+            borrow.UnsignedComparison = instruction.Mnemonic is Arm64Mnemonic.CMP or Arm64Mnemonic.SUB or Arm64Mnemonic.SUBS;
             Add(address, OpCode.Not, flagC, flagC);
             Add(address, OpCode.Subtract, temp1, op0, op1);
             Add(address, OpCode.CheckLess, flagN, temp1, Imm(0));
