@@ -22,8 +22,73 @@ public static class ArrayRecovery
     private static long LengthOffset(int pointerSize) => 3L * pointerSize;
     private static long ElementsOffset(int pointerSize) => 4L * pointerSize;
 
+    // ARM commonly computes array + (index << log2(stride)) in separate ADDs.
+    // Recover only proven memory loads/stores, never a pointer-valued load/LEA.
+    public static bool RecoverSplitAccesses(MethodAnalysisContext method)
+    {
+        var cfg=method.ControlFlowGraph!;
+        var definitions=SingleDefinitions(cfg);
+        var pointerSize=method.AppContext.Binary.PointerSizeBytes;
+        var changed=false;
+        foreach(var instruction in cfg.Instructions)
+        {
+            if(instruction.OpCode!=OpCode.Move) continue;
+            for(var slot=0;slot<2 && slot<instruction.Operands.Count;slot++)
+            {
+                var width=slot==0 ? instruction.NativeWriteSize : instruction.NativeReadSize;
+                if(width<=0 || instruction.Operands[slot] is not MemoryOperand memory) continue;
+                var terms=new Dictionary<LocalVariable,long>();long offset=memory.Addend;
+                try
+                {
+                    if(!AccumulateAddress(memory.Base,1,terms,ref offset,definitions,0)
+                        || !AccumulateAddress(memory.Index,Math.Max(memory.Scale,1),terms,ref offset,definitions,0)) continue;
+                    var arrays=terms.Where(t=>t.Value!=0 && t.Key.Type is SzArrayTypeAnalysisContext).ToArray();
+                    if(arrays.Length!=1 || arrays[0].Value!=1) continue;
+                    var array=arrays[0].Key;
+                    var stride=ElementSize(((SzArrayTypeAnalysisContext)array.Type!).ElementType,pointerSize);
+                    if(stride<=0 || width!=stride) continue;
+                    var indices=terms.Where(t=>t.Value!=0 && !ReferenceEquals(t.Key,array)).ToArray();
+                    var delta=checked(offset-ElementsOffset(pointerSize));
+                    IOperand index;
+                    if(indices.Length==0 && delta>=0 && delta%stride==0) index=new Immediate(delta/stride);
+                    else if(indices.Length==1 && indices[0].Value==stride && delta==0) index=indices[0].Key;
+                    else continue;
+                    instruction.SetOperand(slot,new ArrayAccess(array,index));changed=true;
+                }
+                catch(OverflowException) { /* Unprovable affine address: preserve diagnostics. */ }
+            }
+        }
+        return changed;
+    }
+
+    private static bool AccumulateAddress(IOperand? operand,long factor,Dictionary<LocalVariable,long> terms,ref long offset,
+        Dictionary<LocalVariable,Instruction?> definitions,int depth)
+    {
+        if(depth>12) return false;
+        if(operand==null) return true;
+        if(operand is Immediate immediate) { offset=checked(offset+checked(factor*immediate.Value));return true; }
+        if(operand is not LocalVariable local) return false;
+        if(definitions.TryGetValue(local,out var definition) && definition!=null)
+        {
+            if(definition is {OpCode:OpCode.Move,Operands:[_,LocalVariable copied]})
+                return AccumulateAddress(copied,factor,terms,ref offset,definitions,depth+1);
+            if(definition is {OpCode:OpCode.Add,Operands:[_,var left,var right]})
+                return AccumulateAddress(left,factor,terms,ref offset,definitions,depth+1)
+                    && AccumulateAddress(right,factor,terms,ref offset,definitions,depth+1);
+            if(definition is {OpCode:OpCode.ShiftLeft,Operands:[_,var shifted,Immediate {Value:>=0 and <32} shift]})
+                return AccumulateAddress(shifted,checked(factor*(1L<<(int)shift.Value)),terms,ref offset,definitions,depth+1);
+            if(definition is {OpCode:OpCode.Multiply,Operands:[_,var multiplied,Immediate multiplier]})
+                return AccumulateAddress(multiplied,checked(factor*multiplier.Value),terms,ref offset,definitions,depth+1);
+        }
+        // Do not follow memory loads, calls, phi values or multiply-defined locals
+        // as though their pointer/numeric contents were an address expression.
+        terms[local]=checked(terms.GetValueOrDefault(local)+factor);
+        return true;
+    }
+
     public static void Run(MethodAnalysisContext method)
     {
+        RecoverSplitAccesses(method);
         RecoverAccesses(method);
         RecoverStructElementAddresses(method);
         GroupInitialisers(method.ControlFlowGraph!);

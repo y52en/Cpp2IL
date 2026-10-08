@@ -259,6 +259,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveAmbiguousCalls(method);
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method);
+            changed |= ArrayRecovery.RecoverSplitAccesses(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= StackFieldRecovery.Run(method);
             changed |= StackFieldZeroRecovery.Run(method);
@@ -546,6 +547,9 @@ public static class LocalVariables
         // that lets the loaded value go on to be the base of a further field access.
         if (destination is LocalVariable loadDest && source is FieldReference loadField)
             return SetTypeIfUnknown(loadDest, loadField.Field.FieldType);
+
+        if (destination is LocalVariable arrayDest && source is ArrayAccess { Array.Type: SzArrayTypeAnalysisContext arrayType })
+            return SetTypeIfUnknown(arrayDest,arrayType.ElementType);
 
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
