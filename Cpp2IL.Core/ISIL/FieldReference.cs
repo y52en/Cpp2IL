@@ -7,6 +7,7 @@ public class FieldReference(FieldAnalysisContext field, LocalVariable local, int
     public FieldAnalysisContext Field = field;
     public LocalVariable Local = local;
     public int Offset = offset;
+    public FieldReference? Parent;
 
-    public override string ToString() => $"{Local.Name}.{Field.Name} ({Field.FieldType.FullName})";
+    public override string ToString() => Parent==null ? $"{Local.Name}.{Field.Name} ({Field.FieldType.FullName})" : $"{Parent}.{Field.Name} ({Field.FieldType.FullName})";
 }

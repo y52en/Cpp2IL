@@ -176,7 +176,12 @@ public static class MetadataResolver
 
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? local.Type;
+                var owner = staticOwner ?? (local.Type is ByRefTypeAnalysisContext byref ? byref.ElementType : local.Type);
+                if(i==0 && instruction.OpCode==OpCode.Move && instruction.NativeWriteSize>0 && staticOwner==null
+                    && NestedFieldAccess.Find(owner,local,memory.Addend,instruction.NativeWriteSize) is { } nested)
+                {
+                    instruction.SetOperand(i,nested);changed=true;continue;
+                }
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 FieldAnalysisContext? field;

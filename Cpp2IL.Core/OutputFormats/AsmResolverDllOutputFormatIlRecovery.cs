@@ -94,7 +94,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             InlinedConstructorRecovery.Run(methodContext);
 
             if (methodContext.ConvertedIsil.Count == 0)
-                FillMethodBodyWithStub(methodDefinition);
+                throw new DecompilerException("No native instructions were recovered.");
             else
                 IlGenerator.GenerateIl(methodContext, methodDefinition);
 
@@ -124,7 +124,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 .CreateTypeReference("System", "Exception")
                 .CreateMemberReference(".ctor", MethodSignature.CreateInstance(factory.Void, [factory.String]));
 
-            instructions.Add(CilOpCodes.Ldstr, detail);
+            instructions.Add(CilOpCodes.Ldstr, "Cpp2IL recovery failure: " + detail);
             instructions.Add(CilOpCodes.Newobj, exceptionCtor);
             instructions.Add(CilOpCodes.Throw);
         }

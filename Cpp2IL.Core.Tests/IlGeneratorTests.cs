@@ -41,6 +41,37 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void NestedStructStoreAddressesParentFieldBeforeStoringScalar()
+    {
+        var app=Cpp2IlApi.CurrentAppContext!;
+        var assembly=app.SystemTypes.SystemObjectType.DeclaringAssembly;
+        var holder=new InjectedTypeAnalysisContext(assembly,"Test","Holder",app.SystemTypes.SystemObjectType,System.Reflection.TypeAttributes.Public);
+        var data=new InjectedTypeAnalysisContext(assembly,"Test","Data",app.SystemTypes.SystemValueTypeType,System.Reflection.TypeAttributes.Public);
+        var parent=holder.InjectFieldContext("Data",data,System.Reflection.FieldAttributes.Public);
+        var scalar=data.InjectFieldContext("X",app.SystemTypes.SystemSingleType,System.Reflection.FieldAttributes.Public);
+        var local=new LocalVariable("holder",new Register(null,"X19"),holder);
+        var field=new FieldReference(scalar,local,16){Parent=new FieldReference(parent,local,16)};
+        var caller=new InjectedMethodAnalysisContext(holder,"Write",app.SystemTypes.SystemVoidType,ReflectionMethodAttributes.Public|ReflectionMethodAttributes.Static,[]);
+        caller.ControlFlowGraph=new([new(0,OpCode.Move,field,new FloatLiteral(1)),new(1,OpCode.Return)]);
+        caller.Locals=[local];caller.ParameterLocals=[];caller.AnalysisWarnings=[];
+        var module=new ModuleDefinition("Test.dll",new AssemblyReference("mscorlib",new Version(4,0,0,0)));
+        var dataDef=new TypeDefinition("Test","Data",TypeAttributes.Public|TypeAttributes.SequentialLayout,
+            new TypeReference(module,module.CorLibTypeFactory.CorLibScope,"System","ValueType"));
+        var holderDef=new TypeDefinition("Test","Holder",TypeAttributes.Public,module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(dataDef);module.TopLevelTypes.Add(holderDef);
+        data.PutExtraData("AsmResolverType",dataDef);holder.PutExtraData("AsmResolverType",holderDef);
+        var parentDef=new FieldDefinition("Data",FieldAttributes.Public,new FieldSignature(dataDef.ToTypeSignature()));holderDef.Fields.Add(parentDef);
+        var scalarDef=new FieldDefinition("X",FieldAttributes.Public,new FieldSignature(module.CorLibTypeFactory.Single));dataDef.Fields.Add(scalarDef);
+        parent.PutExtraData("AsmResolverField",parentDef);scalar.PutExtraData("AsmResolverField",scalarDef);
+        var method=new MethodDefinition("Write",MethodAttributes.Public|MethodAttributes.Static,MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));holderDef.Methods.Add(method);
+        IlGenerator.GenerateIl(caller,method);
+        var instructions=method.CilMethodBody!.Instructions;
+        Assert.That(instructions.Any(i=>i.OpCode==CilOpCodes.Ldflda && i.Operand==parentDef),Is.True);
+        Assert.That(instructions.Any(i=>i.OpCode==CilOpCodes.Stfld && i.Operand==scalarDef),Is.True);
+        Assert.That(instructions.Any(i=>i.OpCode==CilOpCodes.Stfld && i.Operand==parentDef),Is.False);
+    }
+
+    [Test]
     public void StaticCall_DoesNotLoadMethodInfoOperand()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

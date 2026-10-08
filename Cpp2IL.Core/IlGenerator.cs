@@ -291,7 +291,7 @@ public static class IlGenerator
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
                     if (!field.Field.IsStatic)
-                        LoadLocal(field.Local, method, locals);
+                        LoadFieldReceiver(field, method, locals);
 
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
@@ -714,7 +714,7 @@ public static class IlGenerator
                     break;
                 }
 
-                LoadLocal(field.Local, method, locals);
+                LoadFieldReceiver(field, method, locals);
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
@@ -886,6 +886,26 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldloc, locals[local]);
     }
 
+    private static void LoadFieldReceiver(FieldReference field,MethodDefinition method,Dictionary<LocalVariable,CilLocalVariable> locals)
+        => LoadFieldReceiver(field,field.Local,method,locals);
+
+    private static void LoadFieldReceiver(FieldReference field,LocalVariable root,MethodDefinition method,Dictionary<LocalVariable,CilLocalVariable> locals)
+    {
+        if(field.Parent==null)
+        {
+            if(root.Type?.IsValueType==true && !root.IsThis)
+            {
+                var parameter=method.Parameters.FirstOrDefault(p=>p.Name==root.Name);
+                if(parameter!=null) method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarga,parameter);
+                else method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldloca,locals[root]);
+            }
+            else LoadLocal(root,method,locals);
+            return;
+        }
+        LoadFieldReceiver(field.Parent,root,method,locals);
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldflda,field.Parent.Field.ToFieldDescriptor());
+    }
+
     private static void StoreToOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
@@ -912,7 +932,7 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
-                LoadLocal(field.Local, method, locals);
+                LoadFieldReceiver(field, method, locals);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;
