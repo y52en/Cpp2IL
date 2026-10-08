@@ -529,6 +529,12 @@ public static class LocalVariables
             _ => null,
         };
 
+        // Enum values occupy the evaluation stack using their metadata-backed
+        // integral representation. Arithmetic temporaries are integers, not
+        // boxed objects or new enum declarations. Missing metadata stays unknown.
+        if (type is { IsEnumType: true })
+            type = type.EnumUnderlyingType;
+
         return type?.FullName switch
         {
             "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16"

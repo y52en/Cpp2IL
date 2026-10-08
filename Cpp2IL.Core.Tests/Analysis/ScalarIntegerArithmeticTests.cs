@@ -7,6 +7,46 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class ScalarIntegerArithmeticTests
 {
+    [TestCase("Byte", false)]
+    [TestCase("SByte", false)]
+    [TestCase("Int16", false)]
+    [TestCase("UInt16", false)]
+    [TestCase("Int32", false)]
+    [TestCase("UInt32", false)]
+    [TestCase("Int64", true)]
+    [TestCase("UInt64", true)]
+    public void EnumArithmeticUsesMetadataWidthAndKeepsSourceEnum(string underlying, bool wide)
+    {
+        var app = TestGameLoader.LoadSimple2019Game();
+        var assembly = app.SystemTypes.SystemObjectType.DeclaringAssembly;
+        var enumType = new InjectedTypeAnalysisContext(assembly, "Test", "Step", assembly.GetTypeByFullName("System.Enum"), TypeAttributes.Public)
+            { EnumUnderlyingType = assembly.GetTypeByFullName("System." + underlying)! };
+        var left = new LocalVariable("step", new Register(null, "X0"), enumType);
+        var result = new LocalVariable("difference", new Register(null, "X1"));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Compute", app.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static, []);
+        method.ControlFlowGraph = new([new(0, OpCode.Subtract, result, left, new Immediate(9)), new(1, OpCode.Return)]);
+        method.Locals = [left, result]; method.ParameterLocals = []; method.AnalysisWarnings = [];
+        LocalVariables.ResolveTypesAndFields(method);
+        Assert.That(result.Type, Is.SameAs(wide ? app.SystemTypes.SystemInt64Type : app.SystemTypes.SystemInt32Type));
+        Assert.That(left.Type, Is.SameAs(enumType));
+    }
+
+    [Test]
+    public void EnumWithoutUnderlyingMetadataRemainsUnresolved()
+    {
+        var app = TestGameLoader.LoadSimple2019Game();
+        var assembly = app.SystemTypes.SystemObjectType.DeclaringAssembly;
+        var enumType = new InjectedTypeAnalysisContext(assembly, "Test", "Unknown", assembly.GetTypeByFullName("System.Enum"), TypeAttributes.Public);
+        var left = new LocalVariable("step", new Register(null, "X0"), enumType);
+        var result = new LocalVariable("difference", new Register(null, "X1"));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Compute", app.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static, []);
+        method.ControlFlowGraph = new([new(0, OpCode.Subtract, result, left, new Immediate(9)), new(1, OpCode.Return)]);
+        method.Locals = [left, result]; method.ParameterLocals = []; method.AnalysisWarnings = [];
+        LocalVariables.ResolveTypesAndFields(method);
+        Assert.That(result.Type, Is.Null);
+        Assert.That(left.Type, Is.SameAs(enumType));
+    }
+
     [TestCase(OpCode.Add,false)]
     [TestCase(OpCode.Subtract,false)]
     [TestCase(OpCode.Multiply,false)]
