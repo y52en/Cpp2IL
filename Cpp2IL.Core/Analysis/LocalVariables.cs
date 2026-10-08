@@ -429,7 +429,7 @@ public static class LocalVariables
                     changed |= PropagatePhi(instruction);
                     break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
-                    changed |= PropagateArithmetic(instruction, method);
+                    changed |= PropagateArithmetic(instruction, method) || PropagateScalarIntegerArithmetic(instruction,method);
                     break;
                 case OpCode.Divide or OpCode.Modulo:
                     changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
@@ -492,6 +492,22 @@ public static class LocalVariables
     }
 
     // An integer operand makes the result an integer. Excludes bool operands so flag logic stays boolean.
+    private static bool PropagateScalarIntegerArithmetic(Instruction instruction,MethodAnalysisContext method)
+    {
+        if(instruction.Operands is not [LocalVariable {Type:null} destination,var left,var right]) return false;
+        var leftType=IntegerResultType(left,method);
+        var rightType=IntegerResultType(right,method);
+        var type=leftType ?? rightType;
+        if(type==null) return false;
+        bool Compatible(IOperand operand,TypeAnalysisContext? known)
+            => known?.FullName==type.FullName || known==null && operand is Immediate immediate
+                && (type.FullName=="System.Int64" || immediate.Value is >=int.MinValue and <=int.MaxValue);
+        // Unlike bitwise flag inference, integer + unknown/reference is NOT
+        // evidence of integer arithmetic: it may be a native pointer address.
+        if(!Compatible(left,leftType) || !Compatible(right,rightType)) return false;
+        return SetTypeIfUnknown(destination,type);
+    }
+
     private static bool PropagateIntegerResult(Instruction instruction, MethodAnalysisContext method)
     {
         if (instruction.Operands[0] is not LocalVariable { Type: null } destination)
