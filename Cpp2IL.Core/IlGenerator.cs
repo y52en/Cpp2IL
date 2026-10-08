@@ -654,10 +654,18 @@ public static class IlGenerator
             return;
         }
 
+        // Enum values have the evaluation-stack width of their metadata
+        // underlying type, not the width suggested by an unsigned literal.
+        var integralType = expectedType is { IsEnumType: true } ? expectedType.EnumUnderlyingType : expectedType;
+
         switch (operand)
         {
+            case Immediate wide when integralType is { FullName: "System.Int64" or "System.UInt64" }:
+                // Even zero and one must be I8 for a long field/argument/return.
+                instructions.Add(CilOpCodes.Ldc_I8, wide.Value);
+                break;
             case Immediate { Value: > int.MaxValue and <= uint.MaxValue } mask
-                when expectedType is { FullName: "System.Int32" or "System.UInt32" }:
+                when integralType is { FullName: "System.Int32" or "System.UInt32" }:
                 // An Int32 bitmask such as 0x80000000 is an I4 bit pattern,
                 // not an I8 operand merely because its unsigned spelling is positive.
                 instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)mask.Value));
