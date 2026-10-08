@@ -37,6 +37,30 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     private static Register Reg(Arm64Register reg) => new(null, NormalizeRegister(reg));
 
+    // FCMP/FCMPE set NZCV from an IEEE comparison, not integer subtraction.
+    // Unordered (NaN) is N=0,Z=0,C=1,V=1. Keep V: signed ARM conditions use it.
+    public static List<Instruction> FloatingCompareFlags(IOperand left, IOperand right, bool doublePrecision)
+    {
+        if (right is Immediate { Value: 0 } or FloatLiteral { Value: 0 } or DoubleLiteral { Value: 0 })
+            right = doublePrecision ? new DoubleLiteral(0) : new FloatLiteral(0);
+        var n = new Register(null, "N");
+        var z = new Register(null, "Z");
+        var c = new Register(null, "C");
+        var v = new Register(null, "V");
+        var greater = new Register(null, "FP_GREATER");
+        var ordered = new Register(null, "FP_ORDERED");
+        return
+        [
+            new(0, OpCode.CheckLess, n, left, right),
+            new(1, OpCode.CheckEqual, z, left, right),
+            new(2, OpCode.Not, c, n),
+            new(3, OpCode.CheckGreater, greater, left, right),
+            new(4, OpCode.Or, ordered, n, z),
+            new(5, OpCode.Or, ordered, ordered, greater),
+            new(6, OpCode.Not, v, ordered),
+        ];
+    }
+
     public static int StoreWidth(Arm64Mnemonic mnemonic,Arm64Register register)
         => mnemonic is Arm64Mnemonic.STRB or Arm64Mnemonic.STURB ? 1
             : mnemonic is Arm64Mnemonic.STRH or Arm64Mnemonic.STURH ? 2
@@ -656,9 +680,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
             case Arm64Mnemonic.CMP:
+                EmitCompareFlags(ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                break;
             case Arm64Mnemonic.FCMP:
             case Arm64Mnemonic.FCMPE:
-                EmitCompareFlags(ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                foreach (var comparison in FloatingCompareFlags(ConvertOperand(instruction, 0),
+                             ConvertOperand(instruction, 1),
+                             instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31))
+                    Add(address, comparison.OpCode, comparison.Operands.ToList());
                 break;
             case Arm64Mnemonic.CMN:
                 // cmp against the negated operand
