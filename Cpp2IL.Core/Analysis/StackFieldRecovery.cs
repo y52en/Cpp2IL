@@ -27,6 +27,8 @@ public static class StackFieldRecovery
         var graph = method.ControlFlowGraph!;
         var definitions = new HashSet<LocalVariable>(graph.Instructions.Select(i=>i.Destination).OfType<LocalVariable>());
         var writers = new List<Writer>();
+        var trace = Environment.GetEnvironmentVariable("CPP2IL_TRACE_CONSTRUCTOR_RVAS")?.Split(',')
+            .Any(r => string.Equals(r.Trim(),method.UnderlyingPointer.ToString("X"),StringComparison.OrdinalIgnoreCase)) == true;
         foreach (var block in graph.Blocks)
         foreach (var call in block.Instructions)
         {
@@ -39,6 +41,14 @@ public static class StackFieldRecovery
             if (call.Destination is LocalVariable result && result.Type?.IsValueType == true
                 && result.Type == target.ReturnType && TryOffset(result,out var resultOffset))
                 writers.Add(new(call,block,result,resultOffset));
+        }
+        if (trace)
+        {
+            Console.Error.WriteLine("StackFieldRecovery: " + method.FullName);
+            foreach (var writer in writers)
+                Console.Error.WriteLine("writer " + writer.Storage + " fields: " + string.Join(",",writer.Storage.Type!.Fields.Select(f=>f.Name+"="+f.Offset)));
+            foreach (var local in graph.Instructions.SelectMany(i=>i.Operands).OfType<LocalVariable>().Distinct().Where(l=>TryOffset(l,out _)))
+                Console.Error.WriteLine("slot " + local + " defined=" + definitions.Contains(local));
         }
         if (writers.Count == 0) return false;
         DominatorInfo? dominance = null;

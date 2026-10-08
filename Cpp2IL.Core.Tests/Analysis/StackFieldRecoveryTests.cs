@@ -31,6 +31,23 @@ public class StackFieldRecoveryTests
     }
 
     [Test]
+    public void PointerCopyMustBePropagatedBeforeStackWriterCanBeRecognized()
+    {
+        var f=Fixture();
+        var writer=f.Caller.ControlFlowGraph!.Instructions.Find(i=>i.IsCall)!;
+        var pointer=new LocalVariable("pointer",new Register(null,"X0",1));
+        writer.SetOperand(1,pointer);
+        f.Caller.ControlFlowGraph=new([
+            new(0,OpCode.Move,pointer,new AddressOf(f.Storage)),writer,f.Read,new(3,OpCode.Return,f.Read.Destination!)]);
+        Assert.That(StackFieldRecovery.Run(f.Caller),Is.False);
+        SsaSimplifier.Run(f.Caller);
+        Assert.That(writer.Operands[1],Is.TypeOf<AddressOf>());
+        Assert.That(StackFieldRecovery.Run(f.Caller),Is.True);
+        var returned=f.Caller.ControlFlowGraph!.Instructions.Find(i=>i.OpCode==OpCode.Return)!;
+        Assert.That(((FieldReference)returned.Operands[0]).Field,Is.SameAs(f.Field));
+    }
+
+    [Test]
     public void UndefinedReadAfterKnownByAddressWriteBindsExactField()
     {
         var f=Fixture();

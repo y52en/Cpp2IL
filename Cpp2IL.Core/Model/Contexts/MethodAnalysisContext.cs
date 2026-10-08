@@ -459,6 +459,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
         CallArgumentTrimmer.Run(this);
+        // Native receivers still contain pointer copies during the early type
+        // fixpoint. Copy propagation exposes &stack storage only later; recover
+        // its independently named scalar reads before they become default IL
+        // locals and before inlined constructor matching consumes those reads.
+        StackFieldRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);
