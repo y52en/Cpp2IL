@@ -133,6 +133,9 @@ public static class InlinedConstructorRecovery
         ref DominatorInfo? dominance, ISet<LocalVariable> aliases)
     {
         if (value is Immediate or FloatLiteral or DoubleLiteral or StringLiteral) return true;
+        if (value is FieldReference { Field.IsStatic: false } field)
+            return field.Local.Type?.IsValueType == true && AvailableBeforeAllocation(field.Local,
+                method,instructions,allocationIndex,allocationBlock,ref dominance,aliases);
         if (value is not LocalVariable local || aliases.Contains(local)) return false;
         var definitions = instructions.Select((i,n)=>(i,n)).Where(x => ReferenceEquals(x.i.Destination,local)).ToList();
         if (definitions.Count == 0) return method.ParameterLocals.Contains(local);
@@ -156,6 +159,7 @@ public static class InlinedConstructorRecovery
         (FloatLiteral x,FloatLiteral y) => x.Value.Equals(y.Value),
         (DoubleLiteral x,DoubleLiteral y) => x.Value.Equals(y.Value),
         (StringLiteral x,StringLiteral y) => x.Value == y.Value,
+        (FieldReference x,FieldReference y) => x.Field == y.Field && ReferenceEquals(x.Local,y.Local),
         _ => false
     };
 }

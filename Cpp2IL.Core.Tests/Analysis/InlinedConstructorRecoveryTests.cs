@@ -131,4 +131,23 @@ public class InlinedConstructorRecoveryTests
         Assert.That(call.Operands[2],Is.SameAs(counter));
         Assert.That(caller.ControlFlowGraph.Instructions.Any(i=>i.OpCode==OpCode.Add),Is.True);
     }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void OnlyNonThrowingStructFieldArgumentsCanMoveIntoTheConstructor(bool valueType)
+    {
+        var f=Fixture();var types=f.Type.AppContext.SystemTypes;
+        var data=new InjectedTypeAnalysisContext(f.Type.DeclaringAssembly,"Test","Args",
+            valueType?types.SystemValueTypeType:types.SystemObjectType,TypeAttributes.Public);
+        var field=data.InjectFieldContext("count",types.SystemInt32Type,FieldAttributes.Public);
+        var caller=new InjectedMethodAnalysisContext(f.Type,"Caller",f.Ctor.ReturnType,
+            MethodAttributes.Public|MethodAttributes.Static,[data]);
+        var parameter=Local("data",data);caller.ParameterLocals=[parameter];
+        var obj=Local("obj",f.Type);var allocation=new Instruction(0,OpCode.Newobj,obj,f.Type);
+        var call=new Instruction(1,OpCode.CallVoid,f.Base,obj);
+        caller.ControlFlowGraph=new([allocation,call,
+            new(2,OpCode.Move,new FieldReference(f.A,obj,16),new FieldReference(field,parameter,4)),
+            new(3,OpCode.Move,new FieldReference(f.B,obj,20),new FloatLiteral(1)),new(4,OpCode.Return)]);
+        Assert.That(InlinedConstructorRecovery.Recover(caller,allocation,[InlinedConstructorRecovery.Extract(f.Ctor)!]),Is.EqualTo(valueType));
+    }
 }
