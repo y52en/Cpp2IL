@@ -518,7 +518,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.MVNI when instruction.Op1Kind == Arm64OperandKind.Immediate:
                 {
                     var value = instruction.Mnemonic == Arm64Mnemonic.MVNI ? ~instruction.Op1Imm : instruction.Op1Imm;
-                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(value));
+                    var move=Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(value));
+                    if(instruction.Mnemonic==Arm64Mnemonic.MOVI && value==0)
+                        move.NativeZeroSize=StoreWidth(Arm64Mnemonic.STR,instruction.Op0Reg);
                     break;
                 }
             case Arm64Mnemonic.MOVK:

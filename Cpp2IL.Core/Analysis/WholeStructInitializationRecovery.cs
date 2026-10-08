@@ -15,6 +15,17 @@ public static class WholeStructInitializationRecovery
     {
         if(method.AppContext.InstructionSet is not NewArmV8InstructionSet) return false;
         var graph=method.ControlFlowGraph!;
+        var trace=System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_STRUCT_INIT_RVAS")?.Split(',')
+            .Any(r=>string.Equals(r.Trim(),method.UnderlyingPointer.ToString("X"),System.StringComparison.OrdinalIgnoreCase))==true;
+        if(trace)
+        {
+            System.Console.Error.WriteLine("Raw struct initialization: "+method.FullName);
+            foreach(var block in graph.Blocks)
+            {
+                System.Console.Error.WriteLine(block+"Predecessors: "+string.Join(",",block.Predecessors.Select(b=>b.ID)));
+                foreach(var i in block.Instructions)System.Console.Error.WriteLine("writeWidth="+i.NativeWriteSize+" "+i);
+            }
+        }
         var targets=new List<(Register Storage,TypeAnalysisContext Type,Block Block,Instruction Call)>();
         foreach(var block in graph.Blocks)
         foreach(var call in block.Instructions)
@@ -32,6 +43,7 @@ public static class WholeStructInitializationRecovery
             };
             if(storage is { } slot && Offset(slot,out _)) targets.Add((slot,callee.DeclaringType,block,call));
         }
+        if(trace)foreach(var target in targets)System.Console.Error.WriteLine("Typed struct target: "+target.Storage+" "+target.Type.FullName);
         DominatorInfo? dominance=null;
         var changed=false;
         foreach(var group in targets.GroupBy(t=>t.Storage.Name))
@@ -62,8 +74,9 @@ public static class WholeStructInitializationRecovery
         {
             var instruction=block.Instructions[i];
             if(instruction.OpCode==OpCode.Nop) continue;
-            if(instruction is not {OpCode:OpCode.Move,Operands:[Register slot,Immediate {Value:0}]}
+            if(instruction is not {OpCode:OpCode.Move,Operands:[Register slot,var value]}
                 || instruction.NativeWriteSize is not (1 or 2 or 4 or 8 or 16)
+                || !ZeroAt(block,start,value,instruction.NativeWriteSize)
                 || !Offset(slot,out var offset)) return false;
             var delta=(long)offset-basis;
             if(delta<0 || delta+instruction.NativeWriteSize>size) return false;
@@ -75,6 +88,21 @@ public static class WholeStructInitializationRecovery
             stores[0].NativeWriteSize=0;
             foreach(var other in stores.Skip(1)){other.OpCode=OpCode.Nop;other.SetOperands();other.NativeWriteSize=0;}
             return true;
+        }
+        return false;
+    }
+
+    private static bool ZeroAt(Block block,int before,IOperand value,int size)
+    {
+        if(value is Immediate {Value:0}) return true;
+        if(value is not Register source) return false;
+        for(var i=before-1;i>=0;i--)
+        {
+            var instruction=block.Instructions[i];
+            if(instruction.Destination is Register written && written.Name==source.Name)
+                return instruction is {OpCode:OpCode.Move,Operands:[_,Immediate {Value:0}]}
+                    && instruction.NativeZeroSize>=size;
+            if(instruction.IsCall || instruction.OpCode is OpCode.IndirectCall or OpCode.NotImplemented or OpCode.Invalid) return false;
         }
         return false;
     }

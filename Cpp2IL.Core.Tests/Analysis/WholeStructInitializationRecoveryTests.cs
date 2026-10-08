@@ -12,6 +12,23 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class WholeStructInitializationRecoveryTests
 {
+    [TestCase(16,false,true)]
+    [TestCase(8,false,false)]
+    [TestCase(0,false,false)]
+    [TestCase(16,true,false)]
+    public void VectorStoreRequiresFullProvenZeroWidth(int zeroWidth,bool overwritten,bool expected)
+    {
+        var types=TestGameLoader.LoadSimple2019Game().SystemTypes;
+        var type=new InjectedTypeAnalysisContext(types.SystemObjectType.DeclaringAssembly,"Test","Data",types.SystemValueTypeType,TypeAttributes.Public);
+        var root=new Register(null,"stack_-80");var vector=new Register(null,"V0");var block=new Block();
+        block.Instructions.Add(new Instruction(0,OpCode.Move,vector,new Immediate(0)){NativeZeroSize=zeroWidth});
+        if(overwritten)block.Instructions.Add(new(1,OpCode.Move,vector,new Immediate(1)));
+        var first=block.Instructions.Count;
+        block.Instructions.Add(new Instruction(2,OpCode.Move,root,vector){NativeWriteSize=16});
+        block.Instructions.Add(new Instruction(3,OpCode.Move,new Register(null,"stack_-70"),vector){NativeWriteSize=16});
+        Assert.That(WholeStructInitializationRecovery.RecoverGroup(block,first,root,type,32),Is.EqualTo(expected));
+    }
+
     [TestCase("complete")]
     [TestCase("reordered")]
     [TestCase("partial")]

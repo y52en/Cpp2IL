@@ -32,6 +32,8 @@ public class Instruction : IOperand
     public Register? ImplicitDefinition;
     // Proven byte width of a lifted native store; zero means unknown.
     public int NativeWriteSize;
+    // Width proven zero by a full native register initialization (not a scalar guess).
+    public int NativeZeroSize;
 
     public bool IsFallThrough =>
         OpCode switch
