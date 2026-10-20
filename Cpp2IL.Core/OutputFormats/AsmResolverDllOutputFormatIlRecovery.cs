@@ -38,6 +38,14 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
     protected override void PrepareMethodBodies(ApplicationAnalysisContext context)
     {
+        var fieldMethodCount = InlinedFieldMethodRecovery.Prepare(context, method =>
+            SkipAssemblyRecovery(method.DeclaringType!.DeclaringAssembly.Name + ".dll", method.UnderlyingPointer,
+                Environment.GetEnvironmentVariable("CPP2IL_RECOVERY_INCLUDE_FRAMEWORKS") == "1"));
+        Logger.InfoNewline($"Prepared {fieldMethodCount} native-derived inline field method templates.");
+        var trivialCount = TrivialConstructorRecovery.Prepare(context, ctor =>
+            SkipAssemblyRecovery(ctor.DeclaringType!.DeclaringAssembly.Name + ".dll", ctor.UnderlyingPointer,
+                Environment.GetEnvironmentVariable("CPP2IL_RECOVERY_INCLUDE_FRAMEWORKS") == "1"));
+        Logger.InfoNewline($"Prepared {trivialCount} native-proven trivial constructor templates.");
         // Build immutable templates before parallel emission, which mutates/releases
         // method graphs. Never analyze a constructor concurrently from a caller.
         var count = 0;
@@ -90,8 +98,15 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             Interlocked.Increment(ref TotalMethodCount);
 
             methodContext.Analyze();
+            UnusedInstanceReceiverRecovery.Run(methodContext);
 
             InlinedConstructorRecovery.Run(methodContext);
+            TrivialConstructorRecovery.Run(methodContext);
+            ConstantFieldConstructorRecovery.Run(methodContext);
+            EmptyObjectBaseConstructorRecovery.Run(methodContext);
+            // Constructor reconstruction consumes allocation-adjacent stores;
+            // do not hide those stores behind setters before it has run.
+            InlinedFieldMethodRecovery.Run(methodContext);
 
             if (methodContext.ConvertedIsil.Count == 0)
                 throw new DecompilerException("No native instructions were recovered.");

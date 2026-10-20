@@ -8,6 +8,36 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class SplitArrayAccessTests
 {
+    [TestCase(false,false,4,2,true)]
+    [TestCase(true,false,4,2,true)]
+    [TestCase(false,true,4,2,true)]
+    [TestCase(false,false,8,2,false)]
+    [TestCase(false,false,4,3,false)]
+    public void PreserveComputedInt32IndexRatherThanMovingItsConstantIntoPointerBytes(
+        bool store,bool subtract,int width,int shift,bool expected)
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var index=new LocalVariable("index",new Register(null,"W1"),app.SystemTypes.SystemInt32Type);
+        var computed=new LocalVariable("computed",new Register(null,"W9"),app.SystemTypes.SystemInt32Type);
+        var scaled=new LocalVariable("scaled",new Register(null,"TMP"));
+        var address=new LocalVariable("address",new Register(null,"X8"));
+        var array=new LocalVariable("array",new Register(null,"X20"),new SzArrayTypeAnalysisContext(app.SystemTypes.SystemSingleType));
+        var value=new LocalVariable("value",new Register(null,"S0"),app.SystemTypes.SystemSingleType);
+        var memory=new MemoryOperand(address,addend:32);
+        var access=store ? new Instruction(3,OpCode.Move,memory,value){NativeWriteSize=width}
+            : new Instruction(3,OpCode.Move,value,memory){NativeReadSize=width};
+        var calculation=new Instruction(0,subtract?OpCode.Subtract:OpCode.Add,computed,index,new Immediate(10));
+        var method=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Caller",app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static,[]);
+        method.ControlFlowGraph=new([calculation,new(1,OpCode.ShiftLeft,scaled,computed,new Immediate(shift)),
+            new(2,OpCode.Add,address,array,scaled),access,new(4,OpCode.Return)]);
+        Assert.That(ArrayRecovery.RecoverSplitAccesses(method),Is.EqualTo(expected));
+        var result=access.Operands[store?0:1] as ArrayAccess;
+        Assert.That(result!=null,Is.EqualTo(expected));
+        if(result!=null) Assert.That(result.Index,Is.SameAs(computed));
+        Assert.That(calculation.OpCode,Is.EqualTo(subtract?OpCode.Subtract:OpCode.Add));
+        Assert.That(calculation.Operands[2],Is.TypeOf<Immediate>());
+    }
+
     [TestCase(false,4,true)]
     [TestCase(true,4,false)]
     [TestCase(false,8,false)]

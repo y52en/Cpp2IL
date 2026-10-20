@@ -15,8 +15,20 @@ public static class FloatLiteralRecovery
     {
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
+            // Unlike a guessed managed type, an actual scalar FADD/FSUB/etc.
+            // proves that integer constants forwarded into its operands are
+            // native IEEE bits, not numbers requiring conv.r4/conv.r8.
+            if(instruction.NativeFloatingPointSize is 4 or 8
+                && instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Negate)
+            {
+                var type=instruction.NativeFloatingPointSize==4
+                    ? method.AppContext.SystemTypes.SystemSingleType : method.AppContext.SystemTypes.SystemDoubleType;
+                for(var index=1;index<instruction.Operands.Count;index++)TryConvert(instruction,index,type,true);
+            }
             if (instruction.OpCode == OpCode.Move && instruction.Operands is [FieldReference field, _])
                 TryConvert(instruction, 1, field.Field.FieldType);
+            else if (instruction.OpCode == OpCode.Move && instruction.Operands is [LocalVariable { Type: { } localType }, _])
+                TryConvert(instruction, 1, localType);
             else if (instruction.IsCall && instruction.Operands is [MethodAnalysisContext target, ..])
                 ConvertArguments(instruction, target);
         }
@@ -37,7 +49,7 @@ public static class FloatLiteralRecovery
         }
     }
 
-    private static void TryConvert(Instruction instruction, int operandIndex, TypeAnalysisContext type)
+    private static void TryConvert(Instruction instruction, int operandIndex, TypeAnalysisContext type, bool nativeFloatingProof=false)
     {
         if (!TryGetIntegerBits(instruction.Operands[operandIndex], out var bits))
             return;
@@ -46,10 +58,10 @@ public static class FloatLiteralRecovery
         // TODO FIXME: to its own Single/Double context instance rather than the canonical one in SystemTypes.
         switch (type.FullName)
         {
-            case "System.Single" when !IsSubnormalSingle((uint)bits):
+            case "System.Single" when nativeFloatingProof || !IsSubnormalSingle((uint)bits):
                 instruction.SetOperand(operandIndex, new FloatLiteral(BitConverter.ToSingle(BitConverter.GetBytes((uint)bits), 0)));
                 break;
-            case "System.Double" when !IsSubnormalDouble(bits):
+            case "System.Double" when nativeFloatingProof || !IsSubnormalDouble(bits):
                 instruction.SetOperand(operandIndex, new DoubleLiteral(BitConverter.ToDouble(BitConverter.GetBytes(bits), 0)));
                 break;
         }

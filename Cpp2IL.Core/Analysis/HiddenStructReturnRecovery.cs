@@ -1,8 +1,10 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -15,16 +17,23 @@ public static class HiddenStructReturnRecovery
     {
         if (method.AppContext.InstructionSet is not NewArmV8InstructionSet) return false;
         var graph=method.ControlFlowGraph!;
-        var resolver=method.AppContext.InstructionSet.CallingConventionResolver!;
+        if(method.AppContext.InstructionSet.CallingConventionResolver is not Arm64CallingConventionResolver resolver)return false;
         var changed=false;
         foreach(var block in graph.Blocks)
         foreach(var call in block.Instructions)
         {
             if(call.OpCode!=OpCode.Call || call.Operands[0] is not Immediate address
                 || !method.AppContext.MethodsByAddress.TryGetValue(address.UnsignedValue,out var targets)
-                || targets.Count!=1 || !resolver.ReturnsViaHiddenBuffer(targets[0])) continue;
+                || targets.Count==0 || !resolver.ReturnsViaHiddenBuffer(targets[0])) continue;
+            // ICF/shared generic aliases do not identify a declaring type, but
+            // ALL candidates can prove the same native result-storage ABI.
+            // Leave the concrete target/type to the separate MethodInfo pass.
             var buffer=resolver.HiddenReturnBufferRegister(targets[0]);
+            var size=resolver.ReturnStorageSize(targets[0]);
             if(buffer is not { } register
+                || targets.Any(target=>!resolver.ReturnsViaHiddenBuffer(target)
+                    || resolver.HiddenReturnBufferRegister(target)?.Name!=register.Name
+                    || resolver.ReturnStorageSize(target)!=size)
                 || ResolveStackAddress(block,block.Instructions.IndexOf(call),register) is not { } storage) continue;
             call.Destination=storage;
             call.ImplicitDefinition=new Register(null,"X0");

@@ -150,4 +150,40 @@ public class InlinedConstructorRecoveryTests
             new(3,OpCode.Move,new FieldReference(f.B,obj,20),new FloatLiteral(1)),new(4,OpCode.Return)]);
         Assert.That(InlinedConstructorRecovery.Recover(caller,allocation,[InlinedConstructorRecovery.Extract(f.Ctor)!]),Is.EqualTo(valueType));
     }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void ReferenceFieldReadsRequireTheCanonicalThisReceiver(bool canonicalThis)
+    {
+        var f=Fixture();
+        var caller=new InjectedMethodAnalysisContext(f.Type,"Caller",f.Ctor.ReturnType,MethodAttributes.Public,[]);
+        var self=Local("this",f.Type);self.IsThis=true;caller.ParameterLocals=[self];
+        var receiver=canonicalThis?self:Local("unproved-this-alias",f.Type);receiver.IsThis=true;
+        var obj=Local("obj",f.Type);var allocation=new Instruction(0,OpCode.Newobj,obj,f.Type);
+        var call=new Instruction(1,OpCode.CallVoid,f.Base,obj);
+        caller.ControlFlowGraph=new([allocation,call,
+            new(2,OpCode.Move,new FieldReference(f.A,obj,16),new FieldReference(f.A,receiver,16)),
+            new(3,OpCode.Move,new FieldReference(f.B,obj,20),new FloatLiteral(1)),new(4,OpCode.Return)]);
+        Assert.That(InlinedConstructorRecovery.Recover(caller,allocation,[InlinedConstructorRecovery.Extract(f.Ctor)!]),Is.EqualTo(canonicalThis));
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void JoinedArgumentRequiresAnAssignmentOnEveryIncomingPath(bool bothPathsAssigned)
+    {
+        var f=Fixture();var caller=new InjectedMethodAnalysisContext(f.Type,"Caller",f.Ctor.ReturnType,MethodAttributes.Public|MethodAttributes.Static,[]);
+        var obj=Local("obj",f.Type);var p=Local("joined",f.A.FieldType);
+        var allocation=new Instruction(0,OpCode.Newobj,obj,f.Type);var call=new Instruction(1,OpCode.CallVoid,f.Base,obj);
+        var graph=new ISILControlFlowGraph([]);var left=new Block{ID=2};var right=new Block{ID=3};var join=new Block{ID=4};
+        graph.Blocks.AddRange([left,right,join]);graph.EntryBlock.Successors.AddRange([left,right]);
+        left.Predecessors.Add(graph.EntryBlock);right.Predecessors.Add(graph.EntryBlock);
+        left.Successors.Add(join);right.Successors.Add(join);join.Predecessors.AddRange([left,right]);
+        join.Successors.Add(graph.ExitBlock);graph.ExitBlock.Predecessors.Add(join);
+        left.Instructions.Add(new(10,OpCode.Move,p,new Immediate(1)));
+        if(bothPathsAssigned)right.Instructions.Add(new(11,OpCode.Move,p,new Immediate(0)));
+        join.Instructions.AddRange([allocation,call,new(2,OpCode.Move,new FieldReference(f.A,obj,16),p),
+            new(3,OpCode.Move,new FieldReference(f.B,obj,20),new FloatLiteral(1)),new(4,OpCode.Return)]);
+        caller.ControlFlowGraph=graph;
+        Assert.That(InlinedConstructorRecovery.Recover(caller,allocation,[InlinedConstructorRecovery.Extract(f.Ctor)!]),Is.EqualTo(bothPathsAssigned));
+    }
 }

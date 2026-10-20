@@ -66,14 +66,16 @@ public static class MetadataResolver
     /// naming the method it refers to (also used to type the local - see <see cref="LocalVariables"/>),
     /// or likewise a <see cref="RuntimeFieldInfoAnalysisContext"/> for a FieldInfo* usage.
     /// </summary>
-    private static void ResolveMetadataUsages(MethodAnalysisContext method)
+    internal static void ResolveMetadataUsages(MethodAnalysisContext method)
     {
         var libContext = method.AppContext.LibCpp2IlContext;
-        var definitions = method.ControlFlowGraph!.Instructions
+        var allDefinitions = method.ControlFlowGraph!.Instructions
             .Where(i => i.Destination is LocalVariable)
             .GroupBy(i => (LocalVariable)i.Destination!)
-            .Where(group => group.Count() == 1)
-            .ToDictionary(group => group.Key, group => group.Single());
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        var definitions=allDefinitions.Where(group=>group.Value.Length==1)
+            .ToDictionary(group=>group.Key,group=>group.Value[0]);
+        DominatorInfo? gotDominance=null;
 
         ulong? ReadGot(ulong slot) => method.AppContext.Binary is ElfFile elf && elf.IsGlobalOffsetTableEntry(slot)
             ? elf.ReadPointerAtVirtualAddress(slot) : null;
@@ -90,7 +92,9 @@ public static class MetadataResolver
             {
                 MemoryOperand { Base: null, Index: null, Scale: 0 } memory => (ulong)memory.Addend,
                 Immediate immediate => immediate.UnsignedValue,
-                _ => IndirectMetadataAddress(instruction.Operands[1], definitions, ReadGot) ?? 0ul,
+                _ => IndirectMetadataAddress(instruction.Operands[1], definitions, ReadGot)
+                    ?? RepeatedGotMetadataAddress(instruction,method.ControlFlowGraph,allDefinitions,
+                        method.AppContext.Binary.PointerSizeBytes,ReadGot,ref gotDominance) ?? 0ul,
             };
 
             if (address == 0)
@@ -147,6 +151,44 @@ public static class MetadataResolver
         return readGot(unchecked((ulong)slot.Addend));
     }
 
+    // Post-SSA local coalescing can reuse a pointer for identical GOT loads.
+    // All writes must load the SAME exact pointer-sized GOT slot, and at least
+    // one write must actually dominate this use. Equal values alone do not
+    // prove initialization on an alternate entry/branch. The returned address
+    // still needs the authoritative metadata-usage lookup above.
+    internal static ulong? RepeatedGotMetadataAddress(Instruction consumer,ISILControlFlowGraph graph,
+        IReadOnlyDictionary<LocalVariable,Instruction[]> definitions,int pointerSize,
+        Func<ulong,ulong?> readGot,ref DominatorInfo? dominance)
+    {
+        if(pointerSize is not (4 or 8) || consumer.OpCode!=OpCode.Move || consumer.NativeReadSize!=pointerSize
+            || consumer.Operands is not [_,MemoryOperand {Base:LocalVariable pointer,Index:null,Scale:0,Addend:0}]
+            || !definitions.TryGetValue(pointer,out var writes) || writes.Length<2)return null;
+        if(writes.Any(i=>i.OpCode!=OpCode.Move || i.NativeReadSize!=pointerSize
+            || i.Operands is not [_,MemoryOperand {Base:null,Index:null,Scale:0}]))return null;
+        var slots=writes.Select(i=>unchecked((ulong)((MemoryOperand)i.Operands[1]).Addend)).Distinct().ToArray();
+        if(slots.Length!=1 || readGot(slots[0]) is not { } address)return null;
+        if(graph.Instructions.Any(i=>i.ImplicitDefinition is { } register
+            && register.Number==pointer.Register.Number && register.Name==pointer.Register.Name))return null;
+        var consumers=graph.Blocks.Where(b=>b.Instructions.Contains(consumer)).ToArray();
+        if(consumers.Length!=1 || graph.Blocks.Any(b=>b.Predecessors.Any(p=>!graph.Blocks.Contains(p))))return null;
+        var target=consumers[0];
+        foreach(var write in writes)
+        {
+            var blocks=graph.Blocks.Where(b=>b.Instructions.Contains(write)).ToArray();
+            if(blocks.Length!=1)return null;
+            if(ReferenceEquals(blocks[0],target))
+            {
+                if(target.Instructions.IndexOf(write)<target.Instructions.IndexOf(consumer))return address;
+            }
+            else
+            {
+                dominance??=new DominatorInfo(graph);
+                if(dominance.Dominates(blocks[0],target))return address;
+            }
+        }
+        return null;
+    }
+
     /// <summary>
     /// Replaces every <c>[base + addend]</c> memory operand whose base is a typed local with a
     /// <see cref="FieldReference"/> to the field at that offset. Returns whether any operand was
@@ -177,13 +219,23 @@ public static class MetadataResolver
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? (local.Type is ByRefTypeAnalysisContext byref ? byref.ElementType : local.Type);
+                // A checked-unbox scalar root dereferences the boxed value,
+                // not its private runtime backing field. Ordinary ref/out
+                // parameters retain their existing field/type inference path.
+                if (local.Type is CheckedUnboxRecovery.UnboxedReference && TypeSizes.IsScalarValueType(owner)) continue;
                 var nativeWidth=i==0 ? instruction.NativeWriteSize : i==1 ? instruction.NativeReadSize : 0;
                 if(instruction.OpCode==OpCode.Move && nativeWidth>0 && staticOwner==null
-                    && NestedFieldAccess.Find(owner,local,memory.Addend,nativeWidth) is { } nested)
+                    && NestedFieldAccess.Find(owner,local,memory.Addend,nativeWidth,method) is { } nested)
                 {
                     instruction.SetOperand(i,nested);changed=true;continue;
                 }
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
+
+                // Exact-width nested lookup above owns closed generic values.
+                // Do not fall back to the legacy reference-object header/zero
+                // metadata offsets for padding, split stores or partial reads.
+                if(staticOwner==null && owner.IsValueType && genericOwner!=null
+                    && (!owner.HasAnyGenericParameters() || SharedGenericReturnLayout.FieldsFor(method,owner)!=null))continue;
 
                 if (staticOwner == null && GenericInstanceFieldLayout.FindInheritedFieldAtOffset(owner, memory.Addend, nativeWidth) is { } inherited)
                 {
@@ -232,6 +284,24 @@ public static class MetadataResolver
         return changed;
     }
 
+    internal static void RewriteNamedExceptionCall(MethodAnalysisContext method, Instruction call,
+        TypeAnalysisContext thrown, bool unconditionalRaiser)
+    {
+        // Raw argument padding may appear to read a nonexistent return value.
+        // Positively proven nonreturning transport always terminates the path.
+        if (!unconditionalRaiser && call.Destination is LocalVariable produced
+            && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
+        {
+            call.OpCode = OpCode.Newobj;
+            call.SetOperands(produced, thrown);
+        }
+        else
+        {
+            call.OpCode = OpCode.Throw;
+            call.SetOperands(thrown);
+        }
+    }
+
     private static void ResolveCalls(MethodAnalysisContext method)
     {
         foreach (var block in method.ControlFlowGraph!.Blocks)
@@ -268,16 +338,8 @@ public static class MetadataResolver
                 // type, which either throw it themselves or build it and hand it back for the caller to raise.
                 if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
                 {
-                    if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
-                    {
-                        callInstruction.OpCode = OpCode.Newobj;
-                        callInstruction.SetOperands(produced, thrown);
-                    }
-                    else
-                    {
-                        callInstruction.OpCode = OpCode.Throw;
-                        callInstruction.SetOperands(thrown);
-                    }
+                    RewriteNamedExceptionCall(method, callInstruction, thrown,
+                        ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target));
 
                     continue;
                 }
@@ -511,7 +573,8 @@ public static class MetadataResolver
             switch (definition.OpCode)
             {
                 case OpCode.Newobj:
-                    return (definition.Operands[0] as LocalVariable)?.Type;
+                    return definition.Operands.Count == 2
+                        ? TrivialConstructorRecovery.AllocationType(definition.Operands[1]) : null;
                 case OpCode.Move when definition.Operands[1] is LocalVariable source:
                     local = source;
                     continue;
@@ -618,7 +681,11 @@ public static class MetadataResolver
                 continue;
 
             var slot = (int)(offset / invokeDataSize);
-            if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
+            var implementation = receiverType is SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext
+                ? pointerSize == 8 && layout.VTable == 0x128
+                    ? ResolveArrayObjectSlot(method.AppContext, receiverType, slot) : null
+                : ResolveVTableSlot(method.AppContext, receiverType, slot);
+            if (implementation is not { } resolved)
                 continue;
             if (resolved.IsStatic)
                 continue;
@@ -688,6 +755,25 @@ public static class MetadataResolver
         };
     }
 
+    internal static MethodAnalysisContext? ResolveArrayObjectSlot(ApplicationAnalysisContext app, TypeAnalysisContext type, int slot)
+    {
+        if (type is not (SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext) || slot < 0) return null;
+        var array = app.GetAssemblyByName("mscorlib")?.GetTypeByFullName("System.Array");
+        var objectType = app.SystemTypes.SystemObjectType;
+        if (array?.Definition == null || objectType.Definition == null
+            || slot >= array.Definition.VtableCount || slot >= objectType.Definition.VtableCount) return null;
+        var arrayTarget = app.ResolveContextForMethod(array.Definition.VTable[slot]);
+        var objectTarget = app.ResolveContextForMethod(objectType.Definition.VTable[slot]);
+        // Only slots positively shared with canonical Object. Do not infer an
+        // element-specific interface thunk, Array override or hidden generic ABI.
+        if (arrayTarget == null || !ReferenceEquals(arrayTarget, objectTarget)
+            || !ReferenceEquals(arrayTarget.DeclaringType, objectType) || arrayTarget.IsStatic || arrayTarget.IsVoid
+            || arrayTarget.Definition?.slot != slot || arrayTarget.GenericParameters.Count != 0
+            || arrayTarget.Parameters.Any(p => p.ParameterType is GenericParameterTypeAnalysisContext)
+            || app.InstructionSet.CallingConventionResolver?.ReturnRegister(arrayTarget).Name != "X0") return null;
+        return arrayTarget;
+    }
+
     private static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
     {
         var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType.Definition ?? type.Definition;
@@ -696,16 +782,35 @@ public static class MetadataResolver
             return null;
 
         if (appContext.ResolveContextForMethod(definition.VTable[slot]) is { } implementation)
-            return implementation;
+            return BindVirtualContext(type,implementation);
 
         // an abstract method has no implementation, try to resolve it
         for (var declarer = type; declarer != null; declarer = declarer.BaseType)
         {
             if (declarer.Methods.FirstOrDefault(m => m.Definition?.slot == slot) is { } declaration)
-                return declaration;
+                return BindVirtualContext(type,declaration);
         }
 
         return null;
+    }
+
+    // A slot on List<long> must not become a call on the open List<T>
+    // definition: that loses BOTH parameter and return ABI information.
+    internal static MethodAnalysisContext? BindVirtualContext(TypeAnalysisContext receiver,MethodAnalysisContext implementation)
+    {
+        if(implementation.DeclaringType is not { } owner)return null;
+        if(implementation is ConcreteGenericMethodAnalysisContext)
+            return implementation; // retain already-instantiated metadata, never guess different arguments
+        if(owner.GenericParameters.Count==0)return implementation;
+        var seen=new HashSet<TypeAnalysisContext>();
+        for(var current=receiver;current!=null && seen.Add(current) && seen.Count<=64;current=current.BaseType)
+        {
+            if(current is not GenericInstanceTypeAnalysisContext generic || !ReferenceEquals(generic.GenericType,owner))continue;
+            if(generic.GenericArguments.Count!=owner.GenericParameters.Count || implementation.GenericParameters.Count!=0)return null;
+            return new ConcreteGenericMethodAnalysisContext(implementation,generic.GenericArguments,[]);
+        }
+        // Keep open definitions as definitions only for their exact open owner.
+        return ReferenceEquals(receiver,owner)?implementation:null;
     }
 
     private static MethodAnalysisContext BaseMethodOf(MethodAnalysisContext method) =>

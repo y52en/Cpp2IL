@@ -14,6 +14,148 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    [TestCase("exclusive")]
+    [TestCase("unreachable")]
+    [TestCase("redefined")]
+    [TestCase("ambiguous")]
+    public void ConstructorPairingUsesSuccessorsNotFlattenedBfsOrReusedLocal(string shape)
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var owner=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Test","ReachableCtor",app.SystemTypes.SystemObjectType,System.Reflection.TypeAttributes.Public);
+        var ctor=owner.InjectMethodContext(".ctor",app.SystemTypes.SystemVoidType,ReflectionMethodAttributes.Public,[]);
+        var context=new InjectedMethodAnalysisContext(owner,"Create",app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public|ReflectionMethodAttributes.Static,[]);
+        var obj=new LocalVariable("reused",new Register(null,"X0"),owner);
+        var allocationA=new Instruction(0,OpCode.Newobj,obj,owner);
+        var allocationB=new Instruction(1,OpCode.Newobj,obj,owner);
+        var callA=new Instruction(2,OpCode.CallVoid,ctor,obj);
+        var callB=new Instruction(3,OpCode.CallVoid,ctor,obj);
+        var graph=new ISILControlFlowGraph([]);
+        var a=new Block{ID=2,Instructions=[allocationA]};var b=new Block{ID=3,Instructions=[allocationB]};
+        var ca=new Block{ID=4,Instructions=[callA]};var cb=new Block{ID=5,Instructions=[callB]};
+        void Edge(Block x,Block y){x.Successors.Add(y);y.Predecessors.Add(x);}
+        Edge(graph.EntryBlock,a);
+        if(shape=="redefined"){Edge(a,b);Edge(b,cb);}
+        else if(shape=="ambiguous"){Edge(a,ca);Edge(a,cb);}
+        else {Edge(graph.EntryBlock,b);Edge(b,cb);Edge(a,shape=="unreachable"?graph.ExitBlock:ca);}
+        Edge(ca,graph.ExitBlock);Edge(cb,graph.ExitBlock);
+        graph.Blocks=[graph.EntryBlock,graph.ExitBlock,a,b,ca,cb];context.ControlFlowGraph=graph;
+        Assert.That(IlGenerator.FindConstructorCall(context,allocationA),Is.EqualTo(shape=="exclusive"?callA:null));
+        if(shape!="ambiguous")Assert.That(IlGenerator.FindConstructorCall(context,allocationB),Is.SameAs(callB));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void ConstructorFusionIsIndependentOfPhysicalBlockEmissionOrder(bool ctorBeforeAllocation)
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var owner=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Test","CtorOrder",app.SystemTypes.SystemObjectType,System.Reflection.TypeAttributes.Public);
+        var ctor=owner.InjectMethodContext(".ctor",app.SystemTypes.SystemVoidType,ReflectionMethodAttributes.Public,[]);
+        var context=new InjectedMethodAnalysisContext(owner,"Create",app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public|ReflectionMethodAttributes.Static,[]);
+        var obj=new LocalVariable("obj",new Register(null,"X0"),owner);
+        var graph=new ISILControlFlowGraph([]);
+        var start=new Block{ID=2};var allocation=new Block{ID=3};var construct=new Block{ID=4};var done=new Block{ID=5};
+        void Edge(Block a,Block b){a.Successors.Add(b);b.Predecessors.Add(a);}
+        Edge(graph.EntryBlock,start);Edge(start,allocation);Edge(allocation,construct);Edge(construct,done);Edge(done,graph.ExitBlock);
+        start.Instructions=[new(0,OpCode.Jump,allocation)];
+        allocation.Instructions=[new(1,OpCode.Newobj,obj,owner),new(2,OpCode.Jump,construct)];
+        construct.Instructions=[new(3,OpCode.CallVoid,ctor,obj),new(4,OpCode.Jump,done)];
+        done.Instructions=[new(5,OpCode.Return)];
+        graph.Blocks=ctorBeforeAllocation?[graph.EntryBlock,graph.ExitBlock,start,construct,allocation,done]
+            :[graph.EntryBlock,graph.ExitBlock,start,allocation,construct,done];
+        context.ControlFlowGraph=graph;context.Locals=[obj];context.ParameterLocals=[];context.AnalysisWarnings=[];
+        var module=new ModuleDefinition("CtorOrder.dll",new AssemblyReference("mscorlib",new Version(4,0,0,0)));
+        var type=new TypeDefinition("Test","CtorOrder",TypeAttributes.Public,module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);owner.PutExtraData("AsmResolverType",type);
+        var ctorDef=new MethodDefinition(".ctor",MethodAttributes.Public|MethodAttributes.SpecialName|MethodAttributes.RuntimeSpecialName,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        type.Methods.Add(ctorDef);ctor.PutExtraData("AsmResolverMethod",ctorDef);
+        var method=new MethodDefinition("Create",MethodAttributes.Public|MethodAttributes.Static,MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);IlGenerator.GenerateIl(context,method);
+        var il=method.CilMethodBody!.Instructions;
+        Assert.That(il.Count(i=>i.OpCode==CilOpCodes.Newobj),Is.EqualTo(1));
+        Assert.That(il.Any(i=>i.OpCode==CilOpCodes.Call && i.Operand is IMethodDescriptor target && target.Name==".ctor"),Is.False);
+        Assert.That(il.Last().OpCode,Is.EqualTo(CilOpCodes.Ret));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void UnresolvedIndirectTailTransferIsDiagnosticAndTerminal(bool returnsValue)
+    {
+        var app = TestGameLoader.LoadSimple2019Game();
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Test", "UnresolvedTail", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var caller = new InjectedMethodAnalysisContext(owner, "Tail",
+            returnsValue ? app.SystemTypes.SystemObjectType : app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new([new(0, OpCode.IndirectJump, new Immediate(123))]);
+        caller.Locals = []; caller.ParameterLocals = []; caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("UnresolvedTail.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var type = new TypeDefinition("Test", "UnresolvedTail", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type); owner.PutExtraData("AsmResolverType", type);
+        var method = new MethodDefinition("Tail", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(returnsValue ? module.CorLibTypeFactory.Object : module.CorLibTypeFactory.Void));
+        type.Methods.Add(method); IlGenerator.GenerateIl(caller, method);
+        var instructions = method.CilMethodBody!.Instructions;
+        Assert.That(instructions.Last().OpCode, Is.EqualTo(CilOpCodes.Throw));
+        Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Ret), Is.False);
+        Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Ldstr && i.Operand is string text
+            && text.Contains("Indirect jump:")), Is.True);
+        Assert.That(instructions.Single(i => i.OpCode == CilOpCodes.Newobj).Operand,
+            Is.InstanceOf<IMethodDescriptor>());
+        Assert.That(((IMethodDescriptor)instructions.Single(i => i.OpCode == CilOpCodes.Newobj).Operand!).DeclaringType!.FullName,
+            Is.EqualTo("System.NotSupportedException"));
+    }
+
+    [Test]
+    public void ConstructorWithWrongOwnerDoesNotReplaceDerivedAllocation()
+    {
+        var app = TestGameLoader.LoadSimple2019Game();
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Test", "DerivedAllocation", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var obj = new LocalVariable("obj", new Register(null, "obj"), owner);
+        var baseConstructor = app.SystemTypes.SystemObjectType.Methods.First(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        var caller = new InjectedMethodAnalysisContext(owner, "Allocate", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new([new(0, OpCode.Newobj, obj, owner), new(1, OpCode.CallVoid, baseConstructor, obj), new(2, OpCode.Return)]);
+        caller.Locals = [obj]; caller.ParameterLocals = []; caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("ConstructorOwner.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var type = new TypeDefinition("Test", "DerivedAllocation", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type); owner.PutExtraData("AsmResolverType", type);
+        var method = new MethodDefinition("Allocate", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void)); type.Methods.Add(method);
+        Assert.Throws<DecompilerException>(() => IlGenerator.GenerateIl(caller, method));
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Newobj), Is.False);
+    }
+
+    [Test]
+    public void UnresolvedMemoryStore_EmitsDiagnosticInsteadOfSilentlyDiscardingWrite()
+    {
+        var app = TestGameLoader.LoadSimple2019Game();
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Test", "UnresolvedStore", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"), owner);
+        var caller = new InjectedMethodAnalysisContext(owner, "Write", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new([new(0, OpCode.Move, new MemoryOperand(receiver, addend: 24), new Immediate(37)),
+            new(1, OpCode.Return)]);
+        caller.Locals = [receiver]; caller.ParameterLocals = []; caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("UnresolvedStore.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var type = new TypeDefinition("Test", "UnresolvedStore", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type); owner.PutExtraData("AsmResolverType", type);
+        var method = new MethodDefinition("Write", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method); IlGenerator.GenerateIl(caller, method);
+        var instructions = method.CilMethodBody!.Instructions;
+        Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Ldstr && i.Operand is string text
+            && text.Contains("Unmanaged memory store:")), Is.True);
+        Assert.That(instructions.Count(i => i.OpCode == CilOpCodes.Pop), Is.EqualTo(1));
+        Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Call), Is.True);
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void VirtualMethodDirectCallAndNativeDispatchRemainDistinct(bool nativeDispatch)

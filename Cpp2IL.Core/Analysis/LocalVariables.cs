@@ -151,6 +151,7 @@ public static class LocalVariables
         {
             bufferLocal.Name = "returnBuffer";
             bufferLocal.Type = method.ReturnType;
+            bufferLocal.IsReturnBuffer = true;
         }
     }
 
@@ -237,6 +238,13 @@ public static class LocalVariables
         SeedMethodInfoTypes(method);
         SeedComparisonResults(method);
         SeedFloatLiterals(method);
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction is { OpCode: OpCode.NumericConvert,
+                Operands: [LocalVariable destination, TypeAnalysisContext targetType, TypeAnalysisContext sourceType, var source] })
+            {
+                destination.Type = targetType; // exact native conversion contract, not a copy's inferred type
+                if (source is LocalVariable sourceLocal) SetTypeIfUnknown(sourceLocal, sourceType);
+            }
 
         // Everywhere there's a CallVoid after a Newobj, we can resolve the constructor call.
         MetadataResolver.ResolveConstructorCalls(method);
@@ -256,10 +264,13 @@ public static class LocalVariables
 
             changed = false;
             changed |= MetadataResolver.ResolveCallsViaMethodInfo(method);
+            changed |= MethodInfoTailRecovery.Run(method);
             changed |= MetadataResolver.ResolveAmbiguousCalls(method);
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method);
             changed |= ArrayRecovery.RecoverSplitAccesses(method);
+            changed |= ArrayRecovery.RecoverStructComponents(method);
+            changed |= CheckedUnboxRecovery.Run(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= StackFieldRecovery.Run(method);
             changed |= StackFieldZeroRecovery.Run(method);
@@ -267,6 +278,11 @@ public static class LocalVariables
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
+            // Copies/phis can acquire their exact Il2CppClass type only during
+            // this fixpoint. Preserve newly proven allocation metadata before
+            // constructor passes; do not infer it from a widened result local.
+            changed |= NormalizePendingAllocations(method);
+            changed |= MetadataResolver.ResolveConstructorCalls(method);
             // Only after all ordinary metadata constraints settle, recover a
             // proven integral induction cycle used as a managed array index.
             if (!changed) changed = ArrayIndexInductionRecovery.Run(method);
@@ -298,18 +314,32 @@ public static class LocalVariables
                 continue;
 
             if (instruction.Operands[0] is LocalVariable destination && InstantiatedType(instruction.Operands[1]) is { } type)
+            {
                 destination.Type = type;
+                // Later constructor recovery/IL emission needs the same proven
+                // allocation type, not a raw Il2CppClass* local or its IntPtr IL.
+                instruction.SetOperand(1, type);
+            }
         }
     }
 
     private static TypeAnalysisContext? InstantiatedType(IOperand classOperand) =>
-        classOperand switch
+        TrivialConstructorRecovery.AllocationType(classOperand);
+
+    public static bool NormalizePendingAllocations(MethodAnalysisContext method)
+    {
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var t } } => t,
-            RuntimeClassTypeAnalysisContext { RepresentedType: var t } => t,
-            TypeAnalysisContext type => type, //not sure this is actually valid but for completeness
-            _ => null,
-        };
+            if (instruction is not { OpCode: OpCode.Newobj, Operands: [LocalVariable destination, var operand] }
+                || operand is TypeAnalysisContext and not RuntimeClassTypeAnalysisContext
+                || InstantiatedType(operand) is not { } type) continue;
+            instruction.SetOperand(1, type);
+            destination.Type = type;
+            changed = true;
+        }
+        return changed;
+    }
 
     // A method/field-metadata global load (Move local, methodof(M) / fieldof(F)) puts a MethodInfo*
     // or FieldInfo* into the local. MetadataResolver already resolved the address to a context naming
@@ -566,7 +596,20 @@ public static class LocalVariables
 
         // Move local, local: copy a known type in whichever direction is missing it.
         if (destination is LocalVariable destLocal && source is LocalVariable sourceLocal)
+        {
+            // A 16-byte vector chunk of a 40-byte returned struct is not the
+            // entire struct. Only an explicitly logical copy (width zero) or
+            // an exact-width native move may transmit that aggregate type.
+            bool Fits(TypeAnalysisContext? type)
+            {
+                if (type?.IsValueType != true || TypeSizes.IsScalarValueType(type)) return true;
+                var size = TypeSizes.UnboxedSize(type, pointerSize);
+                return (move.NativeReadSize == 0 || move.NativeReadSize == size)
+                    && (move.NativeWriteSize == 0 || move.NativeWriteSize == size);
+            }
+            if (!Fits(destLocal.Type) || !Fits(sourceLocal.Type)) return false;
             return SetTypeIfUnknown(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
+        }
 
         // Move local, field: a field load types its result with the field's type. This is the edge
         // that lets the loaded value go on to be the base of a further field access.
@@ -587,7 +630,21 @@ public static class LocalVariables
         if (destination is LocalVariable { Type: null } elementDest
             && source is MemoryOperand { Base: LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: { } elementType } } } elementAccess
             && (elementAccess.Index != null || elementAccess.Addend >= 4L * pointerSize))
+        {
+            // A scalar component of an inline struct is not the whole struct.
+            // Keep its type unresolved until exact field/width proof is found.
+            var size = elementType.IsValueType ? TypeSizes.UnboxedSize(elementType, pointerSize) : pointerSize;
+            if (move.NativeReadSize > 0 && move.NativeReadSize != size) return false;
             return SetTypeIfUnknown(elementDest, elementType);
+        }
+
+        // Move local, [byref]: dereferencing a managed pointer to a reference type yields that referent
+        if (destination is LocalVariable { Type: null } scalarDest
+            && source is MemoryOperand { Index: null, Scale: 0, Addend: 0,
+                Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } scalarType } } }
+            && TypeSizes.IsScalarValueType(scalarType) && move.NativeReadSize > 0
+            && move.NativeReadSize == TypeSizes.UnboxedSize(scalarType, pointerSize))
+            return SetTypeIfUnknown(scalarDest, scalarType);
 
         // Move local, [byref]: dereferencing a managed pointer to a reference type yields that referent
         // (a struct byref accesses fields directly with no deref, so this only fires for class referents).
@@ -607,10 +664,35 @@ public static class LocalVariables
 
     // A phi is a copy from each predecessor's value, so types flow both ways across it - mirroring
     // the bidirectional Move copies it decays into once SSA is destroyed.
-    private static bool PropagatePhi(Instruction phi)
+    internal static bool PropagatePhi(Instruction phi)
     {
         if (phi.Operands[0] is not LocalVariable destination)
             return false;
+
+        // Runtime handles describe pointer PROVENANCE, not managed value
+        // compatibility. One known input must not turn an unrelated array
+        // element address on another edge into String.static_fields, then
+        // erase that edge when ResolveFieldOffsets replaces the dereference.
+        static bool Handle(TypeAnalysisContext? type) => type is RuntimeClassTypeAnalysisContext
+            or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext;
+        var inputs = phi.Operands.Skip(1).OfType<LocalVariable>().ToArray();
+        if (Handle(destination.Type) || inputs.Any(v => Handle(v.Type)))
+        {
+            if (inputs.Length != phi.Operands.Count - 1 || inputs.Length == 0) return false;
+            var known = inputs[0].Type;
+            bool Same(TypeAnalysisContext? other) => (known, other) switch
+            {
+                (RuntimeClassTypeAnalysisContext a, RuntimeClassTypeAnalysisContext b) => ReferenceEquals(a.RepresentedType, b.RepresentedType),
+                (StaticFieldStorageTypeAnalysisContext a, StaticFieldStorageTypeAnalysisContext b) => ReferenceEquals(a.OwnerType, b.OwnerType),
+                (RuntimeMethodInfoAnalysisContext a, RuntimeMethodInfoAnalysisContext b) => ReferenceEquals(a.RepresentedMethod, b.RepresentedMethod),
+                (RuntimeFieldInfoAnalysisContext a, RuntimeFieldInfoAnalysisContext b) => ReferenceEquals(a.RepresentedField, b.RepresentedField),
+                _ => false
+            };
+            if (!Handle(known) || !inputs.All(v => Same(v.Type))
+                || destination.Type != null && !Same(destination.Type)) return false;
+            // Never push a provenance annotation backward into an unknown edge.
+            return SetTypeIfUnknown(destination, known);
+        }
 
         var changed = false;
 

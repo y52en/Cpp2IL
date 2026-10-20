@@ -15,6 +15,8 @@ public class LocalVariable(string name, Register register, TypeAnalysisContext? 
     public bool IsThis = false;
     public bool IsReturn = false;
     public bool IsMethodInfo = false;
+    // Set only when metadata/native ABI identifies the incoming return buffer.
+    public bool IsReturnBuffer = false;
 
     public override string ToString() => Type == null ? $"{Name} @ {Register}" : $"{Name} @ {Register} ({Type.FullName})";
 }

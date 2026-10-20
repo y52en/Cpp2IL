@@ -128,5 +128,15 @@ public enum OpCode
     Throw,
 
     /// <summary>Tests op 3 against the type in op 2, storing the object or null in op 1.</summary>
-    IsInst
+    IsInst,
+
+    /// <summary>Checks op 3 against reference type op 2, storing the same object in op 1.
+    /// Unlike IsInst, incompatibility throws InvalidCastException; null remains null.</summary>
+    CastClass,
+
+    /// <summary>Unchecked numeric conversion: destination, target type, source type, value.</summary>
+    NumericConvert,
+
+    /// <summary>Checked unboxing: destination managed byref, value type token, boxed object.</summary>
+    Unbox
 }

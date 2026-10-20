@@ -113,4 +113,23 @@ public class InheritedGenericFieldTests
         Assert.That(GenericInstanceFieldLayout.FindInheritedFieldAtOffset(closed, 20)?.Name, Is.EqualTo("Next"));
         Assert.That(GenericInstanceFieldLayout.FindInheritedFieldAtOffset(closed, 24), Is.Null);
     }
+
+    [TestCase("UnityEngine.Vector2", 8)]
+    [TestCase("UnityEngine.Vector3", 12)]
+    [TestCase("UnityEngine.Vector4", 16)]
+    public void MetadataProvenStructArgumentDeterminesFollowingFieldOffset(string name, int size)
+    {
+        var app = TestGameLoader.LoadSimple2019Game();
+        var argument = app.Assemblies.SelectMany(a => a.Types).Single(t => t.FullName == name);
+        var generic = Type(app, "StructWrapper", app.SystemTypes.SystemObjectType);
+        var original = generic.InjectFieldContext("Value", Parameter(generic), FieldAttributes.Public);
+        var originalOffset = original.Offset;
+        generic.InjectFieldContext("Next", app.SystemTypes.SystemInt32Type, FieldAttributes.Public);
+        var closed = new GenericInstanceTypeAnalysisContext(generic, [argument]);
+        Assert.That(GenericInstanceFieldLayout.FindInheritedFieldAtOffset(closed, 16, size)?.Name, Is.EqualTo("Value"));
+        Assert.That(GenericInstanceFieldLayout.FindInheritedFieldAtOffset(closed, 16 + size, 4)?.Name, Is.EqualTo("Next"));
+        Assert.That(GenericInstanceFieldLayout.FindInheritedFieldAtOffset(closed, 16, 4), Is.Null,
+            "a component load is not a whole-struct read");
+        Assert.That(original.Offset, Is.EqualTo(originalOffset), "closed layout must not mutate the shared definition");
+    }
 }

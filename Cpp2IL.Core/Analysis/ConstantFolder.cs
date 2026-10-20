@@ -21,6 +21,9 @@ public static class ConstantFolder
 
     private static bool TryFold(Instruction instruction)
     {
+        // These operands are IEEE payloads. Integer negation/identities are
+        // not float algebra (notably signed zero, NaNs and subnormal bit 1).
+        if(instruction.NativeFloatingPointSize!=0)return false;
         // Unary constant folds.
         if (instruction is { OpCode: OpCode.Not, Operands: [_, Immediate n] })
             return ToConstant(instruction, instruction.Destination is LocalVariable { Type.FullName: "System.Boolean" }

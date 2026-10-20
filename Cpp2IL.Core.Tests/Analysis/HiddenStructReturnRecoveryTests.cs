@@ -14,7 +14,7 @@ public class HiddenStructReturnRecoveryTests
     private static Register R(string name)=>new(null,name);
     [TestCase(false)]
     [TestCase(true)]
-    public void RealMetadataReturnSizeRequiresUniqueCallee(bool ambiguous)
+    public void RealMetadataReturnSizeAllowsOnlyUnanimousAliasAbi(bool shared)
     {
         var app=TestGameLoader.LoadSimple2019Game();
         app.InstructionSet=new NewArmV8InstructionSet();
@@ -23,13 +23,29 @@ public class HiddenStructReturnRecoveryTests
         var owner=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,"Test","BufferCalls",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
         var target=owner.InjectMethodContext("ProduceStruct",type,MethodAttributes.Public|MethodAttributes.Static);
         const ulong address=0xDEADBEEF;
-        app.MethodsByAddress[address]=ambiguous?[target,target]:[target];
+        app.MethodsByAddress[address]=shared?[target,target]:[target];
         var caller=owner.InjectMethodContext("Caller",app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static);
         var call=new Instruction(1,OpCode.Call,new Immediate((long)address),R("X0"));
         caller.ControlFlowGraph=new([new(0,OpCode.Move,R("X8"),new AddressOf(R("stack_-A0"))),call,new(2,OpCode.Return)]);
-        Assert.That(HiddenStructReturnRecovery.Run(caller),Is.EqualTo(!ambiguous));
-        Assert.That(((Register)call.Destination!).Name,Is.EqualTo(ambiguous?"X0":"stack_-A0"));
-        if(!ambiguous) Assert.That(call.ImplicitDefinition?.Name,Is.EqualTo("X0"));
+        Assert.That(HiddenStructReturnRecovery.Run(caller),Is.True);
+        Assert.That(((Register)call.Destination!).Name,Is.EqualTo("stack_-A0"));
+        Assert.That(call.ImplicitDefinition?.Name,Is.EqualTo("X0"));
+    }
+
+    [Test]
+    public void AliasDisagreementBetweenObjectAndLargeStructKeepsUnknownResult()
+    {
+        var app=TestGameLoader.LoadSimple2019Game();app.InstructionSet=new NewArmV8InstructionSet();
+        var type=app.Assemblies.SelectMany(a=>a.Types).First(t=>t.IsValueType && TypeSizes.UnboxedSize(t,8)>16);
+        var owner=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,"Test","ConflictingBufferCalls",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        var large=owner.InjectMethodContext("Large",type,MethodAttributes.Public|MethodAttributes.Static);
+        var reference=owner.InjectMethodContext("Reference",app.SystemTypes.SystemObjectType,MethodAttributes.Public|MethodAttributes.Static);
+        const ulong address=0xDEADBEEF;app.MethodsByAddress[address]=[large,reference];
+        var caller=owner.InjectMethodContext("Caller",app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static);
+        var call=new Instruction(1,OpCode.Call,new Immediate((long)address),R("X0"));
+        caller.ControlFlowGraph=new([new(0,OpCode.Move,R("X8"),new AddressOf(R("stack_-A0"))),call,new(2,OpCode.Return)]);
+        Assert.That(HiddenStructReturnRecovery.Run(caller),Is.False);
+        Assert.That(((Register)call.Destination!).Name,Is.EqualTo("X0"));
     }
 
     [Test]

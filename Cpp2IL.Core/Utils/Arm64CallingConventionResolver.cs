@@ -28,11 +28,17 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
         if (!returnType.IsValueType || IsFloatingPoint(returnType) || Arm64HfaLayout.Fields(returnType)!=null)
             return false;
 
-        var size = TypeSizes.UnboxedSize(returnType, PtrSize);
+        var size = ReturnStorageSize(ctx);
         if (size == 0)
             return false; // unknown size (e.g. generic), assume a register return
 
         return size > 16;
+    }
+
+    public long ReturnStorageSize(MethodAnalysisContext method)
+    {
+        var size=TypeSizes.UnboxedSize(method.ReturnType,PtrSize);
+        return size>0?size:SharedGenericReturnLayout.TryGet(method)?.Size??0;
     }
 
     protected override (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app)

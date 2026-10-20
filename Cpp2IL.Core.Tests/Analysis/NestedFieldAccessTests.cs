@@ -11,6 +11,40 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class NestedFieldAccessTests
 {
+    [TestCase(8,0,true)]
+    [TestCase(4,0,false)]
+    [TestCase(1,0,false)]
+    [TestCase(0,0,false)]
+    [TestCase(8,1,false)]
+    public void NestedReferenceRequiresExactPointerSlot(int width,int displacement,bool expected)
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var entry=app.Assemblies.SelectMany(a=>a.Types).Single(t=>t.FullName=="System.Collections.DictionaryEntry");
+        var leaf=entry.Fields.First(f=>!f.IsStatic && !f.FieldType.IsValueType);
+        var owner=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,"Test","EntryHolder",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        owner.InjectFieldContext("Entry",entry,FieldAttributes.Public).Offset=16;
+        var root=new LocalVariable("holder",new Register(null,"X19"),owner);
+        var access=NestedFieldAccess.Find(owner,root,16+leaf.Offset+displacement,width);
+        Assert.That(access!=null,Is.EqualTo(expected));
+        if(expected)
+        {
+            Assert.That(access!.Field,Is.SameAs(leaf));
+            Assert.That(access.Parent?.Field.Name,Is.EqualTo("Entry"));
+            Assert.That(access.Local,Is.SameAs(root));
+        }
+    }
+
+    [Test]
+    public void DoesNotWalkThroughAReferenceObjectOrAcceptOverlappingStorage()
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var entry=app.Assemblies.SelectMany(a=>a.Types).Single(t=>t.FullName=="System.Collections.DictionaryEntry");
+        var owner=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,"Test","OverlapReference",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        owner.InjectFieldContext("Entry",entry,FieldAttributes.Public).Offset=16;
+        owner.InjectFieldContext("Reference",app.SystemTypes.SystemObjectType,FieldAttributes.Public).Offset=16;
+        Assert.That(NestedFieldAccess.Find(owner,new LocalVariable("holder",new Register(null,"X19"),owner),16,8),Is.Null);
+    }
+
     [TestCase(Arm64Mnemonic.LDRB, Arm64Register.W0, 1)]
     [TestCase(Arm64Mnemonic.LDRSB, Arm64Register.X0, 1)]
     [TestCase(Arm64Mnemonic.LDURSH, Arm64Register.X0, 2)]

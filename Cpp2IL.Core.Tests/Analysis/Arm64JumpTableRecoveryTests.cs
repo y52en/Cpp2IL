@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.InstructionSets;
 using Disarm;
+using Disarm.InternalDisassembly;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Graphs;
 
@@ -11,6 +12,48 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class Arm64JumpTableRecoveryTests
 {
+    // Complete original ApplyCurve RVA1656EF8, SHA256
+    // 1a231fb1915a18afa65fca9df424dbd604e788929bcb2a3f7807fbd95592d2dc.
+    private const string ScheduledNative="3F10007148010054297900D0E803012A297119912879A8B801102E1E0801098B00011FD60108201E0D000014011CA04E0B0000140128201E0008201E2138201E070000140210301E0108201E0008221E0210211E0028221E2108201E201CA14EC0035FD6";
+    private static readonly byte[] ScheduledData=Convert.FromHexString("F8A80DFFC8A80DFFC0A80DFFD0A80DFFE0A80DFF");
+
+    [Test]
+    public void ParameterIndexCopyAndScheduledFloatingConstantAreRecognized()
+    {
+        var body=Disassembler.Disassemble(Convert.FromHexString(ScheduledNative),0x1656ef8,new(true,true,false)).ToList();
+        var table=Arm64JumpTableRecovery.Recognize(body,0,(address,count)=>
+        {
+            Assert.That(address,Is.EqualTo(0x257c65cUL));Assert.That(count,Is.EqualTo(20));
+            return ScheduledData;
+        });
+        Assert.That(table,Is.Not.Null);
+        Assert.That(table!.LoadIndex,Is.EqualTo(5));Assert.That(table.BranchIndex,Is.EqualTo(8));
+        Assert.That(table.Selector,Is.EqualTo(Arm64Register.X8));
+        Assert.That(table.Targets,Is.EqualTo(new ulong[]{0x1656f54,0x1656f24,0x1656f1c,0x1656f2c,0x1656f3c}));
+    }
+
+    [TestCase("wide-copy")]
+    [TestCase("wrong-source")]
+    [TestCase("missing-copy")]
+    [TestCase("observable-call")]
+    [TestCase("memory-read")]
+    [TestCase("memory-write")]
+    [TestCase("foreign-entry")]
+    [TestCase("guard-address-gap")]
+    public void ScheduledDispatchStillRequiresExactRangeAndPureInterleaving(string shape)
+    {
+        var bytes=Convert.FromHexString(ScheduledNative);
+        if(shape=="wide-copy")bytes[15]=0xaa; // mov x8,x1: high bits not proven
+        if(shape=="wrong-source")bytes[14]=0x02; // mov w8,w2
+        if(shape=="missing-copy")Convert.FromHexString("1f2003d5").CopyTo(bytes,12);
+        if(shape=="observable-call")Convert.FromHexString("00000094").CopyTo(bytes,24);
+        if(shape=="memory-read")Convert.FromHexString("200040f9").CopyTo(bytes,24);
+        if(shape=="memory-write")Convert.FromHexString("200000f9").CopyTo(bytes,24);
+        var body=Disassembler.Disassemble(bytes,0x1656ef8,new(true,true,false)).ToList();
+        if(shape=="guard-address-gap")body[1]=Disassembler.Disassemble(bytes.AsSpan(4,4).ToArray(),0x1656f00,new(true,true,false)).Single();
+        if(shape=="foreign-entry")body.AddRange(Disassembler.Disassemble(Convert.FromHexString("f3ffff17"),0x1656f40,new(true,true,false)));
+        Assert.That(Arm64JumpTableRecovery.Recognize(body,0,(_,_)=>ScheduledData),Is.Null);
+    }
     // Actual Android bytes at RVA182FB5C. Addresses are RVAs, not Ghidra's +1MB overlay.
     private static readonly byte[] Native = Convert.FromHexString("681a40b91f250071c82a0054696a00f029f10c912879a8b80801098b00011fd6");
     private const ulong Base = 0x257e33c;
@@ -31,6 +74,29 @@ public class Arm64JumpTableRecoveryTests
         var data = new byte[values.Length * 4];
         for (var i = 0; i < values.Length; i++) BinaryPrimitives.WriteInt32LittleEndian(data.AsSpan(i * 4, 4), values[i]);
         return data;
+    }
+
+    [TestCase("closed",2)]
+    [TestCase("unresolved-jump",0)]
+    [TestCase("missing-second-data",0)]
+    [TestCase("cross-entry",0)]
+    public void MultipleTablesRequireAClosedNonOverlappingNativeTargetSet(string shape,int expected)
+    {
+        var body=Body();
+        body.AddRange(Disassembler.Disassemble(Convert.FromHexString(ScheduledNative),0x1656ef8,new(true,true,false)));
+        if(shape=="unresolved-jump")body.AddRange(Disassembler.Disassemble(Convert.FromHexString("00001fd6"),0x1830100,new(true,true,false)));
+        byte[]? Read(ulong address,int count)
+        {
+            if(address==Base)
+            {
+                var offsets=(int[])Offsets.Clone();
+                if(shape=="cross-entry")offsets[0]=unchecked((int)(0x1656f0cL-(long)Base));
+                return Data(offsets);
+            }
+            if(address==0x257c65cUL && shape!="missing-second-data")return ScheduledData;
+            return null;
+        }
+        Assert.That(Arm64JumpTableRecovery.RecognizeAll(body,Read).Count,Is.EqualTo(expected));
     }
 
     [Test]

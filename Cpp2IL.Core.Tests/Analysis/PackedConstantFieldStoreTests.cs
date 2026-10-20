@@ -1,0 +1,59 @@
+using System.Reflection;
+using System.Linq;
+using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
+
+namespace Cpp2IL.Core.Tests.Analysis;
+
+public class PackedConstantFieldStoreTests
+{
+    private static (InjectedTypeAnalysisContext Owner,LocalVariable Receiver,Instruction Store) Fixture()
+    {
+        var app=TestGameLoader.LoadSimple2019Game();
+        var owner=new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,"Test","Packed",
+            app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        var first=owner.InjectFieldContext("First",app.SystemTypes.SystemInt32Type,FieldAttributes.Public);first.Offset=16;
+        var second=owner.InjectFieldContext("Second",app.SystemTypes.SystemInt32Type,FieldAttributes.Public);second.Offset=20;
+        var receiver=new LocalVariable("object",new Register(null,"X0"),owner);
+        return (owner,receiver,new Instruction(0,OpCode.Move,new FieldReference(first,receiver,16),new Immediate(0x800000010))
+            {NativeWriteSize=8});
+    }
+
+    [Test]
+    public void ActualNativeCriAtomPackedStoreRetainsBothInt32Fields()
+    {
+        var (_,receiver,store)=Fixture();var pieces=PackedConstantFieldStoreRecovery.Split(store)!;
+        Assert.That(pieces.Count,Is.EqualTo(2));
+        Assert.That(pieces.Select(p=>p.Value.Value),Is.EqualTo(new long[]{16,8}));
+        Assert.That(pieces.Select(p=>p.Width),Is.EqualTo(new[]{4,4}));
+        Assert.That(pieces.All(p=>ReferenceEquals(p.Field.Local,receiver)),Is.True);
+        Assert.That(store.NativeWriteSize,Is.EqualTo(8)); // planning is nonmutating
+    }
+
+    [TestCase("padding")]
+    [TestCase("overlap")]
+    [TestCase("partial")]
+    [TestCase("reference")]
+    [TestCase("unknown-width")]
+    [TestCase("nested")]
+    public void UnprovedByteCoverageIsNeverSplit(string failure)
+    {
+        var (owner,_,store)=Fixture();
+        if(failure=="padding")owner.Fields[1].Offset=24;
+        if(failure=="overlap")owner.Fields[1].Offset=16;
+        if(failure=="partial")owner.Fields[1].Offset=22;
+        if(failure=="reference")owner.Fields[1].FieldType=owner.AppContext.SystemTypes.SystemObjectType;
+        if(failure=="unknown-width")store.NativeWriteSize=0;
+        if(failure=="nested")((FieldReference)store.Operands[0]).Parent=(FieldReference)store.Operands[0];
+        Assert.That(PackedConstantFieldStoreRecovery.Split(store),Is.Null);
+    }
+
+    [Test]
+    public void SignedFieldBitsAreNotConvertedAsUnsignedNumbers()
+    {
+        var (_,_,store)=Fixture();store.SetOperand(1,new Immediate(unchecked((long)0xfffffffeffffffffUL)));
+        var pieces=PackedConstantFieldStoreRecovery.Split(store)!;
+        Assert.That(pieces.Select(p=>p.Value.Value),Is.EqualTo(new long[]{-1,-2}));
+    }
+}

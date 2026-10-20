@@ -36,6 +36,11 @@ public class Instruction : IOperand
     public int NativeReadSize;
     // Width of a directly lifted integer ADD/SUB result, not an inferred pointer/type.
     public int NativeArithmeticSize;
+    // Width of an unmodified native register/address copy; extensions are not copies.
+    public int NativeRegisterCopySize;
+    // Scalar floating result width proven by S/D operands, not inferred from a
+    // reused V register or from the eventual managed destination type.
+    public int NativeFloatingPointSize;
     // Signedness is part of the comparison, not inferred from a C# type name.
     public bool UnsignedComparison;
     // Width proven zero by a full native register initialization (not a scalar guess).
@@ -125,8 +130,12 @@ public class Instruction : IOperand
             case OpCode.CheckGreaterOrEqual:
             case OpCode.CheckLessOrEqual:
             case OpCode.Newobj:
+            case OpCode.NewArr:
             case OpCode.Box:
             case OpCode.IsInst:
+            case OpCode.CastClass:
+            case OpCode.Unbox:
+            case OpCode.NumericConvert:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -168,7 +177,8 @@ public class Instruction : IOperand
                 or OpCode.Newobj
                 => [_operands[1]],
 
-            OpCode.Box or OpCode.IsInst => [_operands[2]],
+            OpCode.Box or OpCode.IsInst or OpCode.CastClass or OpCode.Unbox => [_operands[2]],
+            OpCode.NumericConvert => [_operands[3]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
@@ -182,7 +192,7 @@ public class Instruction : IOperand
                 ? _operands.Skip(2).Prepend(_operands[0]).ToList()
                 : _operands.Take(1).ToList(),
 
-            OpCode.CallVoid or OpCode.Phi => _operands.Skip(1).ToList(),
+            OpCode.CallVoid or OpCode.Phi or OpCode.NewArr => _operands.Skip(1).ToList(),
             OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
                 or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
                 => [_operands[1], _operands[2]],

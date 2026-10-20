@@ -90,22 +90,54 @@ public static class GenericInstanceFieldLayout
     }
 
     private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)
+        => GetSizeAndAlignment(fieldType, pointerSize, new HashSet<TypeAnalysisContext>());
+
+    private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize,
+        HashSet<TypeAnalysisContext> active)
     {
-        // TODO support user-defined value types
         if (fieldType is GenericParameterTypeAnalysisContext or PointerTypeAnalysisContext || !fieldType.IsValueType)
             return (pointerSize, pointerSize);
 
         if (fieldType.IsEnumType && fieldType.Fields.FirstOrDefault(f => !f.IsStatic) is { } underlying)
             return GetSizeAndAlignment(underlying.FieldType, pointerSize);
 
-        return fieldType.FullName switch
+        (long Size, long Alignment)? primitive = fieldType.FullName switch
         {
             "System.Boolean" or "System.Byte" or "System.SByte" => (1, 1),
             "System.Int16" or "System.UInt16" or "System.Char" => (2, 2),
             "System.Int32" or "System.UInt32" or "System.Single" => (4, 4),
             "System.Int64" or "System.UInt64" or "System.Double" => (8, 8),
             "System.IntPtr" or "System.UIntPtr" => (pointerSize, pointerSize),
-            _ => null // an arbitrary struct needs its own layout computed, bail rather than guess
+            _ => null
         };
+        if (primitive != null) return primitive;
+
+        // Derive storage only from a closed, default-packed sequential metadata
+        // layout. Validate every offset and the complete unboxed size; neither
+        // a type name nor a guessed pointer-sized generic argument is evidence.
+        var definition = fieldType.Definition;
+        if (definition == null || fieldType.HasAnyGenericParameters()
+            || (fieldType.Attributes & TypeAttributes.LayoutMask) != TypeAttributes.SequentialLayout
+            || !definition.PackingSizeIsDefault || !definition.ClassSizeIsDefault
+            || definition.SpecifiedPackingSize != 0 || active.Count >= 16 || !active.Add(fieldType))
+            return null;
+        try
+        {
+            long end = 0, alignment = 1;
+            var fields = fieldType.Fields.Where(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0).ToArray();
+            if (fields.Length == 0) return null;
+            foreach (var field in fields)
+            {
+                if (GetSizeAndAlignment(field.FieldType, pointerSize, active) is not { } layout)
+                    return null;
+                var offset = (end + layout.Alignment - 1) & ~(layout.Alignment - 1);
+                if (field.Offset != offset || offset > int.MaxValue - layout.Size) return null;
+                end = offset + layout.Size;
+                alignment = System.Math.Max(alignment, layout.Alignment);
+            }
+            var size = (end + alignment - 1) & ~(alignment - 1);
+            return TypeSizes.UnboxedSize(fieldType, pointerSize) == size ? (size, alignment) : null;
+        }
+        finally { active.Remove(fieldType); }
     }
 }

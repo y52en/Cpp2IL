@@ -150,13 +150,14 @@ public static class SsaSimplifier
     }
 
     // Pure values that are safe to duplicate across uses: other locals (copies) and constants. Memory
-    // and field loads are excluded so a load is never re-executed; they are handled post-SSA instead.
+    // field/array loads and lengths are snapshots/checks, not immutable constants.
     private static bool IsForwardable(IOperand value) =>
         value switch
         {
             LocalVariable => true,
             MemoryOperand => false,
             FieldReference => false,
+            ArrayAccess or ArrayLength => false,
             _ => true
         };
 }

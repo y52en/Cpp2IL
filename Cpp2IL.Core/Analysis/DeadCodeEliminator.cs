@@ -52,6 +52,48 @@ public static class DeadCodeEliminator
                 }
             }
         }
+        RemoveUnobservableCycles(cfg);
+    }
+
+    // Reference counts alone keep an unused loop-carried Phi/copy cycle alive.
+    // Mark backwards from observable/possibly-throwing instructions instead.
+    // This second pass is deliberately narrower than the legacy removable set:
+    // memory/field reads, division, allocation and unknown operands remain roots.
+    private static void RemoveUnobservableCycles(ISILControlFlowGraph cfg)
+    {
+        var producers = new Dictionary<LocalVariable, List<Instruction>>();
+        var instructions = cfg.Instructions;
+        foreach (var instruction in instructions)
+            if (instruction.Destination is LocalVariable local)
+            {
+                if (!producers.TryGetValue(local, out var definitions)) producers[local] = definitions = [];
+                definitions.Add(instruction);
+            }
+        // Instruction deliberately uses object identity, not structural equality.
+        var live = new HashSet<Instruction>();
+        var pending = new Queue<Instruction>();
+        foreach (var instruction in instructions)
+            if (!IsCyclePure(instruction) && live.Add(instruction)) pending.Enqueue(instruction);
+        while (pending.Count > 0)
+            foreach (var local in UsedLocals(pending.Dequeue()))
+                if (producers.TryGetValue(local, out var definitions))
+                    foreach (var definition in definitions)
+                        if (live.Add(definition)) pending.Enqueue(definition);
+        foreach (var instruction in instructions)
+            if (IsCyclePure(instruction) && !live.Contains(instruction))
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+            }
+    }
+
+    private static bool IsCyclePure(Instruction instruction)
+    {
+        if (instruction.Destination is not LocalVariable || !IsRemovable(instruction.OpCode)
+            || instruction.OpCode is OpCode.Divide or OpCode.Modulo) return false;
+        foreach (var operand in instruction.Operands)
+            if (operand is not (LocalVariable or Immediate or FloatLiteral or DoubleLiteral or StringLiteral)) return false;
+        return true;
     }
 
     private static Dictionary<LocalVariable, int> CountUses(ISILControlFlowGraph cfg)

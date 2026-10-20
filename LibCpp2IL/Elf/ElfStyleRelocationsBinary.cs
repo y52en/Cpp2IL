@@ -9,6 +9,7 @@ namespace LibCpp2IL.Elf;
 public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(input)
 {
     protected readonly List<(ulong start, ulong end)> relocationBlocks = [];
+    protected readonly HashSet<ulong> relocationTargets = [];
 
     protected void ApplyRelocations(IDictionary<ElfDynamicType, ulong> dynamicEntries, ulong loadBias, ElfMachine machine)
     {
@@ -90,6 +91,7 @@ public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(inp
             foreach (var relocation in relocations)
             {
                 var relocationAddress = loadBias + relocation.Offset;
+                relocationTargets.Add(relocationAddress);
 
                 ElfRelocationType type;
                 uint symbolIndex;
@@ -288,6 +290,7 @@ public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(inp
                 if ((word & 1) == 0)
                 {
                     relocationAddress = loadBias + word;
+                    relocationTargets.Add(relocationAddress);
 
                     var relocationRawAddress = MapVirtualAddressToRaw(relocationAddress);
                     var value = ReadNUintAtRawAddress(relocationRawAddress);
@@ -304,6 +307,7 @@ public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(inp
 
                         if ((word & 1) != 0)
                         {
+                            relocationTargets.Add(relocationAddress);
                             var relocationRawAddress = MapVirtualAddressToRaw(relocationAddress);
                             var value = ReadNUintAtRawAddress(relocationRawAddress);
                             WriteWord((int)relocationRawAddress, loadBias + value);

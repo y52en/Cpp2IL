@@ -90,14 +90,16 @@ public class IsInstRecoveryTests
         Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
     }
 
-    [TestCase(false)]
-    [TestCase(true)]
-    public void EmitsIsinst_WithoutCastclassOrNewobj(bool nullInput)
+    [TestCase(false, false)]
+    [TestCase(true, false)]
+    [TestCase(false, true)]
+    [TestCase(true, true)]
+    public void EmitsTypeCheck_WithCorrectFailureSemantics(bool nullInput, bool checkedCast)
     {
         var testedType = Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemObjectType;
         var source = new LocalVariable("source", new Register(null, "source"), testedType);
         var result = new LocalVariable("result", new Register(null, "result"), testedType);
-        var context = Context([new(0, OpCode.IsInst, result, testedType,
+        var context = Context([new(0, checkedCast ? OpCode.CastClass : OpCode.IsInst, result, testedType,
             nullInput ? new Immediate(0) : source), new(1, OpCode.Return)], source, result);
         var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
         var corlib = new ModuleDefinition("mscorlib.dll");
@@ -111,8 +113,54 @@ public class IsInstRecoveryTests
         type.Methods.Add(method);
         IlGenerator.GenerateIl(context, method);
         var body = method.CilMethodBody!;
-        Assert.That(body.Instructions.Count(i => i.OpCode == CilOpCodes.Isinst), Is.EqualTo(1));
-        Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Castclass || i.OpCode == CilOpCodes.Newobj), Is.False);
+        Assert.That(body.Instructions.Count(i => i.OpCode == (checkedCast ? CilOpCodes.Castclass : CilOpCodes.Isinst)), Is.EqualTo(1));
+        Assert.That(body.Instructions.Any(i => i.OpCode == (checkedCast ? CilOpCodes.Isinst : CilOpCodes.Castclass) || i.OpCode == CilOpCodes.Newobj), Is.False);
         Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.EqualTo(nullInput));
+    }
+
+    [Test]
+    public void UnusedCast_IsNotDeleted_BecauseItCanThrow()
+    {
+        var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
+        var source = new LocalVariable("source", new Register(null, "source"), types.SystemObjectType);
+        var result = new LocalVariable("result", new Register(null, "result"), types.SystemObjectType);
+        var cast = new Instruction(0, OpCode.CastClass, result, types.SystemObjectType, source);
+        var context = Context([cast, new(1, OpCode.Return)], source, result);
+        DeadCodeEliminator.Run(context);
+        Assert.That(cast.OpCode, Is.EqualTo(OpCode.CastClass));
+        Assert.That(cast.Destination, Is.SameAs(result));
+        Assert.That(cast.Sources.Single(), Is.SameAs(source));
+    }
+
+    [TestCase(false, false, false)]
+    [TestCase(false, true, false)]
+    [TestCase(true, false, false)]
+    [TestCase(true, true, false)]
+    [TestCase(false, false, true)]
+    [TestCase(false, true, true)]
+    [TestCase(true, false, true)]
+    [TestCase(true, true, true)]
+    public void CastNullBypass_RequiresSameObjectAndCorrectBranch(bool unequal, bool inverted, bool wrongObject)
+    {
+        var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
+        var source = new LocalVariable("source", new Register(null, "source"), types.SystemObjectType);
+        var other = new LocalVariable("other", new Register(null, "other"), types.SystemObjectType);
+        var flag = new LocalVariable("flag", new Register(null, "flag"), types.SystemBooleanType);
+        var negated = new LocalVariable("negated", new Register(null, "negated"), types.SystemBooleanType);
+        var depth = new Block(); var bypass = new Block(); var guard = new Block();
+        var predicate = new Instruction(0, unequal ? OpCode.CheckNotEqual : OpCode.CheckEqual,
+            flag, wrongObject ? other : source, new Immediate(0));
+        var defs = new Dictionary<LocalVariable, Instruction> { [flag] = predicate };
+        if (inverted) defs[negated] = new Instruction(1, OpCode.Not, negated, flag);
+        guard.Instructions.Add(new Instruction(2, OpCode.ConditionalJump,
+            unequal != inverted ? depth : bypass, inverted ? negated : flag));
+        guard.Successors.Add(depth); guard.Successors.Add(bypass); depth.Predecessors.Add(guard);
+        var match = new InlineClassCastRecovery.Match(depth, new Block(), new Block(), new Block(), source, types.SystemObjectType);
+        var proof = typeof(InlineClassCastRecovery).GetMethod("HasNullBypass",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        Assert.That(proof.Invoke(null, [match, defs]), Is.EqualTo(!wrongObject));
+        // Flip only the target: this would perform a native class read on null.
+        guard.Instructions[0].SetOperand(0, unequal != inverted ? bypass : depth);
+        Assert.That(proof.Invoke(null, [match, defs]), Is.False);
     }
 }

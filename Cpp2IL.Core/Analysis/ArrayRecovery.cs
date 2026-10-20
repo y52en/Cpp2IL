@@ -75,6 +75,18 @@ public static class ArrayRecovery
         if(operand is not LocalVariable local) return false;
         if(definitions.TryGetValue(local,out var definition) && definition!=null)
         {
+            // Preserve a proven 32-bit index computation as the index value.
+            // Flattening (index+constant)<<scale into pointer bytes loses the
+            // original integer wrap/sign boundary and makes delta nonzero.
+            // Pointer-valued adds and unknown/mixed-width arithmetic still
+            // follow the existing conservative address proof.
+            if(local.Type?.FullName=="System.Int32"
+                && definition is {OpCode:OpCode.Add or OpCode.Subtract,Operands:[_,var indexLeft,var indexRight]}
+                && Int32IndexOperand(indexLeft) && Int32IndexOperand(indexRight))
+            {
+                terms[local]=checked(terms.GetValueOrDefault(local)+factor);
+                return true;
+            }
             if(definition is {OpCode:OpCode.Move,Operands:[_,LocalVariable copied]})
                 return AccumulateAddress(copied,factor,terms,ref offset,definitions,depth+1);
             if(definition is {OpCode:OpCode.Add,Operands:[_,var left,var right]})
@@ -91,12 +103,152 @@ public static class ArrayRecovery
         return true;
     }
 
+    private static bool Int32IndexOperand(IOperand operand) => operand is
+        LocalVariable {Type.FullName:"System.Int32"} or Immediate {Value:>=int.MinValue and <=int.MaxValue};
+
     public static void Run(MethodAnalysisContext method)
     {
         RecoverSplitAccesses(method);
+        RecoverStructComponents(method);
         RecoverAccesses(method);
         RecoverStructElementAddresses(method);
         GroupInitialisers(method.ControlFlowGraph!);
+    }
+
+    internal static void RecoverAllocationsOnly(MethodAnalysisContext method)
+    {
+        var definitions = method.ControlFlowGraph!.Instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is { OpCode: OpCode.Call, Operands: [StringLiteral { Value: var name }, LocalVariable, var typeOperand, _, ..] }
+                && ArrayNewFunctions.Contains(name)
+                && InterfaceDispatchRecovery.ResolveDispatchOperand(typeOperand, definitions) is SzArrayTypeAnalysisContext type)
+                instruction.SetOperand(2, type);
+            RecoverAllocation(instruction);
+        }
+    }
+
+    // Later CFG/typing cleanup can make array-data pointers unambiguous. Do
+    // not repeat unrestricted affine substitution over coalesced locals: only
+    // a stable array + exact header, with the CURRENT direct index, is allowed.
+    // The index is not expanded, retagged, moved or replaced with a prior value.
+    public static int RecoverLateSplitLoads(MethodAnalysisContext method)
+    {
+        if(method.ControlFlowGraph is not { } graph)return 0;
+        var definitions=graph.Instructions.Where(i=>i.Destination is LocalVariable)
+            .GroupBy(i=>(LocalVariable)i.Destination!).ToDictionary(g=>g.Key,g=>g.ToArray());
+        DominatorInfo? dominance=null;var count=0;
+        bool Before(Instruction definition,Instruction use)
+        {
+            var origins=graph.Blocks.Where(b=>b.Instructions.Contains(definition)).ToArray();
+            var targets=graph.Blocks.Where(b=>b.Instructions.Contains(use)).ToArray();
+            if(origins.Length!=1 || targets.Length!=1)return false;
+            if(ReferenceEquals(origins[0],targets[0]))
+                return origins[0].Instructions.IndexOf(definition)<origins[0].Instructions.IndexOf(use);
+            if(graph.Blocks.Any(b=>b.Predecessors.Any(p=>!graph.Blocks.Contains(p))))return false;
+            dominance??=new DominatorInfo(graph);
+            return dominance.Dominates(origins[0],targets[0]);
+        }
+        foreach(var read in graph.Instructions.ToArray())
+        {
+            if(read is not {OpCode:OpCode.Move,Operands:[LocalVariable,
+                    MemoryOperand {Base:LocalVariable address,Index:LocalVariable index,Addend:0} memory]}
+                || !definitions.TryGetValue(address,out var addressDefinitions) || addressDefinitions.Length!=1
+                || addressDefinitions[0] is not {OpCode:OpCode.Add,Operands:[_,LocalVariable array,Immediate offset]} definition
+                || array.Type is not SzArrayTypeAnalysisContext arrayType
+                || offset.Value!=ElementsOffset(method.AppContext.Binary.PointerSizeBytes)
+                || index.Type is {IsValueType:false} or PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+                || !Before(definition,read))continue;
+            var stride=ElementSize(arrayType.ElementType,method.AppContext.Binary.PointerSizeBytes);
+            if(stride<=0 || read.NativeReadSize!=stride || memory.Scale!=stride)continue;
+            var writes=definitions.GetValueOrDefault(array,[]);
+            if(method.ParameterLocals.Contains(array)?writes.Length!=0
+                :writes.Length!=1 || !Before(writes[0],definition))continue;
+            if(graph.Instructions.Any(i=>i.ImplicitDefinition is { } register
+                && (register==address.Register || register==array.Register)))continue;
+            read.SetOperand(1,new ArrayAccess(array,index));count++;
+        }
+        if(count>0)DeadCodeEliminator.Run(graph);
+        return count;
+    }
+
+    // Lower exact component ranges into an existing managed array address and
+    // field reference. No new operand kind: ldelema + ldfld/stfld preserves the
+    // actual element storage instead of silently updating a value-type copy.
+    public static bool RecoverStructComponents(MethodAnalysisContext method)
+    {
+        var cfg = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        if (pointerSize != 8) return false;
+        var definitions = SingleDefinitions(cfg);
+        var nextIndex = cfg.Instructions.Select(i => i.Index).DefaultIfEmpty(-1).Max() + 1;
+        var changed = false;
+        foreach (var block in cfg.Blocks)
+        foreach (var instruction in block.Instructions.ToArray())
+        {
+            if (instruction is not { OpCode: OpCode.Move, Operands.Count: 2 }) continue;
+            var prefixes = new List<Instruction>();
+            for (var slot = 0; slot < 2; slot++)
+            {
+                var width = slot == 0 ? instruction.NativeWriteSize : instruction.NativeReadSize;
+                if (width <= 0 || instruction.Operands[slot] is not MemoryOperand memory) continue;
+                try
+                {
+                    var terms = new Dictionary<LocalVariable, long>();
+                    long offset = memory.Addend;
+                    if (!AccumulateAddress(memory.Base, 1, terms, ref offset, definitions, 0)
+                        || !AccumulateAddress(memory.Index, Math.Max(memory.Scale, 1), terms, ref offset, definitions, 0)) continue;
+                    var arrays = terms.Where(t => t.Value != 0 && t.Key.Type is SzArrayTypeAnalysisContext).ToArray();
+                    if (arrays.Length != 1 || arrays[0].Value != 1) continue;
+                    var array = arrays[0].Key;
+                    var element = ((SzArrayTypeAnalysisContext)array.Type!).ElementType;
+                    if (!element.IsValueType || element.HasAnyGenericParameters() || ElementSize(element, pointerSize) != 0) continue;
+                    var stride = MetadataElementSize(element, pointerSize);
+                    var delta = checked(offset - ElementsOffset(pointerSize));
+                    if (stride <= 0 || stride > int.MaxValue || delta < 0) continue;
+                    var indices = terms.Where(t => t.Value != 0 && !ReferenceEquals(t.Key, array)).ToArray();
+                    IOperand index;
+                    long component;
+                    if (indices.Length == 0)
+                    {
+                        index = new Immediate(delta / stride);
+                        component = delta % stride;
+                    }
+                    else if (indices.Length == 1 && indices[0].Value == stride && delta < stride)
+                    {
+                        index = indices[0].Key;
+                        component = delta;
+                    }
+                    else continue;
+                    if (width >= stride || component > stride - width) continue;
+                    var name = "arrayElementAddress" + nextIndex;
+                    var address = new LocalVariable(name, new Register(null, name), new ByRefTypeAnalysisContext(element));
+                    var field = NestedFieldAccess.Find(element, address, component, width);
+                    if (field == null) continue;
+                    if (slot == 1 && instruction.Operands[0] is FieldReference targetField
+                        && targetField.Field.FieldType.FullName != field.Field.FieldType.FullName) continue;
+                    if (slot == 1 && instruction.Operands[0] is LocalVariable { Type: { } known }
+                        && known.FullName != field.Field.FieldType.FullName) continue;
+                    var prefix = new Instruction(nextIndex++, OpCode.Move, address, new AddressOf(new ArrayAccess(array, index)));
+                    prefixes.Add(prefix);
+                    method.Locals.Add(address);
+                    instruction.SetOperand(slot, field);
+                    if (slot == 1 && instruction.Operands[0] is LocalVariable loaded && loaded.Type == null)
+                        loaded.Type = field.Field.FieldType;
+                    changed = true;
+                }
+                catch (OverflowException) { /* Keep unprovable native ranges as diagnostics. */ }
+            }
+            if (prefixes.Count == 0) continue;
+            block.Instructions.InsertRange(block.Instructions.IndexOf(instruction), prefixes);
+            // Usually branches name blocks, but retain correct entry semantics
+            // for graphs whose jump operands directly name an instruction.
+            foreach (var branch in cfg.Instructions)
+            for (var slot = 0; slot < branch.Operands.Count; slot++)
+                if (ReferenceEquals(branch.Operands[slot], instruction)) branch.SetOperand(slot, prefixes[0]);
+        }
+        return changed;
     }
 
     private static void RecoverAccesses(MethodAnalysisContext method)

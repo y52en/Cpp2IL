@@ -345,6 +345,19 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     [MemberNotNull(nameof(ConvertedIsil))]
     public void Analyze()
     {
+        void TraceAnalysis(string stage)
+        {
+            var requested = Environment.GetEnvironmentVariable("CPP2IL_TRACE_ANALYSIS_RVAS");
+            if (requested == null || !requested.Split(',').Any(value => string.Equals(value.Trim(),
+                    UnderlyingPointer.ToString("X"), StringComparison.OrdinalIgnoreCase))) return;
+            Console.Error.WriteLine("ANALYSIS_STAGE " + stage + " " + FullName);
+            foreach (var block in ControlFlowGraph!.Blocks)
+            {
+                Console.Error.WriteLine("BLOCK " + block.ID + " PREDECESSORS "
+                    + string.Join(",", block.Predecessors.Select(b => b.ID)));
+                foreach (var instruction in block.Instructions) Console.Error.WriteLine(instruction);
+            }
+        }
         if (MaxMethodSizeBytes != -1 && RawBytes.Length > MaxMethodSizeBytes)
         {
             Logger.WarnNewline($"Method {FullName} is too big ({RawBytes.Length} bytes), skipping analysis.");
@@ -372,10 +385,13 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
         StackAnalyzer.Analyze(this);
+        NativeScalarStoreRecovery.Run(this);
         Arm64HfaRecovery.Run(this);
         HiddenStructReturnRecovery.Run(this);
+        WholeStackValueCopyRecovery.Run(this);
         WholeStructInitializationRecovery.Run(this);
         BoxAddressRecovery.Run(this);
+        TraceAnalysis("stack-recovered");
 
         // Dominator info must be computed after stack analysis, which removes unreachable/empty
         // blocks and would otherwise leave the dominator tree out of sync with the graph SSA sees.
@@ -384,6 +400,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Create locals
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
+        TraceAnalysis("ssa-locals");
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
@@ -408,9 +425,21 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         InjectedCheckRemover.Run(this);
 
+        ArrayRecovery.RecoverAllocationsOnly(this);
+        InterfaceInvokerThunkRecovery.Run(this);
+        AllocatedObjectArrayHelperRecovery.TrimKnownHelperPadding(this);
+        AllocatedObjectArrayHelperRecovery.Run(this);
+        ForwardNullCheckRecovery.Run(this);
         InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        TraceAnalysis("typed");
+
+        // Managed signatures now type input arguments and resolved call results.
+        // Revisit only the hash-proven outlined helpers while definitions are
+        // still SSA; the first pass must decline those initially untyped values.
+        AllocatedObjectArrayHelperRecovery.Run(this);
+        ForwardNullCheckRecovery.Run(this);
 
         // Boolean Not/copy wrappers cannot safely be followed until types are resolved.
         InjectedCheckRemover.Run(this);
@@ -427,27 +456,46 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
+        if (PhiMemoryLoadRecovery.Run(this) > 0)
+        {
+            // The per-edge reads did not exist during ResolveAll. Resolve exact
+            // original metadata globals before their pointer phis are removed.
+            MetadataResolver.ResolveMetadataUsages(this);
+            LocalVariables.ResolveTypesAndFields(this);
+        }
         SsaSimplifier.Run(this);
 
         // Folding a constant exposes more to propagate
         for (var i = 0; i < 8 && ConstantFolder.Run(this); i++)
             SsaSimplifier.Run(this);
 
+        if (SsaFieldAddressRecovery.Run(this) > 0)
+            LocalVariables.ResolveTypesAndFields(this);
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
 
+        // Type/copy resolution can expose pure loop-carried cycles which have
+        // no path to any observable use. Eliminate them while still in SSA.
+        DeadCodeEliminator.Run(this);
+
         SsaForm.Remove(this);
+        TraceAnalysis("ssa-removed");
 
         // Phi removal leaves a copy per merged version, most of which can share one local
         CopyCoalescer.Run(this);
+        TraceAnalysis("copies-coalesced");
 
         // Now out of SSA: clean up the per-edge copies that phi removal introduced (a local can have
         // several definitions merging at a join here, so this pass propagates conservatively), then
         // drop dead locals.
         Simplifier.Simplify(this);
+        TraceAnalysis("post-ssa-simplified");
+        LateMetadataAllocationRecovery.Run(this);
 
         // Fix float literals
+        ReadOnlyScalarRecovery.Run(this);
         FloatLiteralRecovery.Run(this);
+        PackedConstantFieldStoreRecovery.Run(this);
 
         // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
         ArrayRecovery.Run(this);
@@ -462,6 +510,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
         CallArgumentTrimmer.Run(this);
+        HiddenBufferConstructorReturnRecovery.Run(this);
         // Native receivers still contain pointer copies during the early type
         // fixpoint. Copy propagation exposes &stack storage only later; recover
         // its independently named scalar reads before they become default IL
@@ -469,6 +518,23 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         StackFieldRecovery.Run(this);
         StackFieldZeroRecovery.Run(this);
         DeadCodeEliminator.Run(this);
+
+        // Native argument padding and unused flags must be gone before proving
+        // that the cast lookup/exception path has no escaping definitions.
+        LateClassInitRecovery.Run(this);
+        InlineClassCastRecovery.Run(this);
+        RuntimeCheckedCastRecovery.Run(this);
+        InlineClassTestRecovery.Run(this);
+        CovariantArrayStoreRecovery.Run(this);
+        EmptyRuntimeGuardRecovery.Run(this);
+        ArrayRecovery.RecoverLateSplitLoads(this);
+        if (SsaFieldAddressRecovery.Run(this) > 0)
+        {
+            MetadataResolver.ResolveFieldOffsets(this);
+            DeadCodeEliminator.Run(this);
+        }
+        NativeScalarStorageRecovery.Run(this);
+        SharedEnumDefaultReturnRecovery.Run(this);
 
         LocalVariables.RemoveUnused(this);
     }

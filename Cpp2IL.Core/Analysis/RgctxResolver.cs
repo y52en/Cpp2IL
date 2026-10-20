@@ -95,10 +95,17 @@ public static class RgctxResolver
         if (definition.Definition is not { } typeDefinition)
             return null;
 
-        var typeArguments = (instance as GenericInstanceTypeAnalysisContext)?.GenericArguments ?? [];
+        var typeArguments = TypeArgumentsForOwner(instance);
 
         return ResolveEntry(typeDefinition.RgctXs, index, typeArguments, [], instance.AppContext);
     }
+
+    // Shared code on an open type still has real VAR parameters. An empty
+    // substitution list makes every such entry fail inflation and cache null.
+    // Concrete owners retain their actual arguments; never substitute object
+    // or another guessed instantiation for the owner's own parameters.
+    internal static IReadOnlyList<TypeAnalysisContext> TypeArgumentsForOwner(TypeAnalysisContext instance)
+        => instance is GenericInstanceTypeAnalysisContext concrete ? concrete.GenericArguments : instance.GenericParameters;
 
     // Only a generic method (or one on a generic type) gets a per-method rgctx table
     private static bool HasMethodRgctx(MethodAnalysisContext method) => method switch

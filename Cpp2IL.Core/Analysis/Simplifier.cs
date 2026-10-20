@@ -95,6 +95,13 @@ public static class Simplifier
                     // If it's move and it moves something to local, replace and remove it
                     if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local)
                     {
+                        // These operands evaluate a load/check NOW. Substituting
+                        // them at later uses re-reads mutable storage, duplicates
+                        // checks, and moves exceptions across observable work.
+                        // Preserve the snapshot; ordinary local copies still fold.
+                        if (instruction.Operands[1] is MemoryOperand or FieldReference or ArrayAccess or ArrayLength
+                            && !SingleImmediateLoadUse(block,i,local))
+                            continue;
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
                             // This can't be inlined into memory operand
@@ -105,7 +112,8 @@ public static class Simplifier
                             var stopAtJoins = definitionCounts.TryGetValue(local, out var defs) && defs > 1;
 
                             // Replace local
-                            ReplaceLocalsUntilReassignment(block, i + 1, local, instruction.Operands[1], stopAtJoins);
+                            ReplaceLocalsUntilReassignment(block, i + 1, local, instruction.Operands[1], stopAtJoins,
+                                instruction.NativeReadSize);
 
                             // Only drop the defining move once the local has no remaining uses; if the
                             // replacement stopped at a join, the local is still live past it so the move stays.
@@ -130,6 +138,45 @@ public static class Simplifier
             }
 
             return changed;
+        }
+
+        private bool SingleImmediateLoadUse(Block block,int index,LocalVariable local)
+        {
+            var next=block.Instructions.Skip(index+1).FirstOrDefault(i=>i.OpCode!=OpCode.Nop);
+            if(next==null)return false;
+            // Keep safe adjacent load/store and first-argument forwarding. No
+            // read crosses an instruction, nor is it duplicated across uses.
+            var permitted=next.OpCode==OpCode.Return && next.Operands.Count==1 && ReferenceEquals(next.Operands[0],local)
+                || next.OpCode==OpCode.Move && next.Operands.Count==2 && ReferenceEquals(next.Operands[1],local)
+                    && next.Operands[0] is LocalVariable or MemoryOperand or FieldReference
+                || next.OpCode==OpCode.CallVoid && next.Operands.Count>1 && ReferenceEquals(next.Operands[1],local);
+            if(!permitted)return false;
+            var reads=0;
+            foreach(var instruction in _graph.Instructions)
+            for(var n=0;n<instruction.Operands.Count;n++)
+            {
+                if(instruction.Operands[n] is AddressOf {Target:LocalVariable addressed} && ReferenceEquals(addressed,local))
+                    return false;
+                var destinationIndex=instruction.OpCode is OpCode.Call or OpCode.IndirectCall ? 1 : 0;
+                if(n==destinationIndex && ReferenceEquals(instruction.Destination,local))continue;
+                if(ReadsLocal(instruction.Operands[n],local) && ++reads>1)return false;
+            }
+            return reads==1;
+        }
+
+        private static bool ReadsLocal(IOperand? operand,LocalVariable local,int depth=0)
+        {
+            if(depth>16)return true; // unknown/deep address trees cannot authorize forwarding
+            return operand switch
+            {
+                LocalVariable value=>ReferenceEquals(value,local),
+                MemoryOperand memory=>ReadsLocal(memory.Base,local,depth+1)||ReadsLocal(memory.Index,local,depth+1),
+                FieldReference field=>ReferenceEquals(field.Local,local)||ReadsLocal(field.Parent,local,depth+1),
+                ArrayAccess array=>ReferenceEquals(array.Array,local)||ReadsLocal(array.Index,local,depth+1),
+                ArrayLength array=>ReferenceEquals(array.Array,local),
+                AddressOf address=>ReadsLocal(address.Target,local,depth+1),
+                _=>false
+            };
         }
 
         private void InlineLocals()
@@ -198,13 +245,19 @@ public static class Simplifier
             {
                 if (instruction.Destination is LocalVariable local)
                     counts[local] = counts.TryGetValue(local, out var count) ? count + 1 : 1;
+                // An escaped storage location is not single-assignment after
+                // SSA destruction: the receiver of ref/out may be written by
+                // the callee even without a Move destination in this graph.
+                foreach (var operand in instruction.Operands)
+                    if (operand is AddressOf { Target: LocalVariable addressed })
+                        counts[addressed] = 2;
             }
 
             return counts;
         }
 
         private void ReplaceLocalsUntilReassignment(Block startBlock, int startIndex, LocalVariable local,
-            IOperand replacement, bool stopAtJoins)
+            IOperand replacement, bool stopAtJoins, int replacementReadSize = 0)
         {
             var visited = new HashSet<Block>();
             var remaining = new Stack<(Block, int)>(_graph.Blocks.Count);
@@ -229,6 +282,16 @@ public static class Simplifier
                     if (instruction.Destination is LocalVariable destLocal && destLocal == local)
                         return;
 
+                    // Copies capture a value, not a live view of another local.
+                    // Do not substitute a source after it has been overwritten,
+                    // or either storage location's address has escaped.
+                    if (replacement is LocalVariable replacementLocal
+                        && ReferenceEquals(instruction.Destination, replacementLocal))
+                        return;
+                    if (instruction.Operands.Any(operand => operand is AddressOf { Target: LocalVariable addressed }
+                        && (ReferenceEquals(addressed, local) || ReferenceEquals(addressed, replacement))))
+                        return;
+
                     // Replace operands
                     for (var j = 0; j < instruction.Operands.Count; j++)
                     {
@@ -236,6 +299,16 @@ public static class Simplifier
 
                         if (operand is LocalVariable usedLocal && usedLocal == local)
                         {
+                            if (replacement is MemoryOperand && instruction.OpCode == OpCode.Move && j == 1)
+                            {
+                                // A native load's width belongs to the copied
+                                // value. Losing it at a store misidentifies a
+                                // vector read as a scalar; guessing from the
+                                // destination field's type is not safe.
+                                if (instruction.NativeReadSize != 0 && instruction.NativeReadSize != replacementReadSize)
+                                    continue;
+                                instruction.NativeReadSize = replacementReadSize;
+                            }
                             instruction.SetOperand(j, replacement);
                             UpdateSourceCache(currentBlock, instruction);
                         }

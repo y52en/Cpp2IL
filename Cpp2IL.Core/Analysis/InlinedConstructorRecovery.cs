@@ -134,8 +134,15 @@ public static class InlinedConstructorRecovery
     {
         if (value is Immediate or FloatLiteral or DoubleLiteral or StringLiteral) return true;
         if (value is FieldReference { Field.IsStatic: false } field)
+        {
+            // The canonical managed instance receiver is non-null on entry. Do
+            // not extend this to arbitrary reference parameters or this aliases:
+            // moving their field reads would move a possible null exception.
+            if (field.Local.IsThis && method.ParameterLocals.Any(p=>ReferenceEquals(p,field.Local)))
+                return !aliases.Contains(field.Local);
             return field.Local.Type?.IsValueType == true && AvailableBeforeAllocation(field.Local,
                 method,instructions,allocationIndex,allocationBlock,ref dominance,aliases);
+        }
         if (value is not LocalVariable local || aliases.Contains(local)) return false;
         var definitions = instructions.Select((i,n)=>(i,n)).Where(x => ReferenceEquals(x.i.Destination,local)).ToList();
         if (definitions.Count == 0) return method.ParameterLocals.Contains(local);
@@ -150,7 +157,22 @@ public static class InlinedConstructorRecovery
             dominance ??= new DominatorInfo(method.ControlFlowGraph);
             if (dominance.Dominates(definitionBlock, allocationBlock)) return true;
         }
-        return false;
+        // Phi elimination leaves one local assigned on each incoming branch.
+        // No individual definition dominates a join. Prove an assignment on
+        // EVERY predecessor path; an unanchored cycle or missing path rejects.
+        var memo = new Dictionary<Block,bool>();
+        var visiting = new HashSet<Block>();
+        bool AssignedOnEntry(Block block)
+        {
+            if (memo.TryGetValue(block,out var known)) return known;
+            if (!visiting.Add(block)) return false;
+            var available = block.Predecessors.Count > 0 && block.Predecessors.All(before =>
+                before.Instructions.Any(i=>ReferenceEquals(i.Destination,local)) || AssignedOnEntry(before));
+            visiting.Remove(block);
+            memo[block]=available;
+            return available;
+        }
+        return AssignedOnEntry(allocationBlock);
     }
 
     private static bool SameValue(IOperand a, IOperand b) => ReferenceEquals(a,b) || (a,b) switch
