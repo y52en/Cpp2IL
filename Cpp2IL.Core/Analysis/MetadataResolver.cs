@@ -93,6 +93,8 @@ public static class MetadataResolver
                 MemoryOperand { Base: null, Index: null, Scale: 0 } memory => (ulong)memory.Addend,
                 Immediate immediate => immediate.UnsignedValue,
                 _ => IndirectMetadataAddress(instruction.Operands[1], definitions, ReadGot)
+                    ?? PhiGotMetadataAddress(instruction,method.ControlFlowGraph,definitions,
+                        method.AppContext.Binary.PointerSizeBytes,ReadGot)
                     ?? RepeatedGotMetadataAddress(instruction,method.ControlFlowGraph,allDefinitions,
                         method.AppContext.Binary.PointerSizeBytes,ReadGot,ref gotDominance) ?? 0ul,
             };
@@ -149,6 +151,57 @@ public static class MetadataResolver
             || definition is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null, Scale: 0 } slot] })
             return null;
         return readGot(unchecked((ulong)slot.Addend));
+    }
+
+    // A saved GOT pointer may meet itself (or an identical reload) at SSA
+    // phis. Resolve a VALUE only when every incoming dependency is an exact
+    // pointer-sized GOT load/copy and every cycle reaches a real GOT anchor.
+    // A valid sibling must never legitimize a separate uninitialized cycle.
+    // The returned address STILL needs the original metadata-usage lookup.
+    internal static ulong? PhiGotMetadataAddress(Instruction consumer,ISILControlFlowGraph graph,
+        IReadOnlyDictionary<LocalVariable,Instruction> definitions,int pointerSize,Func<ulong,ulong?> readGot)
+    {
+        if(pointerSize is not (4 or 8) || consumer.NativeReadSize!=pointerSize
+            || consumer is not {OpCode:OpCode.Move,Operands:[_,MemoryOperand {Base:LocalVariable pointer,Index:null,Scale:0,Addend:0}]}
+            || !definitions.TryGetValue(pointer,out var origin)
+            || !(origin.OpCode==OpCode.Phi || origin is {OpCode:OpCode.Move,Operands:[_,LocalVariable]}))return null;
+        var edges=new Dictionary<LocalVariable,LocalVariable[]>();var anchors=new HashSet<LocalVariable>();
+        var addresses=new HashSet<ulong>();var pending=new Stack<LocalVariable>();pending.Push(pointer);
+        while(pending.Count>0)
+        {
+            var local=pending.Pop();if(edges.ContainsKey(local))continue;
+            if(edges.Count>=256 || !definitions.TryGetValue(local,out var definition))return null;
+            LocalVariable[] dependencies;
+            if(definition is {OpCode:OpCode.Move,Operands:[_,MemoryOperand {Base:null,Index:null,Scale:0} slot]}
+                && definition.NativeReadSize==pointerSize
+                && readGot(unchecked((ulong)slot.Addend)) is {} address)
+            {anchors.Add(local);addresses.Add(address);dependencies=[];}
+            else if(definition is {OpCode:OpCode.Move,Operands:[_,LocalVariable source]}
+                && (definition.NativeRegisterCopySize==0 || definition.NativeRegisterCopySize==pointerSize))dependencies=[source];
+            else if(definition.OpCode==OpCode.Phi && definition.Operands.Count>=2
+                && definition.Operands.Skip(1).All(o=>o is LocalVariable))dependencies=definition.Operands.Skip(1).Cast<LocalVariable>().ToArray();
+            else return null;
+            edges[local]=dependencies;foreach(var dependency in dependencies)pending.Push(dependency);
+        }
+        if(anchors.Count==0 || addresses.Count!=1)return null;
+        if(graph.Instructions.Any(i=>i.ImplicitDefinition is {} clobbered
+            && edges.Keys.Any(local=>local.Register.Number==clobbered.Number
+                && local.Register.Name==clobbered.Name)))return null;
+        var anchored=new HashSet<LocalVariable>(anchors);var changed=true;
+        while(changed)
+        {
+            changed=false;
+            foreach(var (local,dependencies) in edges)
+                if(!anchored.Contains(local) && dependencies.Any(anchored.Contains))changed|=anchored.Add(local);
+        }
+        if(anchored.Count!=edges.Count)return null;
+        var origins=graph.Blocks.Where(b=>b.Instructions.Contains(origin)).ToArray();
+        var consumers=graph.Blocks.Where(b=>b.Instructions.Contains(consumer)).ToArray();
+        if(origins.Length!=1 || consumers.Length!=1)return null;
+        if(ReferenceEquals(origins[0],consumers[0]))
+        {if(origins[0].Instructions.IndexOf(origin)>=origins[0].Instructions.IndexOf(consumer))return null;}
+        else if(!new DominatorInfo(graph).Dominates(origins[0],consumers[0]))return null;
+        return addresses.Single();
     }
 
     // Post-SSA local coalescing can reuse a pointer for identical GOT loads.
@@ -314,6 +367,8 @@ public static class MetadataResolver
                 continue;
 
             var target = dest.UnsignedValue;
+            if (callInstruction.NativeDirectCallTarget == 0)
+                callInstruction.NativeDirectCallTarget = target;
 
             var keyFunctionAddresses = method.AppContext.GetOrCreateKeyFunctionAddresses();
 
@@ -599,9 +654,28 @@ public static class MetadataResolver
             if (!instruction.IsCall)
                 continue;
 
+            if (instruction.Operands[0] is MethodAnalysisContext)
+            {
+                changed |= RefineResolvedGenericCall(method, instruction);
+                continue;
+            }
+
             if (instruction.Operands[0] is not Immediate target)
                 //Already resolved
                 continue;
+
+            if (NativeNullableAccessorRecovery.TryResolve(method, instruction))
+            {
+                changed = true;
+                continue;
+            }
+
+            if (!method.AppContext.MethodsByAddress.ContainsKey(target.UnsignedValue)
+                && NativeNullableConstructorRecovery.IsProvenBody(method, target.UnsignedValue))
+            {
+                changed |= NativeNullableConstructorRecovery.TryResolve(method, instruction);
+                continue;
+            }
 
             if (GetMethodInfoArgument(instruction) is not { RepresentedMethod: { } representedMethod })
                 //No MethodInfo to work with
@@ -646,12 +720,60 @@ public static class MetadataResolver
         return changed;
     }
 
+    internal static bool RefineResolvedGenericCall(MethodAnalysisContext caller, Instruction call,
+        Func<MethodAnalysisContext, ulong, bool>? nativeEntryMatches = null)
+    {
+        if (!call.IsCall || call.NativeVirtualDispatch || call.NativeDirectCallTarget == 0
+            || call.Operands.Count == 0 || call.Operands[0] is not MethodAnalysisContext current
+            || current is ConcreteGenericMethodAnalysisContext || current.DeclaringType is not { GenericParameters.Count: > 0 }
+            || current.DeclaringType is GenericInstanceTypeAnalysisContext || current.GenericParameters.Count != 0
+            || current.Parameters.Count != 0) return false;
+        var hidden = (call.OpCode == OpCode.Call ? 2 : 1) + (current.IsStatic ? 0 : 1);
+        if (call.Operands.Count != hidden + 1
+            || AsMethodInfo(call.Operands[hidden]) is not { RepresentedMethod: ConcreteGenericMethodAnalysisContext concrete }
+            || ReferenceEquals(concrete, caller) || !ReferenceEquals(BaseMethodOf(current), BaseMethodOf(concrete))
+            || concrete.MethodGenericParameters.Count != 0 || concrete.IsStatic != current.IsStatic
+            || concrete.DeclaringType is not GenericInstanceTypeAnalysisContext closed
+            || closed.HasAnyGenericParameters()
+            || !TrivialConstructorRecovery.SameType(current.ReturnType, concrete.ReturnType)
+            || current.ReturnType.HasAnyGenericParameters()
+            || current.ReturnType is PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+                or RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) return false;
+        nativeEntryMatches ??= (target, entry) =>
+        {
+            var architecture = target.AppContext.InstructionSet;
+            var unboxed = architecture.GetUnboxedMethodTarget(target);
+            var actual = unboxed != 0 ? unboxed : architecture.GetPointerForMethod(target);
+            if (actual != 0) return actual == entry;
+            // A stripped MethodSpec can have no separate native variant while
+            // still supplying the exact closed metadata for a reference-shared
+            // body. Require the SAME definition's proven native entry too;
+            // never apply this route to value/open/pointer arguments.
+            if (concrete.MethodRef == null || !ClosedReferenceOwnerArguments(closed)) return false;
+            var definitionUnboxed = architecture.GetUnboxedMethodTarget(current);
+            var definitionEntry = definitionUnboxed != 0 ? definitionUnboxed : architecture.GetPointerForMethod(current);
+            return definitionEntry != 0 && definitionEntry == entry;
+        };
+        if (!nativeEntryMatches(concrete, call.NativeDirectCallTarget)) return false;
+        // Already remapped operands: same fixed return, zero explicit args and
+        // same instance/static ABI. Do not remap or infer new argument slots.
+        call.SetOperand(0, concrete);
+        return true;
+    }
+
+    internal static bool ClosedReferenceOwnerArguments(GenericInstanceTypeAnalysisContext owner)
+        => owner.GenericArguments.Count > 0 && owner.GenericArguments.Count == owner.GenericType.GenericParameters.Count
+            && owner.GenericArguments.All(argument => !argument.IsValueType && !argument.HasAnyGenericParameters()
+                && argument is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext or RuntimeClassTypeAnalysisContext
+                    or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext));
+
     // Resolves virtual dispatch through <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c>
     // as long as the klass local's represented type is known.
     public static bool ResolveVirtualCalls(MethodAnalysisContext method)
         => ResolveVirtualCalls(method, RuntimeMetadataLayout.For(method));
 
-    internal static bool ResolveVirtualCalls(MethodAnalysisContext method, RuntimeMetadataLayout layout)
+    internal static bool ResolveVirtualCalls(MethodAnalysisContext method, RuntimeMetadataLayout layout,
+        IReadOnlySet<Instruction>? allowedCalls = null)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var vtableOffset = layout.VTable;
@@ -669,6 +791,7 @@ public static class MetadataResolver
 
         foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
+            if (allowedCalls != null && !allowedCalls.Contains(instruction)) continue;
             if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
                 continue;
 
@@ -755,6 +878,118 @@ public static class MetadataResolver
         };
     }
 
+    internal sealed record LateFieldVirtualWitness(LocalVariable Receiver, LocalVariable Klass,
+        TypeAnalysisContext ReceiverType, MethodAnalysisContext Target);
+
+    // Unlike the early SSA type fixpoint, this late proof must account for ALL
+    // definitions after phi destruction. Never use the last observed load or a
+    // guessed local type to license a virtual call.
+    internal static LateFieldVirtualWitness? ProveLateFieldVirtualCall(MethodAnalysisContext method,
+        Instruction call, RuntimeMetadataLayout layout)
+    {
+        if (method.ControlFlowGraph is not { } cfg || method.AppContext.Binary.PointerSizeBytes != 8
+            || layout.VTable != 0x128 || call.OpCode != OpCode.IndirectCall
+            || call.Operands is not [LocalVariable pointer, LocalVariable result, LocalVariable receiver, ..]) return null;
+        var writes = cfg.Blocks.SelectMany(b => b.Instructions).Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+        if (!writes.TryGetValue(pointer, out var pointerLoad)
+            || pointerLoad is not { OpCode: OpCode.Move, NativeReadSize: 8,
+                Operands: [_, MemoryOperand { Base: LocalVariable klass, Index: null, Scale: 0 } slotLoad] }
+            || !writes.TryGetValue(klass, out var classLoad)
+            || classLoad is not { OpCode: OpCode.Move, NativeReadSize: 8,
+                Operands: [_, MemoryOperand { Base: LocalVariable instance, Addend: 0, Index: null, Scale: 0 }] }
+            || !ReferenceEquals(instance, receiver)
+            || !writes.TryGetValue(receiver, out var receiverLoad)
+            || receiverLoad is not { OpCode: OpCode.Move, NativeReadSize: 8,
+                Operands: [_, FieldReference { Parent: null } field] }
+            || field.Field.BackingData == null || field.Field.IsStatic || field.Field.Offset < 0
+            || field.Field.Offset != field.Field.DefaultOffset || field.Field.Attributes != field.Field.DefaultAttributes
+            || !TrivialConstructorRecovery.SameType(field.Field.FieldType, field.Field.DefaultFieldType)
+            || field.Offset != field.Field.Offset || field.Field.FieldType is not { IsValueType: false } receiverType
+            || receiverType is PointerTypeAnalysisContext or ByRefTypeAnalysisContext or RuntimeClassTypeAnalysisContext
+            || receiverType.Definition == null || receiverType.GenericParameters.Count != 0
+            || receiver.Type != null && !TrivialConstructorRecovery.SameType(receiver.Type, receiverType)
+            || klass.Type != null && (klass.Type is not RuntimeClassTypeAnalysisContext existingClass
+                || !TrivialConstructorRecovery.SameType(existingClass.RepresentedType, receiverType))) return null;
+        var hierarchy = new HashSet<TypeAnalysisContext>();
+        var ownerMatches = false;
+        for (var owner = field.Local.Type; owner != null && hierarchy.Add(owner); owner = owner.BaseType)
+            if (TrivialConstructorRecovery.SameType(owner, field.Field.DeclaringType)) { ownerMatches = true; break; }
+        var receiverBlocks = cfg.Blocks.Where(b => b.Instructions.Contains(receiverLoad)).ToArray();
+        if (!ownerMatches || receiverBlocks.Length != 1 || !InlineClassTestRecovery.StableSource(method, field.Local, receiverBlocks[0])
+            || !ForwardNullCheckRecovery.DefinitionDominates(cfg, receiverLoad, classLoad)
+            || !ForwardNullCheckRecovery.DefinitionDominates(cfg, classLoad, pointerLoad)
+            || !ForwardNullCheckRecovery.DefinitionDominates(cfg, pointerLoad, call)) return null;
+        var dependencies = new[] { pointer, klass, receiver, field.Local };
+        if (cfg.Instructions.Any(i => i.ImplicitDefinition is { } clobbered
+            && dependencies.Any(l => l.Register.Number == clobbered.Number && l.Register.Name == clobbered.Name))
+            || cfg.Instructions.SelectMany(i => i.Operands).Any(o => EscapesByAddress(o, dependencies))) return null;
+        var offset = slotLoad.Addend - layout.VTable;
+        if (offset < 0 || offset % 16 != 0 || offset / 16 > int.MaxValue) return null;
+        var target = ResolveVTableSlot(method.AppContext, receiverType, (int)(offset / 16));
+        // Non-void ordinary calls only: tail/void/HFA/stack ABI shapes require
+        // their own proof, not reinterpretation of a stale native result slot.
+        if (target == null || target.IsStatic || target.IsVoid || target.GenericParameters.Count != 0
+            || target.AppContext.InstructionSet.CallingConventionResolver is not { } resolver
+            || resolver.ReturnsViaHiddenBuffer(target)
+            || resolver.ResolveForManaged(target).Any(o => o is StackOffset)
+            || target.ReturnType is GenericParameterTypeAnalysisContext
+            || target.Parameters.Any(p => p.ParameterType is GenericParameterTypeAnalysisContext
+                || Arm64HfaLayout.Fields(p.ParameterType) != null)
+            || result.Type != null && !TrivialConstructorRecovery.SameType(result.Type, target.ReturnType)) return null;
+        return new(receiver, klass, receiverType, target);
+    }
+
+    private static bool EscapesByAddress(IOperand operand, LocalVariable[] locals) => operand switch
+    {
+        AddressOf address => ReferencesLateLocal(address.Target, locals),
+        MemoryOperand memory => memory.Base != null && EscapesByAddress(memory.Base, locals)
+            || memory.Index != null && EscapesByAddress(memory.Index, locals),
+        ArrayAccess array => EscapesByAddress(array.Index, locals),
+        _ => false
+    };
+
+    private static bool ReferencesLateLocal(IOperand operand, LocalVariable[] locals) => operand switch
+    {
+        LocalVariable local => locals.Contains(local),
+        AddressOf address => ReferencesLateLocal(address.Target, locals),
+        MemoryOperand memory => memory.Base != null && ReferencesLateLocal(memory.Base, locals)
+            || memory.Index != null && ReferencesLateLocal(memory.Index, locals),
+        FieldReference field => locals.Contains(field.Local)
+            || field.Parent != null && ReferencesLateLocal(field.Parent, locals),
+        ArrayAccess array => locals.Contains(array.Array) || ReferencesLateLocal(array.Index, locals),
+        ArrayLength length => locals.Contains(length.Array),
+        _ => false
+    };
+
+    public static int ResolveLateFieldVirtualCalls(MethodAnalysisContext method)
+    {
+        if (method.ControlFlowGraph == null || method.AppContext.UnityVersion.Major != 2018
+            || method.AppContext.UnityVersion.Minor != 4
+            || method.AppContext.InstructionSet is not Cpp2IL.Core.InstructionSets.NewArmV8InstructionSet) return 0;
+        var layout = RuntimeMetadataLayout.For(method);
+        var calls = new Dictionary<Instruction, LateFieldVirtualWitness>();
+        foreach (var call in method.ControlFlowGraph.Instructions.ToArray())
+            if (ProveLateFieldVirtualCall(method, call, layout) is { } witness) calls[call] = witness;
+        foreach (var witness in calls.Values)
+        {
+            witness.Receiver.Type ??= witness.ReceiverType;
+            witness.Klass.Type ??= new RuntimeClassTypeAnalysisContext(witness.ReceiverType, witness.ReceiverType.DeclaringAssembly);
+        }
+        if (calls.Count == 0 || !ResolveVirtualCalls(method, layout, calls.Keys.ToHashSet())) return 0;
+        var count = 0;
+        foreach (var (call, witness) in calls)
+            if (call.Operands[0] is MethodAnalysisContext actual && ReferenceEquals(actual, witness.Target))
+            {
+                ((LocalVariable)call.Operands[1]).Type ??= actual.ReturnType;
+                count++;
+            }
+        CallArgumentTrimmer.Run(method);
+        DeadCodeEliminator.Run(method);
+        return count;
+    }
+
     internal static MethodAnalysisContext? ResolveArrayObjectSlot(ApplicationAnalysisContext app, TypeAnalysisContext type, int slot)
     {
         if (type is not (SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext) || slot < 0) return null;
@@ -774,7 +1009,7 @@ public static class MetadataResolver
         return arrayTarget;
     }
 
-    private static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
+    internal static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
     {
         var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType.Definition ?? type.Definition;
 

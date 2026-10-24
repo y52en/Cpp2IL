@@ -90,7 +90,7 @@ public static class ConstantFieldConstructorRecovery
     public static int Run(MethodAnalysisContext method)
     {
         if(method.ControlFlowGraph is not { } cfg)return 0;
-        var count=0;
+        var count=RecoverBaseInitializer(method);
         foreach(var allocation in cfg.Instructions)
         {
             if(allocation is not {OpCode:OpCode.Newobj,Operands:[LocalVariable obj,TypeAnalysisContext type]}
@@ -147,5 +147,74 @@ public static class ConstantFieldConstructorRecovery
             }
         }
         return count;
+    }
+
+    // A native compiler can inline the immediate parent's field initializers
+    // and leave only its call to the grandparent. Such a call cannot be emitted
+    // as a legal C# base initializer. Reuse the COMPLETE original parent template,
+    // consuming all its stores in exact order around that exact ancestor call.
+    // No name-based deletion/retargeting or partially matched prefix is allowed.
+    internal static int RecoverBaseInitializer(MethodAnalysisContext method)
+    {
+        if(method.Name!=".ctor" || method.IsStatic || !method.IsVoid
+            || method.DeclaringType is not {IsValueType:false,GenericParameters.Count:0} owner
+            || owner is GenericInstanceTypeAnalysisContext || owner.BaseType is not { } parent
+            || parent.GetExtraData<Template[]>(CacheKey) is not {Length:1} templates
+            || method.ControlFlowGraph is not { } cfg)return 0;
+        var template=templates[0];
+        var selfParameters=method.ParameterLocals.Where(p=>p.IsThis).ToArray();
+        if(selfParameters.Length!=1 || !TrivialConstructorRecovery.SameType(selfParameters[0].Type,owner)
+            || !ReferenceEquals(template.Constructor.DeclaringType,parent) || template.Constructor.Parameters.Count!=0
+            || template.BaseConstructor is not { } ancestor || !ProvenDirectBase(parent,ancestor)
+            || template.Stores.Count==0 || template.BaseStoreIndex<0
+            || template.BaseStoreIndex>template.Stores.Count)return 0;
+        var self=selfParameters[0];
+        if(cfg.Blocks.SelectMany(b=>b.Instructions).Any(i=>ReferenceEquals(i.Destination,self)
+            || i.ImplicitDefinition is { } clobbered && clobbered.Number==self.Register.Number
+                && clobbered.Name==self.Register.Name))return 0;
+        var initializerCalls=cfg.Instructions.Where(i=>i.IsCall && i.Operands.Count>1
+            && i.Operands[0] is MethodAnalysisContext {Name:".ctor"}
+            && i.Operands.Count>(i.OpCode==OpCode.Call?2:1)
+            && ReferenceEquals(i.Operands[i.OpCode==OpCode.Call?2:1],self)).ToArray();
+        if(initializerCalls.Length!=1 || initializerCalls[0] is not
+            {OpCode:OpCode.CallVoid,NativeVirtualDispatch:false,Operands:[MethodAnalysisContext called,LocalVariable receiver]}
+            || !ReferenceEquals(called,ancestor) || !ReferenceEquals(receiver,self))return 0;
+        var call=initializerCalls[0];
+        var prefix=new List<Instruction>();var seen=new HashSet<Block>();var block=cfg.EntryBlock;
+        while(seen.Add(block))
+        {
+            if(!ReferenceEquals(block,cfg.EntryBlock) && block.Predecessors.Count!=1)break;
+            prefix.AddRange(block.Instructions.Where(i=>i.OpCode is not (OpCode.Nop or OpCode.Jump)));
+            if(prefix.Count>256 || block.Successors.Count!=1)break;
+            block=block.Successors[0];
+        }
+        if(prefix.Count>256)return 0;
+        var start=prefix.IndexOf(call)-template.BaseStoreIndex;
+        if(start<0 || start+template.Stores.Count+1>prefix.Count)return 0;
+        // A duplicate/unmatched inherited initializer before the selected
+        // window is not evidence for a complete parent substitution. Only the
+        // child's own field initializers may precede this exact parent segment.
+        // FieldReference is a constant *descriptor* in Instruction.Destination;
+        // inspect the Move's actual left operand rather than dropping a store.
+        if(prefix.Take(start).Any(i=>i is {OpCode:OpCode.Move,Operands:[MemoryOperand,..]}
+            || i is {OpCode:OpCode.Move,Operands:[FieldReference field,..]} && (!ReferenceEquals(field.Local,self)
+                || field.Parent!=null || !ReferenceEquals(field.Field.DeclaringType,owner))))return 0;
+        var matched=new List<Instruction>();var storeIndex=0;
+        for(var index=0;index<template.Stores.Count+1;index++)
+        {
+            var instruction=prefix[start+index];
+            if(index==template.BaseStoreIndex)
+            {if(!ReferenceEquals(instruction,call))return 0;continue;}
+            var expected=template.Stores[storeIndex++];
+            if(instruction is not {OpCode:OpCode.Move,Operands:[FieldReference {Parent:null} field,var value]}
+                || !ReferenceEquals(field.Local,self) || !ReferenceEquals(field.Field,expected.Field)
+                || field.Offset!=expected.Field.Offset || instruction.NativeWriteSize!=expected.Width
+                || Constant(field.Field.FieldType,value,instruction.NativeWriteSize) is not { } constant
+                || constant.Value!=expected.Value || constant.Kind!=expected.Kind)return 0;
+            matched.Add(instruction);
+        }
+        call.SetOperand(0,template.Constructor);
+        foreach(var store in matched){store.OpCode=OpCode.Nop;store.SetOperands();}
+        return 1;
     }
 }

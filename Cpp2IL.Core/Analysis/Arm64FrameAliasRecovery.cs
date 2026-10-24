@@ -15,14 +15,19 @@ public static class Arm64FrameAliasRecovery
     private static bool Equal(Dictionary<string, int> a, Dictionary<string, int> b) =>
         a.Count == b.Count && a.All(p => b.TryGetValue(p.Key, out var value) && value == p.Value);
 
-    private static Dictionary<string, int> Incoming(Block block, ISILControlFlowGraph graph,
-        Dictionary<Block, Dictionary<string, int>> outputs)
+    private static Dictionary<string, int>? Incoming(Block block, ISILControlFlowGraph graph,
+        Dictionary<Block, Dictionary<string, int>?> outputs)
     {
-        if (block == graph.EntryBlock || block.Predecessors.Count == 0) return [];
-        var result = new Dictionary<string, int>(outputs[block.Predecessors[0]]);
-        foreach (var predecessor in block.Predecessors.Skip(1))
+        if (block == graph.EntryBlock) return [];
+        // Unvisited is TOP, not the proven absence of an alias. Starting every
+        // backedge at empty destroys even a frame preserved by the whole loop.
+        // Only a path anchored at the real entry can initialize a state.
+        var known=block.Predecessors.Select(p=>outputs[p]).Where(s=>s!=null).ToArray();
+        if(known.Length==0)return null;
+        var result = new Dictionary<string, int>(known[0]!);
+        foreach (var predecessor in known.Skip(1))
             foreach (var key in result.Keys.ToArray())
-                if (!outputs[predecessor].TryGetValue(key, out var value) || value != result[key])
+                if (!predecessor!.TryGetValue(key, out var value) || value != result[key])
                     result.Remove(key);
         return result;
     }
@@ -66,7 +71,7 @@ public static class Arm64FrameAliasRecovery
     {
         // No inferred successors for computed jumps: do not treat missing edges as proof.
         if (graph.Instructions.Any(i => i.OpCode == OpCode.IndirectJump)) return 0;
-        var outputs = graph.Blocks.ToDictionary(b => b, _ => new Dictionary<string, int>());
+        var outputs = graph.Blocks.ToDictionary(b => b, _ => (Dictionary<string, int>?)null);
         var stable = false;
         for (var round = 0; round < 4096; round++)
         {
@@ -74,12 +79,13 @@ public static class Arm64FrameAliasRecovery
             foreach (var block in graph.Blocks)
             {
                 var state = Incoming(block, graph, outputs);
+                if(state==null)continue;
                 foreach (var instruction in block.Instructions)
                 {
                     if (!stackSizes.TryGetValue(instruction, out var size)) return 0;
                     Transfer(instruction, size, state);
                 }
-                if (Equal(state, outputs[block])) continue;
+                if (outputs[block] is {} previous && Equal(state, previous)) continue;
                 outputs[block] = state;
                 changed = true;
             }
@@ -92,6 +98,7 @@ public static class Arm64FrameAliasRecovery
         foreach (var block in graph.Blocks)
         {
             var state = Incoming(block, graph, outputs);
+            if(state==null)continue; // unreachable/unanchored cycles prove nothing
             foreach (var instruction in block.Instructions)
             {
                 var size = stackSizes[instruction];

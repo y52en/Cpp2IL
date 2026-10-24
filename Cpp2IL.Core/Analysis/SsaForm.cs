@@ -31,6 +31,7 @@ public class SsaForm
     public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
     {
         var ssa = new SsaForm();
+        ssa.FindAddressedStackStorage(graph);
         ssa.FindClobberingAddressTakes(graph);
 
         graph.BuildUseDefLists(ssa._clobbering);
@@ -42,6 +43,16 @@ public class SsaForm
 
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
     private readonly HashSet<Instruction> _clobbering = [];
+    private readonly HashSet<int> _addressedStackStorage = [];
+
+    private void FindAddressedStackStorage(ISILControlFlowGraph graph)
+    {
+        foreach(var instruction in graph.Instructions)
+            foreach(var operand in instruction.Operands)
+                if(operand is AddressOf {Target:Register slot}
+                    && slot.Name.StartsWith("stack_",System.StringComparison.Ordinal))
+                    _addressedStackStorage.Add(slot.Number);
+    }
 
     private void FindClobberingAddressTakes(ISILControlFlowGraph graph)
     {
@@ -53,7 +64,8 @@ public class SsaForm
 
                 foreach (var operand in instruction.Operands)
                 {
-                    if (operand is AddressOf { Target: Register addressed } && IsReadAfter(block, i, addressed))
+                    if (operand is AddressOf { Target: Register addressed } && !_addressedStackStorage.Contains(addressed.Number)
+                        && IsReadAfter(block, i, addressed))
                         _clobbering.Add(instruction);
                 }
             }
@@ -173,6 +185,7 @@ public class SsaForm
         foreach (var entry in defSites)
         {
             var regNumber = entry.Key;
+            if(_addressedStackStorage.Contains(regNumber))continue;
             var sites = entry.Value;
 
             var workList = new Queue<Block>(sites);
@@ -348,6 +361,12 @@ public class SsaForm
     private Register NewName(Register register, List<int> definedHere)
     {
         var regNumber = register.Number;
+        // Taking an address does not write a slot. The pointer can be captured
+        // BEFORE initialization and used by an out/ref call afterwards. Keep
+        // that physical stack location mutable and stable across all stores,
+        // calls and branches; only its pointer registers remain SSA values.
+        // General machine registers are deliberately NOT made mutable here.
+        if(_addressedStackStorage.Contains(regNumber))return _repr[regNumber];
 
         var version = _counter.TryGetValue(regNumber, out var current) ? current + 1 : 1;
         _counter[regNumber] = version;

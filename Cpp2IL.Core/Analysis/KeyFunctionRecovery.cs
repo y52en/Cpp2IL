@@ -83,8 +83,23 @@ public static class KeyFunctionRecovery
     private static void RewriteBox(Instruction instruction)
     {
         // function name, result, class, address of value.
-        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [_, var result, TypeAnalysisContext boxedType, var value, ..])
+        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [_, var result, var handle, var value, ..])
             return;
+
+        // The runtime argument is an Il2CppClass*, not a value of that
+        // pointer's synthetic IntPtr type. Box the represented managed type.
+        // This also applies to a proven generic type parameter: CIL box !0
+        // handles both value and reference instantiations correctly.
+        var boxedType = handle switch
+        {
+            RuntimeClassTypeAnalysisContext klass => klass.RepresentedType,
+            LocalVariable { Type: RuntimeClassTypeAnalysisContext klass } => klass.RepresentedType,
+            TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => type,
+            _ => null
+        };
+        if (boxedType == null || boxedType is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+            or RuntimeFieldInfoAnalysisContext or ByRefTypeAnalysisContext
+            || boxedType.FullName == "System.Void") return;
 
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, boxedType, value);

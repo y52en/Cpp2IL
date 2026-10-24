@@ -24,7 +24,7 @@ public static class CheckedUnboxRecovery
     private const string ImageHash = "1a5b36ef24266d5911158725cf70b03ca88961505da606ff0455e0ef83c524d1";
     private static readonly ConditionalWeakTable<ApplicationAnalysisContext, Lazy<bool>> Images = new();
 
-    private static bool Supports(ApplicationAnalysisContext app)
+    internal static bool Supports(ApplicationAnalysisContext app)
         => app.InstructionSet is NewArmV8InstructionSet && app.Binary.PointerSizeBytes == 8
             && Images.GetValue(app, owner => new Lazy<bool>(() =>
             {

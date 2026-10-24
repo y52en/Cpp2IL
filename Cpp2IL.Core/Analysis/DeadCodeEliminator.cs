@@ -37,6 +37,8 @@ public static class DeadCodeEliminator
                 {
                     if (!IsRemovable(instruction.OpCode))
                         continue;
+                    if (HasManagedReadOrArithmeticEffect(instruction))
+                        continue;
 
                     // Only definitions of a register local are candidates. Stores have a memory or
                     // field destination (Destination is not a local) and are never dead.
@@ -53,6 +55,20 @@ public static class DeadCodeEliminator
             }
         }
         RemoveUnobservableCycles(cfg);
+    }
+
+    // An unused VALUE does not imply an unused OPERATION: managed reads may
+    // throw (or trigger a static initializer), and integer division can throw.
+    // Synthetic IL2CPP runtime metadata fields are not managed application
+    // fields; their separate positively identified guard cleanup still works.
+    internal static bool HasManagedReadOrArithmeticEffect(Instruction instruction)
+    {
+        if(instruction.OpCode is OpCode.Divide or OpCode.Modulo)return true;
+        if(instruction is not {OpCode:OpCode.Move,Operands:[_,var source]})return false;
+        if(source is ArrayLength or ArrayAccess or AddressOf {Target:ArrayAccess})return true;
+        return source is FieldReference field
+            && (field.Field.BackingData!=null || field.Field.DeclaringType is InjectedTypeAnalysisContext)
+            && (field.Field.IsStatic || field.Local.Type is not (RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext));
     }
 
     // Reference counts alone keep an unused loop-carried Phi/copy cycle alive.
@@ -173,7 +189,7 @@ public static class DeadCodeEliminator
                 or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
                 or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor
-                or OpCode.Not or OpCode.Negate=> true,
+                or OpCode.Not or OpCode.Negate or OpCode.Absolute=> true,
             >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual => true,
             _ => false
         };

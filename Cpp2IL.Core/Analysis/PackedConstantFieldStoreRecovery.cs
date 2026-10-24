@@ -43,23 +43,24 @@ public static class PackedConstantFieldStoreRecovery
             return SplitClosedValue(instruction,nativeMethod);
         if (instruction is not {OpCode:OpCode.Move,Operands:[FieldReference {Parent:null} first,Immediate value],NativeWriteSize:2 or 4 or 8}
             || first.Local.Type is not {IsValueType:false,GenericParameters.Count:0} owner
-            || owner is GenericInstanceTypeAnalysisContext || owner.BaseType?.FullName != "System.Object"
-            || !ReferenceEquals(first.Field.DeclaringType,owner) || first.Field.IsStatic
+            || owner is GenericInstanceTypeAnalysisContext || first.Field.IsStatic
             || first.Offset != first.Field.Offset || first.Offset<16) return null;
+        var fields=ClassFields(owner);
+        if(fields==null || !fields.Contains(first.Field))return null;
         var start=first.Offset;var end=(long)start+instruction.NativeWriteSize;
-        var fields=owner.Fields.Where(f=>!f.IsStatic && (f.Attributes&FieldAttributes.Literal)==0).ToArray();
         var covered=new List<(FieldAnalysisContext Field,int Width)>();
         foreach(var field in fields)
         {
             var width=IntegralWidth(field.FieldType);
             if(field.Offset<0)return null;
             if(field.Offset>=end)continue;
-            if(width==0)
-            {
-                // A nonintegral field in/before the store may overlap it.
-                return null;
-            }
-            if((long)field.Offset+width<=start)continue;
+            var storage=width!=0?width:StorageWidth(field.FieldType);
+            // A known reference/float preceding the store is disjoint, not a
+            // reason to discard the entire class layout. Unknown extents still
+            // fail closed, and nonintegral fields may NEVER be split/stored.
+            if(storage==0)return null;
+            if((long)field.Offset+storage<=start)continue;
+            if(width==0)return null;
             if(field.Offset<start || (long)field.Offset+width>end)return null;
             covered.Add((field,width));
         }
@@ -84,6 +85,27 @@ public static class PackedConstantFieldStoreRecovery
         }
         return cursor==end ? result : null;
     }
+
+    private static List<FieldAnalysisContext>? ClassFields(TypeAnalysisContext owner)
+    {
+        var result=new List<FieldAnalysisContext>();var seen=new HashSet<TypeAnalysisContext>();
+        var root=owner.AppContext.SystemTypes.SystemObjectType;
+        for(var current=owner; !ReferenceEquals(current,root);current=current.BaseType!)
+        {
+            if(current==null || seen.Count>=64 || !seen.Add(current) || current.IsValueType
+                || current.GenericParameters.Count!=0 || current is GenericInstanceTypeAnalysisContext)return null;
+            foreach(var field in current.Fields.Where(f=>!f.IsStatic && (f.Attributes&FieldAttributes.Literal)==0))
+            {
+                if(!ReferenceEquals(field.DeclaringType,current) || result.Contains(field))return null;
+                result.Add(field);
+            }
+        }
+        return result;
+    }
+
+    private static int StorageWidth(TypeAnalysisContext type)=>type.FullName switch {
+        "System.Single"=>4,"System.Double" or "System.IntPtr" or "System.UIntPtr"=>8,
+        _=>!type.IsValueType && type is not (GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)?8:0};
 
     private static IReadOnlyList<Piece>? SplitClosedValue(Instruction instruction,MethodAnalysisContext? nativeMethod)
     {

@@ -18,14 +18,32 @@ public static class Arm64HfaRecovery
         var resolver=method.AppContext.InstructionSet.CallingConventionResolver!;
         var serial=graph.Instructions.Select(i=>i.Index).DefaultIfEmpty(0).Max()+1;
         Instruction Move(IOperand to,IOperand from)=>new(serial++,OpCode.Move,to,from);
+        Instruction LaneMove(IOperand to,IOperand from,Arm64HfaLayout.Lane lane)
+        {
+            var width=lane.FieldType==method.AppContext.SystemTypes.SystemSingleType?4:8;
+            return new(serial++,OpCode.Move,to,from)
+            {NativeReadSize=from is MemoryOperand?width:0,NativeWriteSize=to is MemoryOperand?width:0};
+        }
         var changed=false;
         var entry=new List<Instruction>();
         var incoming=resolver.ResolveForManaged(method);
         changed |= RecoverIncomingStackHfas(method, incoming);
         foreach(var item in Parameters(method,incoming))
             for(var lane=0;lane<item.Fields.Length;lane++)
-                entry.Add(Move(new Register(null,"V"+(item.FirstLane+lane)),new MemoryOperand(item.Storage,addend:item.Fields[lane].Offset)));
-        if(entry.Count>0){graph.EntryBlock.Instructions.InsertRange(0,entry);changed=true;}
+                entry.Add(LaneMove(new Register(null,"V"+(item.FirstLane+lane)),new MemoryOperand(item.Storage,addend:item.Fields[lane].Offset),item.Fields[lane]));
+        if(entry.Count>0)
+        {
+            // Synthetic Entry is omitted by CIL emission. Project arguments
+            // on a real once-only edge, outside all native loop backedges.
+            var prologue=new Block {ID=graph.Blocks.Max(b=>b.ID)+1,BlockType=BlockType.Fall,Instructions=entry,
+                Successors=graph.EntryBlock.Successors};
+            prologue.Predecessors.Add(graph.EntryBlock);
+            foreach(var successor in prologue.Successors)
+                for(var p=0;p<successor.Predecessors.Count;p++)
+                    if(successor.Predecessors[p]==graph.EntryBlock)successor.Predecessors[p]=prologue;
+            graph.EntryBlock.Successors=[prologue];
+            graph.Blocks.Insert(graph.Blocks.IndexOf(graph.EntryBlock)+1,prologue);changed=true;
+        }
         foreach(var block in graph.Blocks.ToArray())
         for(var index=0;index<block.Instructions.Count;index++)
         {
@@ -39,7 +57,7 @@ public static class Arm64HfaRecovery
                 {
                     prefix.Add(Move(item.Storage,new DefaultStructValue(item.Type)));
                     for(var lane=0;lane<item.Fields.Length;lane++)
-                        prefix.Add(Move(new MemoryOperand(item.Storage,addend:item.Fields[lane].Offset),new Register(null,"V"+(item.FirstLane+lane))));
+                        prefix.Add(LaneMove(new MemoryOperand(item.Storage,addend:item.Fields[lane].Offset),new Register(null,"V"+(item.FirstLane+lane)),item.Fields[lane]));
                 }
                 if(prefix.Count>0)
                 {
@@ -52,7 +70,7 @@ public static class Arm64HfaRecovery
                 {
                     var result=new Register(null,"hfa_result_"+serial++);
                     instruction.Destination=result;
-                    var suffix=fields.Select((field,lane)=>Move(new Register(null,"V"+lane),new MemoryOperand(result,addend:field.Offset))).ToList();
+                    var suffix=fields.Select((field,lane)=>LaneMove(new Register(null,"V"+lane),new MemoryOperand(result,addend:field.Offset),field)).ToList();
                     // Call-block consumers require the actual call to remain
                     // last. Project lanes on a dedicated successor edge, not
                     // after the call inside its block.
@@ -69,7 +87,7 @@ public static class Arm64HfaRecovery
             {
                 var result=new Register(null,"hfa_return_"+serial++);
                 var prefix=new List<Instruction>{Move(result,new DefaultStructValue(method.ReturnType))};
-                prefix.AddRange(fields.Select((field,lane)=>Move(new MemoryOperand(result,addend:field.Offset),new Register(null,"V"+lane))));
+                prefix.AddRange(fields.Select((field,lane)=>LaneMove(new MemoryOperand(result,addend:field.Offset),new Register(null,"V"+lane),field)));
                 block.Instructions.InsertRange(index,prefix);index+=prefix.Count;
                 instruction.SetOperands(result);changed=true;
             }
@@ -94,7 +112,7 @@ public static class Arm64HfaRecovery
                 || method.ParameterOperands[ordinal] is not Register parameter
                 || parameter.Name!="stack_"+offset.Offset.ToString("X")) continue;
             var size=TypeSizes.UnboxedSize(type,8);
-            var loads=new List<(Instruction Load,FieldAnalysisContext Field)>();
+            var loads=new List<(Instruction Load,Arm64HfaLayout.Lane Field)>();
             var valid=true;
             foreach(var instruction in graph.Instructions)
             foreach(var operand in instruction.Operands)
@@ -140,7 +158,7 @@ public static class Arm64HfaRecovery
         }
     }
 
-    private static IEnumerable<(Register Storage,TypeAnalysisContext Type,FieldAnalysisContext[] Fields,int FirstLane)> Parameters(MethodAnalysisContext method,IOperand[] operands)
+    private static IEnumerable<(Register Storage,TypeAnalysisContext Type,Arm64HfaLayout.Lane[] Fields,int FirstLane)> Parameters(MethodAnalysisContext method,IOperand[] operands)
     {
         var floating=0;
         for(var p=0;p<method.Parameters.Count;p++)

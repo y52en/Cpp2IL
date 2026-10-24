@@ -184,6 +184,38 @@ public static class ArrayRecovery
         var definitions = SingleDefinitions(cfg);
         var nextIndex = cfg.Instructions.Select(i => i.Index).DefaultIfEmpty(-1).Max() + 1;
         var changed = false;
+        bool StableFullWidthTerm(LocalVariable value,Instruction use)
+        {
+            if(cfg.Blocks.Any(b=>b.Predecessors.Any(p=>!cfg.Blocks.Contains(p))))return false;
+            var writes=cfg.Instructions.Where(i=>ReferenceEquals(i.Destination,value)).ToArray();
+            return method.ParameterLocals.Contains(value)?writes.Length==0
+                :writes.Length==1 && ForwardNullCheckRecovery.DefinitionDominates(cfg,writes[0],use);
+        }
+        bool FullWidthAddressStable(IOperand? value,Instruction use,int depth=0)
+        {
+            if(depth>12)return false;
+            if(value==null || value is Immediate)return true;
+            if(value is not LocalVariable local)return false;
+            if(method.ParameterLocals.Contains(local))return !definitions.ContainsKey(local);
+            if(!definitions.TryGetValue(local,out var definition) || definition==null
+                || !ForwardNullCheckRecovery.DefinitionDominates(cfg,definition,use))return false;
+            // This matches AccumulateAddress: a typed Int32 add/sub is a
+            // snapshot index, not a pointer expression to expand further.
+            if(local.Type?.FullName=="System.Int32"
+                && definition is {OpCode:OpCode.Add or OpCode.Subtract,Operands:[_,var left,var right]}
+                && Int32IndexOperand(left) && Int32IndexOperand(right))return true;
+            if(definition is {OpCode:OpCode.Move,Operands:[_,LocalVariable source]})return FullWidthAddressStable(source,definition,depth+1);
+            if(definition.OpCode is OpCode.Add or OpCode.ShiftLeft or OpCode.Multiply)
+                return definition.Operands.Skip(1).All(o=>FullWidthAddressStable(o,definition,depth+1));
+            return local.Type!=null;
+        }
+        TypeAnalysisContext? MaterializedType(IOperand value)=>value switch {
+            LocalVariable local=>local.Type,
+            FloatLiteral=>method.AppContext.SystemTypes.SystemSingleType,
+            DoubleLiteral=>method.AppContext.SystemTypes.SystemDoubleType,
+            FieldReference {Parent:null} field when !field.Field.IsStatic && field.Offset==field.Field.Offset
+                && field.Local.Type?.IsValueType==true=>field.Field.FieldType,
+            _=>null};
         foreach (var block in cfg.Blocks)
         foreach (var instruction in block.Instructions.ToArray())
         {
@@ -221,7 +253,30 @@ public static class ArrayRecovery
                         component = delta;
                     }
                     else continue;
-                    if (width >= stride || component > stride - width) continue;
+                    if (width > stride || component > stride - width) continue;
+                    if(width==stride)
+                    {
+                        // A real native whole-width scalar/vector transfer can
+                        // be either a typed whole element, or the sole scalar
+                        // field of a wrapper. Never guess from the width alone.
+                        if(width is not (1 or 2 or 4 or 8 or 16)
+                            || terms.Where(t=>t.Value!=0).Any(t=>!StableFullWidthTerm(t.Key,instruction))
+                            || !FullWidthAddressStable(memory.Base,instruction)
+                            || !FullWidthAddressStable(memory.Index,instruction))continue;
+                        var value=instruction.Operands[slot==0?1:0];
+                        if(slot==1 && value is not LocalVariable)continue;
+                        var fullValueType=MaterializedType(value);
+                        if(fullValueType==null)continue;
+                        if(TrivialConstructorRecovery.SameType(fullValueType,element))
+                        {
+                            instruction.SetOperand(slot,new ArrayAccess(array,index));changed=true;continue;
+                        }
+                        var fields=element.Fields.Where(f=>!f.IsStatic
+                            && (f.Attributes&System.Reflection.FieldAttributes.Literal)==0).ToArray();
+                        if(fields.Length!=1 || fields[0].Offset!=0 || component!=0
+                            || ElementSize(fields[0].FieldType,pointerSize)!=width
+                            || !TrivialConstructorRecovery.SameType(fullValueType,fields[0].FieldType))continue;
+                    }
                     var name = "arrayElementAddress" + nextIndex;
                     var address = new LocalVariable(name, new Register(null, name), new ByRefTypeAnalysisContext(element));
                     var field = NestedFieldAccess.Find(element, address, component, width);

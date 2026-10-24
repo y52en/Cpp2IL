@@ -384,12 +384,20 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
+        NativeStoreLeafExpansion.Run(this);
+        NativeFloatingLoadLeafExpansion.Run(this);
+        NativeIntegerLoadLeafExpansion.Run(this);
         StackAnalyzer.Analyze(this);
+        InlineBoxedHfaRecovery.Run(this);
+        NativeNullableConstructorRecovery.PrepareStackReceivers(this);
+        NativeNullableAccessorRecovery.PrepareStackReceivers(this);
         NativeScalarStoreRecovery.Run(this);
         Arm64HfaRecovery.Run(this);
+        Arm64IntegerReturnCopyRecovery.Run(this);
         HiddenStructReturnRecovery.Run(this);
         WholeStackValueCopyRecovery.Run(this);
         WholeStructInitializationRecovery.Run(this);
+        AddressedStackFieldStoreRecovery.Run(this);
         BoxAddressRecovery.Run(this);
         TraceAnalysis("stack-recovered");
 
@@ -430,6 +438,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         AllocatedObjectArrayHelperRecovery.TrimKnownHelperPadding(this);
         AllocatedObjectArrayHelperRecovery.Run(this);
         ForwardNullCheckRecovery.Run(this);
+        if(RuntimeHelperArgumentPaddingRecovery.Run(this)>0)DeadCodeEliminator.Run(this);
         InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
@@ -463,11 +472,16 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
             MetadataResolver.ResolveMetadataUsages(this);
             LocalVariables.ResolveTypesAndFields(this);
         }
+        TypedStructZeroRecovery.Run(this);
         SsaSimplifier.Run(this);
 
         // Folding a constant exposes more to propagate
         for (var i = 0; i < 8 && ConstantFolder.Run(this); i++)
             SsaSimplifier.Run(this);
+
+        // A proven vector zero may become an immediate only after these copy
+        // folds. Recheck the same native byte-coverage/metadata-layout proof.
+        TypedStructZeroRecovery.Run(this);
 
         if (SsaFieldAddressRecovery.Run(this) > 0)
             LocalVariables.ResolveTypesAndFields(this);
@@ -477,6 +491,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Type/copy resolution can expose pure loop-carried cycles which have
         // no path to any observable use. Eliminate them while still in SSA.
         DeadCodeEliminator.Run(this);
+
+        // Dispatch resolution and SSA cleanup can make a previously live
+        // native helper return/pointer-loading chain dead. Recheck the SAME
+        // fingerprint and next-callvirt proof before destroying SSA identities.
+        ForwardNullCheckRecovery.Run(this);
 
         SsaForm.Remove(this);
         TraceAnalysis("ssa-removed");
@@ -510,6 +529,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
         CallArgumentTrimmer.Run(this);
+        NativeMemoryBarrierRecovery.Run(this);
+        VirtualDelegateRecovery.Run(this);
         HiddenBufferConstructorReturnRecovery.Run(this);
         // Native receivers still contain pointer copies during the early type
         // fixpoint. Copy propagation exposes &stack storage only later; recover
@@ -524,7 +545,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LateClassInitRecovery.Run(this);
         InlineClassCastRecovery.Run(this);
         RuntimeCheckedCastRecovery.Run(this);
+        NullBypassRuntimeCastRecovery.Run(this);
+        SealedClassCastRecovery.Run(this);
         InlineClassTestRecovery.Run(this);
+        SharedClassTestRecovery.Run(this);
+        MetadataResolver.ResolveLateFieldVirtualCalls(this);
         CovariantArrayStoreRecovery.Run(this);
         EmptyRuntimeGuardRecovery.Run(this);
         ArrayRecovery.RecoverLateSplitLoads(this);
@@ -536,6 +561,26 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         NativeScalarStorageRecovery.Run(this);
         SharedEnumDefaultReturnRecovery.Run(this);
 
+        // Only now have class-init guards and unused native argument padding
+        // disappeared. The complete-copy proof must see the final live graph;
+        // it must never ignore unclassified instructions to force a match.
+        if (GenericUnboxFieldCopyRecovery.Run(this))
+            DeadCodeEliminator.Run(this);
+        if (GenericUnboxArrayCopyRecovery.Run(this))
+            DeadCodeEliminator.Run(this);
+
+        // Late field/copy and exact call binding can expose the immediate
+        // managed dereference only now. Recheck NULL proofs only; do not
+        // generalize bounds predicates or erase arbitrary application guards.
+        SharedGenericFieldGetterRecovery.Run(this);
+        SharedGenericFieldSetterRecovery.Run(this);
+        InjectedCheckRemover.RunNullOnly(this);
+        NativeArrayBoundsRecovery.Run(this);
+        PrimitiveByRefStorageRecovery.Run(this);
+        PackedPrimitiveFieldCopyRecovery.Run(this);
+        PackedScalarConstantStoreRecovery.Run(this);
+        NativePublicFieldAccessorRecovery.Run(this);
+        NativeAggregateFieldAccessorRecovery.Run(this);
         LocalVariables.RemoveUnused(this);
     }
 

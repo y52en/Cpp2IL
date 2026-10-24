@@ -9,13 +9,23 @@ namespace Cpp2IL.Core.Analysis;
 //Resolves field offsets on generic types, which are all 0 in the metadata.
 public static class GenericInstanceFieldLayout
 {
+    public sealed record FieldStorage(FieldAnalysisContext Field,long Offset,long Size);
     // Unlike the legacy open-definition layout, this path retains the declaring
     // generic instance at each inheritance level. Non-generic offsets constrain
     // the layout; unsupported sizes and open parameters are never guessed.
     public static FieldAnalysisContext? FindInheritedFieldAtOffset(TypeAnalysisContext owner, long targetOffset, int nativeWidth = 0)
     {
-        if (targetOffset < 0 || targetOffset > int.MaxValue || nativeWidth < 0 || owner.IsValueType)
-            return null;
+        if(targetOffset<0 || targetOffset>int.MaxValue || nativeWidth<0)return null;
+        var matches=InheritedFields(owner)?.Where(f=>f.Offset==targetOffset
+            && (nativeWidth==0 || nativeWidth==f.Size)).ToArray();
+        return matches is {Length:1}?matches[0].Field:null;
+    }
+
+    // A per-instantiation view, never write recomputed offsets back to the
+    // shared generic definition. Component access needs the WHOLE proven range.
+    public static IReadOnlyList<FieldStorage>? InheritedFields(TypeAnalysisContext owner)
+    {
+        if(owner.IsValueType)return null;
         var hierarchy = new List<TypeAnalysisContext>();
         var seen = new HashSet<string>();
         for (var type = owner; type != null; type = type.BaseType)
@@ -26,17 +36,21 @@ public static class GenericInstanceFieldLayout
         }
         if (!hierarchy.Any(t => t is GenericInstanceTypeAnalysisContext))
             return null;
+        if(!ReferenceEquals(hierarchy[^1],owner.AppContext.SystemTypes.SystemObjectType))return null;
         var pointerSize = owner.AppContext.Binary.PointerSizeBytes;
         if (pointerSize is not (4 or 8))
             return null;
         var end = 2L * pointerSize;
-        FieldAnalysisContext? result = null;
+        var result=new List<FieldStorage>();
         foreach (var type in hierarchy.AsEnumerable().Reverse())
         {
             var generic = type as GenericInstanceTypeAnalysisContext;
             var definition = generic?.GenericType ?? type;
             if (generic != null && (definition.Attributes & TypeAttributes.LayoutMask) != TypeAttributes.AutoLayout)
                 return null; // packing/explicit layout requires separate evidence
+            if(generic!=null && definition.Definition is {} metadata
+                && (metadata.PackingSize!=0 || metadata.SpecifiedPackingSize!=0
+                    || !metadata.ClassSizeIsDefault && metadata.Size is not (0 or -1)))return null;
             foreach (var original in definition.Fields.Where(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0))
             {
                 FieldAnalysisContext field = generic == null ? original : new ConcreteGenericFieldAnalysisContext(original, generic);
@@ -47,12 +61,7 @@ public static class GenericInstanceFieldLayout
                 var offset = generic == null ? original.Offset : aligned;
                 if (offset < aligned || offset > long.MaxValue - layout.Size)
                     return null;
-                if (offset == targetOffset)
-                {
-                    if (nativeWidth > 0 && nativeWidth != layout.Size) return null;
-                    if (result != null) return null;
-                    result = field;
-                }
+                result.Add(new(field,offset,layout.Size));
                 end = offset + layout.Size;
             }
         }
@@ -118,7 +127,7 @@ public static class GenericInstanceFieldLayout
         var definition = fieldType.Definition;
         if (definition == null || fieldType.HasAnyGenericParameters()
             || (fieldType.Attributes & TypeAttributes.LayoutMask) != TypeAttributes.SequentialLayout
-            || !definition.PackingSizeIsDefault || !definition.ClassSizeIsDefault
+            || !definition.PackingSizeIsDefault && definition.PackingSize!=0
             || definition.SpecifiedPackingSize != 0 || active.Count >= 16 || !active.Add(fieldType))
             return null;
         try
@@ -136,8 +145,15 @@ public static class GenericInstanceFieldLayout
                 alignment = System.Math.Max(alignment, layout.Alignment);
             }
             var size = (end + alignment - 1) & ~(alignment - 1);
-            return TypeSizes.UnboxedSize(fieldType, pointerSize) == size ? (size, alignment) : null;
+            // Explicit sequential Size is not uncertainty when ALL offsets,
+            // natural footprint and native unboxed size independently agree.
+            // Extra declared padding remains unsupported rather than guessed.
+            return CompleteValueSizeAgrees(definition.Size,size,TypeSizes.UnboxedSize(fieldType,pointerSize))
+                ? (size, alignment) : null;
         }
         finally { active.Remove(fieldType); }
     }
+
+    internal static bool CompleteValueSizeAgrees(long declared,long computed,long native)
+        => computed>0 && native==computed && (declared is 0 or -1 || declared==computed);
 }

@@ -142,7 +142,7 @@ public class BooleanAndNullRecoveryTests
     {
         var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
         var element = reference ? types.SystemObjectType : types.SystemInt32Type;
-        var pointer = new LocalVariable("output", new Register(null, "output"), new ByRefTypeAnalysisContext(element));
+        var pointer = new LocalVariable("output", new Register(null, "output"), new ByRefTypeAnalysisContext(element)){ParameterIndex=0};
         var context = Context([new(0, OpCode.Move, new MemoryOperand(pointer), Imm(0)), new(1, OpCode.Return)], pointer);
         var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
         var corlib = new ModuleDefinition("mscorlib.dll");

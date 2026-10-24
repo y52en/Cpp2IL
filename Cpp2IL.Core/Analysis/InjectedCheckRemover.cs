@@ -22,6 +22,18 @@ public static class InjectedCheckRemover
     }
 
     public static void Run(ISILControlFlowGraph cfg)
+        => Run(cfg,false);
+
+    public static void RunNullOnly(MethodAnalysisContext method)
+    {
+        if(method.AppContext.InstructionSet is Cpp2IL.Core.InstructionSets.NewArmV8InstructionSet
+            && method.AppContext.Binary.PointerSizeBytes==8 && method.AppContext.UnityVersion.Major==2018
+            && method.AppContext.UnityVersion.Minor==4 && method.ControlFlowGraph is {} cfg)Run(cfg,true);
+    }
+
+    internal static void RunNullOnly(ISILControlFlowGraph cfg)=>Run(cfg,true);
+
+    private static void Run(ISILControlFlowGraph cfg,bool nullOnly)
     {
         NormalizeThrowTerminators(cfg);
         var defOf = BuildDefMap(cfg);
@@ -47,6 +59,7 @@ public static class InjectedCheckRemover
             if ((targetThrow == null) == (fallThrow == null)) continue;
             var throwsWhenTrue = targetThrow != null;
             var thrownType = targetThrow ?? fallThrow!;
+            if(nullOnly && thrownType!="System.NullReferenceException")continue;
             var throwing = throwsWhenTrue ? target : fall;
             var surviving = throwsWhenTrue ? fall : target;
 
@@ -54,6 +67,21 @@ public static class InjectedCheckRemover
                 || !TryResolveCondition(condition, defOf, ref throwsWhenTrue, out var definition)
                 || !IsInjectedCheck(definition, thrownType, throwsWhenTrue))
                 continue;
+            if (thrownType=="System.NullReferenceException")
+            {
+                var receiver=definition.Operands.Skip(1).OfType<LocalVariable>().SingleOrDefault();
+                if(receiver==null)continue;
+                if(!NextOperationRetainsNullThrow(cfg,surviving,receiver))
+                {
+                    if(receiver.Type is not SzArrayTypeAnalysisContext)continue;
+                    // ldlen;pop preserves the original null exception HERE,
+                    // without allocating a different explicit exception or
+                    // delaying it past a checked conversion/application call.
+                    // Empty arrays are valid: this is NOT a bounds check.
+                    var index=checked(cfg.Instructions.Max(i=>i.Index)+1);
+                    block.Instructions.Insert(block.Instructions.Count-1,new(index,OpCode.ArrayNullCheck,receiver));
+                }
+            }
 
             // Removing a fallthrough throw must still branch to the surviving
             // target; simply nopping the branch would execute the throw.
@@ -71,6 +99,44 @@ public static class InjectedCheckRemover
         // delete any throw blocks
         cfg.RemoveUnreachableBlocks();
         DeadCodeEliminator.Run(cfg);
+    }
+
+    // A later dereference is insufficient: a checked conversion, call, write
+    // or return between the guard and that dereference changes which effect or
+    // exception occurs first. Keep the original branch unless the very next
+    // observable operation itself checks this same managed receiver.
+    internal static bool NextOperationRetainsNullThrow(ISILControlFlowGraph cfg,Block start,LocalVariable receiver)
+    {
+        if(receiver.Type==null || receiver.Type.IsValueType || start.Predecessors.Count!=1)return false;
+        if(ForwardNullCheckRecovery.TryPreserveNextManagedDereference(cfg,start,0,receiver))return true;
+        var visited=new HashSet<Block>();var block=start;var budget=128;
+        while(visited.Count<8 && visited.Add(block))
+        {
+            foreach(var instruction in block.Instructions)
+            {
+                if(--budget<0)return false;
+                if(instruction.OpCode is OpCode.Nop or OpCode.Jump)continue;
+                if(instruction is {OpCode:OpCode.Move,Operands:[LocalVariable destination,var source]})
+                {
+                    if(ReferenceEquals(destination,receiver))return false;
+                    if(receiver.Type is SzArrayTypeAnalysisContext && source is ArrayLength length && ReferenceEquals(length.Array,receiver))return true;
+                    if(receiver.Type is SzArrayTypeAnalysisContext && source is ArrayAccess access && ReferenceEquals(access.Array,receiver)
+                        && access.Index is LocalVariable or Immediate)return true;
+                    if(source is LocalVariable or Immediate)continue;
+                }
+                if(instruction.NativeVirtualDispatch && instruction.OpCode is OpCode.Call or OpCode.CallVoid
+                    && instruction.Operands[0] is MethodAnalysisContext {IsStatic:false})
+                {
+                    var index=instruction.OpCode==OpCode.Call?2:1;
+                    return instruction.Operands.Count>index && ReferenceEquals(instruction.Operands[index],receiver)
+                        && instruction.Operands.Skip(index+1).All(o=>o is LocalVariable or Immediate);
+                }
+                return false;
+            }
+            if(block.Successors.Count!=1 || block.Successors[0]==cfg.ExitBlock)return false;
+            block=block.Successors[0];
+        }
+        return false;
     }
 
     // Metadata recovery turns non-returning native exception helpers into Throw.

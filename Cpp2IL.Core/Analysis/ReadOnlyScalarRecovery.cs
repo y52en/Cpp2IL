@@ -13,7 +13,7 @@ public static class ReadOnlyScalarRecovery
     public static int Run(MethodAnalysisContext method)
     {
         if (method.AppContext.Binary is not ElfFile binary) return 0;
-        var changed = 0;
+        var changed = RecoverFloatingSnapshots(method,binary.TryReadReadOnlyScalar);
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (instruction is not { OpCode: OpCode.Move, Operands: [var target, MemoryOperand memory] }
@@ -48,6 +48,51 @@ public static class ReadOnlyScalarRecovery
 
     public delegate bool ScalarReader(ulong address,int width,out ulong bits);
     public sealed record ScalarStore(FieldReference Field,IOperand Value,int Width);
+
+    // A scalar FP instruction proves the IEEE interpretation of a readonly
+    // load even when generic type propagation left its local untyped. Every
+    // use must agree; raw bits, addresses and mixed interpretations are refused.
+    internal static int RecoverFloatingSnapshots(MethodAnalysisContext method,ScalarReader read)
+    {
+        if(method.ControlFlowGraph is not {} cfg)return 0;
+        var all=cfg.Instructions.ToArray();var changed=0;
+        foreach(var load in all)
+        {
+            if(load is not {OpCode:OpCode.Move,NativeWriteSize:0,NativeReadSize:4 or 8,
+                    Operands:[LocalVariable local,MemoryOperand {IsConstant:true,Addend:>0} memory]}
+                || local.IsThis || local.IsMethodInfo || method.ParameterLocals.Contains(local)
+                || all.Count(i=>ReferenceEquals(i.Destination,local))!=1)continue;
+            var width=load.NativeReadSize;
+            var type=width==4?method.AppContext.SystemTypes.SystemSingleType:method.AppContext.SystemTypes.SystemDoubleType;
+            if(local.Type!=null && local.Type.FullName!=type.FullName)continue;
+            var consumers=all.Where(i=>i.Operands.Any(o=>Contains(o,local)
+                && !(ReferenceEquals(o,local) && ReferenceEquals(i.Destination,local)))).ToArray();
+            if(consumers.Length==0 || consumers.Any(i=>i.NativeFloatingPointSize!=width
+                || i.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Negate or OpCode.Absolute)
+                || i.Operands.Skip(1).Any(o=>Contains(o,local) && !ReferenceEquals(o,local))))continue;
+            var home=cfg.Blocks.SingleOrDefault(b=>b.Instructions.Contains(load));
+            if(home==null)continue;
+            var dominance=new DominatorInfo(cfg);
+            if(consumers.Any(i=>!cfg.Blocks.Any(b=>b.Instructions.Contains(i)
+                && (ReferenceEquals(b,home)?b.Instructions.IndexOf(load)<b.Instructions.IndexOf(i)
+                    :dominance.Dominates(home,b)))))continue;
+            if(!read((ulong)memory.Addend,width,out var bits) || Decode(type.FullName,width,bits) is not {} value)continue;
+            local.Type=type;load.SetOperand(1,value);changed++;
+        }
+        return changed;
+    }
+
+    private static bool Contains(IOperand operand,LocalVariable local)=>operand switch
+    {
+        LocalVariable other=>ReferenceEquals(other,local),
+        MemoryOperand memory=>(memory.Base!=null && Contains(memory.Base,local))
+            || (memory.Index!=null && Contains(memory.Index,local)),
+        AddressOf address=>Contains(address.Target,local),
+        FieldReference field=>ReferenceEquals(field.Local,local) || field.Parent!=null && Contains(field.Parent,local),
+        ArrayAccess array=>ReferenceEquals(array.Array,local) || Contains(array.Index,local),
+        ArrayLength length=>ReferenceEquals(length.Array,local),
+        _=>false
+    };
 
     public static List<ScalarStore>? ProjectWideSnapshot(ISILControlFlowGraph cfg,Block block,Instruction instruction,ScalarReader read)
     {

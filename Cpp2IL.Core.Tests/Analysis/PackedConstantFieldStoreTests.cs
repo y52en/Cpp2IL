@@ -56,4 +56,42 @@ public class PackedConstantFieldStoreTests
         var pieces=PackedConstantFieldStoreRecovery.Split(store)!;
         Assert.That(pieces.Select(p=>p.Value.Value),Is.EqualTo(new long[]{-1,-2}));
     }
+
+    [TestCase("inherited-reference",true)] [TestCase("inherited-float",true)]
+    [TestCase("inherited-intptr",true)] [TestCase("base-first-field",true)]
+    [TestCase("overlapping-base-reference",false)] [TestCase("overlapping-base-integer",false)]
+    [TestCase("negative-base-offset",false)] [TestCase("cyclic-base",false)]
+    [TestCase("covered-float",false)] [TestCase("unknown-base-extent",false)]
+    public void InheritedClassesRequireCompleteDisjointStorageAndIntegralByteCoverage(string shape,bool expected)
+    {
+        var (owner,receiver,store)=Fixture();var types=owner.AppContext.SystemTypes;
+        var parent=new InjectedTypeAnalysisContext(owner.DeclaringAssembly,"Test","Parent",types.SystemObjectType,TypeAttributes.Public);
+        owner.BaseType=parent;
+        var first=owner.Fields[0];var second=owner.Fields[1];first.Offset=24;second.Offset=28;
+        store.SetOperand(0,new FieldReference(first,receiver,24));
+        var beforeType=shape=="inherited-float"?types.SystemSingleType:shape=="inherited-intptr"
+            ?types.SystemObjectType.DeclaringAssembly.GetTypeByFullName("System.IntPtr")!:types.SystemObjectType;
+        var before=parent.InjectFieldContext("Before",beforeType,FieldAttributes.Public);before.Offset=16;
+        if(shape=="base-first-field")
+        {
+            owner.Fields.Remove(first);first=parent.InjectFieldContext("InheritedFirst",types.SystemInt32Type,FieldAttributes.Public);
+            first.Offset=24;store.SetOperand(0,new FieldReference(first,receiver,24));
+        }
+        if(shape=="overlapping-base-reference")before.Offset=20;
+        if(shape=="overlapping-base-integer"){before.FieldType=types.SystemInt32Type;before.Offset=26;}
+        if(shape=="negative-base-offset")before.Offset=-1;
+        if(shape=="cyclic-base")parent.BaseType=owner;
+        if(shape=="covered-float")second.FieldType=types.SystemSingleType;
+        if(shape=="unknown-base-extent")before.FieldType=new InjectedTypeAnalysisContext(owner.DeclaringAssembly,
+            "Test","UnknownValue",types.SystemObjectType.DeclaringAssembly.GetTypeByFullName("System.ValueType"),TypeAttributes.Public);
+        var pieces=PackedConstantFieldStoreRecovery.Split(store);
+        Assert.That(pieces!=null,Is.EqualTo(expected));
+        if(expected)
+        {
+            var proven=pieces!;
+            Assert.That(proven.Select(p=>p.Value.Value),Is.EqualTo(new long[]{16,8}));
+            Assert.That(proven.Select(p=>p.Field.Field),Is.EqualTo(new[]{first,second}));
+            Assert.That(proven.All(p=>ReferenceEquals(p.Field.Local,receiver)),Is.True);
+        }
+    }
 }

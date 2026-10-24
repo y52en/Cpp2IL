@@ -151,7 +151,8 @@ public class CheckedUnboxRecoveryTests
         var app=TestGameLoader.LoadSimple2019Game();
         var call=Call(app,app.SystemTypes.SystemInt32Type);Assert.That(CheckedUnboxRecovery.Rewrite(call),Is.True);
         var result=(LocalVariable)call.Operands[0];
-        var context=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Check",app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static,[]);
+        var context=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Check",app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static,[app.SystemTypes.SystemObjectType],["boxed"]);
+        context.ParameterLocals=[(LocalVariable)call.Operands[2]];
         var assembly=new AssemblyDefinition("PrimitiveUnbox"+Guid.NewGuid().ToString("N"),new Version(1,0));
         var module=new ModuleDefinition("PrimitiveUnbox.dll",new AssemblyReference("mscorlib",new Version(4,0,0,0)));assembly.Modules.Add(module);
         var type=new TypeDefinition("Test","Generated",AType.Public,module.CorLibTypeFactory.Object.Type);module.TopLevelTypes.Add(type);
@@ -185,7 +186,8 @@ public class CheckedUnboxRecoveryTests
         var access=store?new Instruction(1,OpCode.Move,new FieldReference(field,address,0),new FloatLiteral(99))
             :new Instruction(1,OpCode.Move,result,new FieldReference(field,address,0));
         var ret=store?new Instruction(2,OpCode.Return):new Instruction(2,OpCode.Return,result);
-        var context=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Access",store?app.SystemTypes.SystemVoidType:app.SystemTypes.SystemSingleType,MethodAttributes.Public|MethodAttributes.Static,[]);
+        var context=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Access",store?app.SystemTypes.SystemVoidType:app.SystemTypes.SystemSingleType,MethodAttributes.Public|MethodAttributes.Static,[app.SystemTypes.SystemObjectType],["boxed"]);
+        context.ParameterLocals=[boxed];
         context.ControlFlowGraph=new([call,access,ret]);context.Locals=[boxed,address,result];
         var assembly=new AssemblyDefinition("CheckedUnbox"+Guid.NewGuid().ToString("N"),new Version(1,0));
         var module=new ModuleDefinition("CheckedUnbox.dll",new AssemblyReference("mscorlib",new Version(4,0,0,0)));assembly.Modules.Add(module);

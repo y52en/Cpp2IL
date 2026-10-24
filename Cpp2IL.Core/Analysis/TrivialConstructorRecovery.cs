@@ -30,6 +30,11 @@ public static class TrivialConstructorRecovery
     {
         if (left == null || right == null) return false;
         if (ReferenceEquals(left, right)) return true;
+        // Resolving a generic argument can create a fresh SZARRAY wrapper.
+        // Compare its exact element metadata identity, never its display name.
+        // Do not conflate SZARRAY with rank-one multidimensional ARRAY.
+        if (left is SzArrayTypeAnalysisContext la && right is SzArrayTypeAnalysisContext ra)
+            return SameType(la.ElementType, ra.ElementType);
         return left is GenericInstanceTypeAnalysisContext a && right is GenericInstanceTypeAnalysisContext b
             && ReferenceEquals(a.GenericType, b.GenericType) && a.GenericArguments.Count == b.GenericArguments.Count
             && a.GenericArguments.Zip(b.GenericArguments, SameType).All(equal => equal);
@@ -119,8 +124,10 @@ public static class TrivialConstructorRecovery
             if (type.IsValueType || type.FullName == "System.Object") continue;
             var templates = new List<Template>();
             var constantTemplates = new List<ConstantFieldConstructorRecovery.Template>();
+            var forwardingTemplates = new List<ForwardedConstructorRecovery.Template>();
+            var argumentTemplates = new List<ArgumentForwardingConstructorRecovery.Template>();
             foreach (var constructor in type.Methods.Where(m => m.Name == ".ctor" && !m.IsStatic
-                && m.Parameters.Count == 0 && m.UnderlyingPointer != 0))
+                && m.Parameters.Count <= 8 && m.UnderlyingPointer != 0))
             {
                 if (skip(constructor)) continue;
                 try
@@ -130,12 +137,16 @@ public static class TrivialConstructorRecovery
                     constructor.Analyze();
                     if (Extract(constructor) is { } template) templates.Add(template);
                     if (ConstantFieldConstructorRecovery.Extract(constructor) is { } constant) constantTemplates.Add(constant);
+                    if (ForwardedConstructorRecovery.Extract(constructor) is { } forwarding) forwardingTemplates.Add(forwarding);
+                    if (ArgumentForwardingConstructorRecovery.Extract(constructor) is { } arguments) argumentTemplates.Add(arguments);
                 }
                 catch { /* Keep unsupported constructors diagnostic, including generic contexts. */ }
                 finally { constructor.ReleaseAnalysisData(); }
             }
             type.PutExtraData(CacheKey, templates.ToArray());
             type.PutExtraData(ConstantFieldConstructorRecovery.CacheKey, constantTemplates.ToArray());
+            type.PutExtraData(ForwardedConstructorRecovery.CacheKey, forwardingTemplates.ToArray());
+            type.PutExtraData(ArgumentForwardingConstructorRecovery.CacheKey, argumentTemplates.ToArray());
             count += templates.Count;
         }
         return count;

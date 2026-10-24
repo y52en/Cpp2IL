@@ -3,21 +3,68 @@ using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
-// Reconstitute only constructors whose complete native analysis consists of
-// Object's no-op constructor followed by distinct this-field assignments.
+// Reconstitute only complete native constructor templates: an exact proven base
+// invocation followed by distinct this-field assignments. Preserve base effects.
 public static class InlinedConstructorRecovery
 {
     public const string CacheKey = "PureFieldConstructorTemplates";
-    public sealed record Assignment(FieldAnalysisContext Field, int Parameter);
-    public sealed record Template(MethodAnalysisContext Constructor, IReadOnlyList<Assignment> Assignments);
+    public sealed record Assignment(FieldAnalysisContext Field, int Parameter, IOperand? Constant = null);
+    public sealed record Template(MethodAnalysisContext Constructor, IReadOnlyList<Assignment> Assignments,
+        MethodAnalysisContext? BaseConstructor = null);
+
+    private static List<TypeAnalysisContext>? Hierarchy(TypeAnalysisContext owner)
+    {
+        var result=new List<TypeAnalysisContext>();var seen=new HashSet<TypeAnalysisContext>();
+        for(var current=owner;current!=null;current=current.BaseType)
+        {
+            if(result.Count>=32 || current.IsValueType || current.HasAnyGenericParameters() || !seen.Add(current))return null;
+            result.Add(current);
+        }
+        return result;
+    }
+
+    private static bool OwnsField(TypeAnalysisContext owner,FieldAnalysisContext field)
+        => !field.IsStatic && (field.Attributes&System.Reflection.FieldAttributes.Literal)==0
+            && Hierarchy(owner) is {} chain && chain.Contains(field.DeclaringType)
+            && field.DeclaringType.Fields.Contains(field);
+
+    private static int FieldWidth(FieldAnalysisContext field,int pointerSize)
+    {
+        var type=field.FieldType;
+        if(type is ByRefTypeAnalysisContext or PointerTypeAnalysisContext || type.HasAnyGenericParameters())return 0;
+        var scalar=type.IsEnumType?type.EnumUnderlyingType:type;
+        return !type.IsValueType?pointerSize:scalar?.FullName switch
+        {
+            "System.Boolean" or "System.Byte" or "System.SByte"=>1,
+            "System.Char" or "System.Int16" or "System.UInt16"=>2,
+            "System.Int32" or "System.UInt32" or "System.Single"=>4,
+            "System.Int64" or "System.UInt64" or "System.Double"=>8,
+            "System.IntPtr" or "System.UIntPtr"=>pointerSize,_=>0,
+        };
+    }
+
+    private static bool DirectBase(TypeAnalysisContext owner,MethodAnalysisContext target)
+        => !owner.IsValueType && !owner.HasAnyGenericParameters() && owner.BaseType is {} parent
+            && !parent.HasAnyGenericParameters() && target.Name==".ctor" && !target.IsStatic
+            && !target.IsVirtual && target.IsVoid && target.Parameters.Count==0
+            && (TrivialConstructorRecovery.SameType(parent,target.DeclaringType)
+                // Complete Ghidra1564: an optimized child native constructor
+                // calls Object.ctor and writes an inherited field directly.
+                // Match THAT complete body, never infer skipped parent effects
+                // from metadata or invent a call to an arbitrary ancestor.
+                || ReferenceEquals(target.DeclaringType,owner.AppContext.SystemTypes.SystemObjectType)
+                    && target.GetExtraData<TrivialConstructorRecovery.ObjectProof>(TrivialConstructorRecovery.ObjectProofKey) is {IsNoOp:true}
+                    && Hierarchy(owner) is {} chain && chain.Contains(target.DeclaringType));
 
     public static Template? Extract(MethodAnalysisContext ctor)
     {
         Trace(ctor, "constructor template input");
-        if (ctor.Name != ".ctor" || ctor.IsStatic || ctor.DeclaringType?.BaseType?.FullName != "System.Object"
+        if (ctor.Name != ".ctor" || ctor.IsStatic || !ctor.IsVoid || ctor.DeclaringType is not { IsValueType:false } owner
+            || owner.BaseType == null || owner.HasAnyGenericParameters()
             || ctor.ControlFlowGraph == null || ctor.Parameters.Count == 0) return null;
         var parameters = ctor.ParameterLocals.Where(l => !l.IsThis && !l.IsMethodInfo).ToList();
         if (parameters.Count != ctor.Parameters.Count) return null;
@@ -29,24 +76,44 @@ public static class InlinedConstructorRecovery
             if (!visited.Add(block)) return null;
             block = block.Successors[0];
         }
+        if(owner.BaseType.FullName!="System.Object")
+        {
+            visited.Add(block);
+            if(!ReferenceEquals(block,ctor.ControlFlowGraph.ExitBlock)
+                || ctor.ControlFlowGraph.Blocks.Any(b=>!visited.Contains(b)))return null;
+        }
         var result = new List<Assignment>();
         var baseCalls = 0;
+        MethodAnalysisContext? baseConstructor = null;
+        var objectBase=owner.BaseType.FullName=="System.Object";
         var returned = false;
         foreach (var instruction in ctor.ControlFlowGraph.Instructions)
         {
             if (instruction.OpCode is OpCode.Nop or OpCode.Jump) continue;
+            if(returned)return null;
             if (instruction.OpCode == OpCode.Return && instruction.Operands.Count == 0) { returned = true; continue; }
-            if (instruction is { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: ".ctor", DeclaringType.FullName: "System.Object", Parameters.Count: 0 }, LocalVariable { IsThis: true }] })
-            { if (++baseCalls > 1) return null; continue; }
-            if (instruction is not { OpCode: OpCode.Move, Operands: [FieldReference field, LocalVariable source] }
-                || !field.Local.IsThis || field.Field.IsStatic || field.Field.DeclaringType != ctor.DeclaringType)
+            if (instruction is { OpCode: OpCode.CallVoid, NativeVirtualDispatch:false,
+                Operands: [MethodAnalysisContext parent, LocalVariable { IsThis: true }] }
+                && DirectBase(owner,parent)
+                && (objectBase || ctor.ParameterLocals.Any(p=>p.IsThis && ReferenceEquals(p,instruction.Operands[1]))))
+            { if (++baseCalls > 1) return null; baseConstructor=parent; continue; }
+            if (instruction is not { OpCode: OpCode.Move, Operands: [FieldReference field, var source] }
+                || !field.Local.IsThis || field.Parent!=null || !OwnsField(owner,field.Field)
+                || !ReferenceEquals(field.Field.DeclaringType,owner)
+                    && (field.Offset!=field.Field.Offset || instruction.NativeWriteSize<=0
+                        || instruction.NativeWriteSize!=FieldWidth(field.Field,owner.AppContext.Binary.PointerSizeBytes)))
                 return null;
-            var parameter = parameters.IndexOf(source);
-            if (parameter < 0 || result.Any(a => a.Field == field.Field)) return null;
-            result.Add(new(field.Field, parameter));
+            if(!objectBase && (baseCalls!=1 || !ctor.ParameterLocals.Any(p=>p.IsThis && ReferenceEquals(p,field.Local))))return null;
+            var parameter = source is LocalVariable local ? parameters.IndexOf(local) : -1;
+            if (result.Any(a => a.Field == field.Field)) return null;
+            if (parameter >= 0) result.Add(new(field.Field, parameter));
+            else if (field.Parent == null && ExactConstant(field.Field.FieldType, source))
+                result.Add(new(field.Field, -1, source));
+            else return null;
         }
-        if (!returned || result.Count == 0 || Enumerable.Range(0,parameters.Count).Any(i => result.All(a => a.Parameter != i))) return null;
-        return new(ctor, result.ToArray());
+        if (!returned || result.Count == 0 || !objectBase && baseCalls!=1
+            || Enumerable.Range(0,parameters.Count).Any(i => result.All(a => a.Parameter != i))) return null;
+        return new(ctor, result.ToArray(),baseConstructor);
     }
 
     public static void Run(MethodAnalysisContext method)
@@ -73,7 +140,11 @@ public static class InlinedConstructorRecovery
     public static bool Recover(MethodAnalysisContext method, Instruction allocation, IReadOnlyList<Template> templates)
     {
         if (allocation is not { OpCode: OpCode.Newobj, Operands: [LocalVariable obj, TypeAnalysisContext type] }
-            || type.IsValueType || type.BaseType?.FullName != "System.Object") return false;
+            || type.IsValueType || type.BaseType==null || type.HasAnyGenericParameters()) return false;
+        var objectBase=type.BaseType.FullName=="System.Object";
+        var proven=templates.Where(t=>ReferenceEquals(t.Constructor.DeclaringType,type)
+            && (t.BaseConstructor!=null ? DirectBase(type,t.BaseConstructor) : objectBase)).ToArray();
+        if(proven.Length==0)return false;
         var instructions = method.ControlFlowGraph!.Instructions;
         var index = instructions.IndexOf(allocation);
         if (index < 0) return false;
@@ -89,31 +160,47 @@ public static class InlinedConstructorRecovery
         DominatorInfo? dominance = null;
         var aliases = new HashSet<LocalVariable> {obj};
         Instruction? baseCall = null;
-        var stores = new List<Instruction>();
+        var stores = new List<(Instruction Instruction, FieldAnalysisContext Field)>();
         var matches = new List<(Template Template, IOperand[] Args)>();
         foreach (var instruction in scan)
         {
             if (instruction.OpCode is OpCode.Nop or OpCode.Jump) continue;
             if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable alias, LocalVariable source] } && aliases.Contains(source))
             { aliases.Add(alias); continue; }
-            if (instruction is { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: ".ctor", DeclaringType.FullName: "System.Object", Parameters.Count: 0 }, LocalVariable receiver] }
+            if (instruction is { OpCode: OpCode.CallVoid, NativeVirtualDispatch:false,
+                    Operands: [MethodAnalysisContext parent, LocalVariable receiver] }
+                && DirectBase(type,parent)
+                && proven.Any(t=>t.BaseConstructor!=null ? ReferenceEquals(t.BaseConstructor,parent) : objectBase)
                 && aliases.Contains(receiver) && baseCall == null && stores.Count == 0)
             { baseCall = instruction; continue; }
-            if (baseCall == null || instruction is not { OpCode: OpCode.Move, Operands: [FieldReference field, var value] }
-                || !aliases.Contains(field.Local) || field.Field.DeclaringType != type || field.Field.IsStatic
-                || stores.Any(s => ((FieldReference)s.Operands[0]).Field == field.Field)
+            if (baseCall == null || instruction is not { OpCode: OpCode.Move, Operands: [_, var value] }
+                || StoreField(instruction,type,aliases,method.AppContext.Binary.PointerSizeBytes) is not {} field
+                || stores.Any(s => s.Field == field)
+                // A nontrivial parent may publish this or invoke callbacks.
+                // Never move a field read across that call: only already
+                // materialized locals/literals can become child arguments.
+                || !objectBase && value is FieldReference
                 || !AvailableBeforeAllocation(value, method, instructions, index, allocationBlock, ref dominance, aliases)) break;
-            stores.Add(instruction);
+            stores.Add((instruction,field));
             matches.Clear();
-            foreach (var template in templates.Where(t => t.Constructor.DeclaringType == type && t.Assignments.Count == stores.Count))
+            foreach (var template in proven.Where(t => t.Assignments.Count == stores.Count
+                && (t.BaseConstructor==null || ReferenceEquals(t.BaseConstructor,baseCall.Operands[0]))))
             {
+                if(!objectBase && !template.Assignments.Select(a=>a.Field)
+                    .SequenceEqual(stores.Select(s=>s.Field)))continue;
                 var args = new IOperand[template.Constructor.Parameters.Count];
                 var valid = true;
                 foreach (var assignment in template.Assignments)
                 {
-                    var store = stores.SingleOrDefault(s => ((FieldReference)s.Operands[0]).Field == assignment.Field);
+                    var store = stores.SingleOrDefault(s => s.Field == assignment.Field).Instruction;
                     if (store == null) { valid = false; break; }
                     var argument = store.Operands[1];
+                    if (assignment.Constant is { } constant)
+                    {
+                        if (assignment.Parameter != -1 || !SameValue(constant, argument)) { valid = false; break; }
+                        continue;
+                    }
+                    if (assignment.Parameter < 0 || assignment.Parameter >= args.Length) { valid = false; break; }
                     if (args[assignment.Parameter] is { } previous && !SameValue(previous, argument)) { valid = false; break; }
                     args[assignment.Parameter] = argument;
                 }
@@ -124,11 +211,33 @@ public static class InlinedConstructorRecovery
         if (baseCall == null || matches.Count != 1) return false;
         var match = matches[0];
         baseCall.SetOperands(new List<IOperand> {match.Template.Constructor,obj}.Concat(match.Args).ToList());
-        foreach (var store in stores) { store.OpCode = OpCode.Nop; store.SetOperands(); }
+        foreach (var (store,_) in stores) { store.OpCode = OpCode.Nop; store.SetOperands(); }
         return true;
     }
 
-    private static bool AvailableBeforeAllocation(IOperand value, MethodAnalysisContext method,
+    // Allocation types can become known after the last field-resolution sweep.
+    // Bind only a complete scalar/reference store at an exact declared offset;
+    // do not rewrite the graph or infer an owner from a propagated base type.
+    private static FieldAnalysisContext? StoreField(Instruction instruction,TypeAnalysisContext owner,
+        ISet<LocalVariable> aliases,int pointerSize)
+    {
+        if(instruction.Operands[0] is FieldReference field)
+            return field.Parent==null && aliases.Contains(field.Local) && !field.Field.IsStatic
+                && OwnsField(owner,field.Field)
+                && (ReferenceEquals(field.Field.DeclaringType,owner)
+                    || field.Offset==field.Field.Offset && instruction.NativeWriteSize>0
+                        && instruction.NativeWriteSize==FieldWidth(field.Field,pointerSize)) ? field.Field : null;
+        if(instruction.Operands[0] is not MemoryOperand {Base:LocalVariable receiver,Index:null,Scale:0} memory
+            || !aliases.Contains(receiver) || memory.Addend<2L*pointerSize || instruction.NativeWriteSize<=0)return null;
+        if(Hierarchy(owner) is not {} hierarchy)return null;
+        var fields=hierarchy.SelectMany(t=>t.Fields).Where(f=>OwnsField(owner,f)
+            && f.Offset==memory.Addend).ToArray();
+        if(fields.Length!=1)return null;
+        var width=FieldWidth(fields[0],pointerSize);
+        return width==instruction.NativeWriteSize?fields[0]:null;
+    }
+
+    internal static bool AvailableBeforeAllocation(IOperand value, MethodAnalysisContext method,
         List<Instruction> instructions, int allocationIndex, Block allocationBlock,
         ref DominatorInfo? dominance, ISet<LocalVariable> aliases)
     {
@@ -175,11 +284,35 @@ public static class InlinedConstructorRecovery
         return AssignedOnEntry(allocationBlock);
     }
 
+    private static bool ExactConstant(TypeAnalysisContext type, IOperand value)
+    {
+        if (value is FloatLiteral) return type.FullName == "System.Single";
+        if (value is DoubleLiteral) return type.FullName == "System.Double";
+        if (value is StringLiteral) return type.FullName == "System.String";
+        if (value is not Immediate immediate) return false;
+        if (!type.IsValueType) return immediate.Value == 0 && type.Type is
+            LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_CLASS or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_OBJECT
+            or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_STRING or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY;
+        var scalar = type.IsEnumType ? type.EnumUnderlyingType : type;
+        return scalar?.FullName switch
+        {
+            "System.Boolean" => immediate.Value is 0 or 1,
+            "System.SByte" => immediate.Value is >= sbyte.MinValue and <= sbyte.MaxValue,
+            "System.Byte" => immediate.Value is >= byte.MinValue and <= byte.MaxValue,
+            "System.Int16" => immediate.Value is >= short.MinValue and <= short.MaxValue,
+            "System.UInt16" or "System.Char" => immediate.Value is >= ushort.MinValue and <= ushort.MaxValue,
+            "System.Int32" => immediate.Value is >= int.MinValue and <= int.MaxValue,
+            "System.UInt32" => immediate.Value is >= uint.MinValue and <= uint.MaxValue,
+            "System.Int64" or "System.UInt64" => true,
+            _ => false
+        };
+    }
+
     private static bool SameValue(IOperand a, IOperand b) => ReferenceEquals(a,b) || (a,b) switch
     {
         (Immediate x,Immediate y) => x.Value == y.Value,
-        (FloatLiteral x,FloatLiteral y) => x.Value.Equals(y.Value),
-        (DoubleLiteral x,DoubleLiteral y) => x.Value.Equals(y.Value),
+        (FloatLiteral x,FloatLiteral y) => System.BitConverter.SingleToInt32Bits(x.Value) == System.BitConverter.SingleToInt32Bits(y.Value),
+        (DoubleLiteral x,DoubleLiteral y) => System.BitConverter.DoubleToInt64Bits(x.Value) == System.BitConverter.DoubleToInt64Bits(y.Value),
         (StringLiteral x,StringLiteral y) => x.Value == y.Value,
         (FieldReference x,FieldReference y) => x.Field == y.Field && ReferenceEquals(x.Local,y.Local),
         _ => false

@@ -45,7 +45,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             (Arm64Mnemonic.FADD,OpCode.Add) or (Arm64Mnemonic.FSUB,OpCode.Subtract)
                 or (Arm64Mnemonic.FMUL,OpCode.Multiply) or (Arm64Mnemonic.FDIV,OpCode.Divide) => 3,
-            (Arm64Mnemonic.FNEG,OpCode.Negate) => 2,
+            (Arm64Mnemonic.FNEG,OpCode.Negate) or (Arm64Mnemonic.FABS,OpCode.Absolute) => 2,
             _ => 0,
         };
         if(arity==0 || instruction.Op1Kind!=Arm64OperandKind.Register || Width(instruction.Op1Reg)!=width)return 0;
@@ -135,7 +135,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var body = Disassembler.Disassemble(binary.GetRawBinaryContent().Slice(raw,8),
             method.UnderlyingPointer,new(true,true,false)).ToList();
         var target = RecognizeUnboxingAdjustor(body);
-        return target != 0 && binary.TryMapVirtualAddressToRaw(target,out _) ? target : 0;
+        return target != 0 && binary.TryMapVirtualAddressToRaw(target,out _) ? target
+            : Cpp2IL.Core.Analysis.NativeScalarReceiverForwarders.Target(method);
     }
 
     public static ulong RecognizeUnboxingAdjustor(IReadOnlyList<Arm64Instruction> body)
@@ -156,6 +157,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     {
         var binary = context.AppContext.Binary;
         var pointer = AnalysisPointer(context);
+        var provenLength=Cpp2IL.Core.Analysis.NativeScalarReceiverForwarders.ProvenLength(context,pointer);
+        if(provenLength>0)
+            return new BinarySlice(binary,checked((int)binary.MapVirtualAddressToRaw(pointer)),provenLength);
 
         if (context is not ConcreteGenericMethodAnalysisContext)
         {
@@ -308,7 +312,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
     {
-        var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, AnalysisPointer(context)).ToList();
+        var pointer=AnalysisPointer(context);
+        var provenLength=Cpp2IL.Core.Analysis.NativeScalarReceiverForwarders.ProvenLength(context,pointer);
+        var insns=provenLength>0?Disassembler.Disassemble(context.AppContext.Binary.GetRawBinaryContent()
+            .Slice(checked((int)context.AppContext.Binary.MapVirtualAddressToRaw(pointer)),provenLength),
+            pointer,new(true,true,false)).ToList():NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext,pointer).ToList();
 
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
@@ -401,6 +409,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     _ => 0,
                 };
             instructions.Add(newInstruction);
+            if(Analysis.Arm64MultiplyRecovery.Describe(instruction) is {} multiply)
+            {
+                if(opCode==OpCode.Multiply)
+                {
+                    newInstruction.NativeArithmeticSize=multiply.OutputWidth;
+                    newInstruction.NativeMultiplyInputSize=multiply.InputWidth;
+                    newInstruction.NativeMultiplySigned=multiply.Signed;
+                }
+                else if(opCode is OpCode.Add or OpCode.Subtract or OpCode.Negate
+                    && operands.Count>0 && operands[0] is Register target && target.Name==NormalizeRegister(instruction.Op0Reg))
+                    newInstruction.NativeArithmeticSize=multiply.OutputWidth;
+            }
             return newInstruction;
         }
 
@@ -510,7 +530,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             // need their own carry/flag proofs; don't silently reinterpret them.
             borrow.UnsignedComparison = instruction.Mnemonic is Arm64Mnemonic.CMP or Arm64Mnemonic.SUB or Arm64Mnemonic.SUBS;
             Add(address, OpCode.Not, flagC, flagC);
-            Add(address, OpCode.Subtract, temp1, op0, op1);
+            // This subtraction computes the flags rather than the architectural
+            // destination. Preserve its decoded W/X width too: a TEMP register
+            // must not erase the width used to prove an unsigned bounds test.
+            var flagDifference = Add(address, OpCode.Subtract, temp1, op0, op1);
+            if (instruction.Mnemonic is Arm64Mnemonic.CMP or Arm64Mnemonic.SUB or Arm64Mnemonic.SUBS)
+                flagDifference.NativeArithmeticSize = instruction.Op0Reg switch
+                {
+                    >= Arm64Register.W0 and <= Arm64Register.W31 => 4,
+                    >= Arm64Register.X0 and <= Arm64Register.X31 => 8,
+                    _ => 0,
+                };
             Add(address, OpCode.CheckLess, flagN, temp1, Imm(0));
             Add(address, OpCode.CheckEqual, flagZ, temp1, Imm(0));
             Add(address, OpCode.Xor, temp2, op0, op1);
@@ -613,6 +643,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
                 var copied = Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction.Mnemonic is Arm64Mnemonic.MOV or Arm64Mnemonic.MOVZ
+                    && copied.Operands[1] is Immediate { Value: 0 }
+                    && (instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X30
+                        or >= Arm64Register.W0 and <= Arm64Register.W30))
+                    // W-register writes zero-extend into the corresponding X
+                    // register. A MOV of zero proves all eight bytes, not just
+                    // the four-byte arithmetic width of Wn.
+                    copied.NativeZeroSize = 8;
                 if (instruction.Mnemonic == Arm64Mnemonic.MOV
                     && instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X30
                     && instruction.Op1Reg is >= Arm64Register.X0 and <= Arm64Register.X30)
@@ -863,6 +901,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
             case Arm64Mnemonic.TST:
                 {
+                    if(Analysis.Arm64ShiftedLogicalRecovery.Lower(instruction,context.AppContext.SystemTypes) is {} shifted)
+                    {
+                        foreach(var operation in shifted)Add(address,operation.OpCode,operation.Operands.ToList()).NativeArithmeticSize=operation.NativeArithmeticSize;
+                        EmitResultFlags(shifted[^1].Operands[0]);break;
+                    }
                     var temp = new Register(null, "TEMP");
                     Add(address, OpCode.And, temp, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
                     EmitResultFlags(temp);
@@ -873,6 +916,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.ORR:
             case Arm64Mnemonic.EOR:
                 {
+                    if(Analysis.Arm64ShiftedLogicalRecovery.Lower(instruction,context.AppContext.SystemTypes) is {} shifted)
+                    {
+                        foreach(var operation in shifted)Add(address,operation.OpCode,operation.Operands.ToList()).NativeArithmeticSize=operation.NativeArithmeticSize;
+                        if(instruction.Mnemonic==Arm64Mnemonic.ANDS)EmitResultFlags(shifted[^1].Operands[0]);
+                        break;
+                    }
                     var opCode = instruction.Mnemonic switch
                     {
                         Arm64Mnemonic.ORR => OpCode.Or,
@@ -893,6 +942,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.ORN:
             case Arm64Mnemonic.EON:
                 {
+                    if(Analysis.Arm64ShiftedLogicalRecovery.Lower(instruction,context.AppContext.SystemTypes) is {} shifted)
+                    {
+                        foreach(var operation in shifted)Add(address,operation.OpCode,operation.Operands.ToList()).NativeArithmeticSize=operation.NativeArithmeticSize;
+                        if(instruction.Mnemonic==Arm64Mnemonic.BICS)EmitResultFlags(shifted[^1].Operands[0]);
+                        break;
+                    }
                     var temp = new Register(null, "TEMP");
                     Add(address, OpCode.Not, temp, ConvertOperand(instruction, 2));
                     var opCode = instruction.Mnemonic switch
@@ -943,32 +998,41 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.FNEG:
                 Add(address, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
                 break;
-            case Arm64Mnemonic.LSL:
-                Add(address, OpCode.ShiftLeft, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+            case Arm64Mnemonic.FABS:
+                if(ScalarFloatingPointWidth(instruction,OpCode.Absolute)==0)
+                {Add(address,OpCode.NotImplemented,new StringLiteral("Unsupported non-scalar FABS"));break;}
+                Add(address,OpCode.Absolute,ConvertOperand(instruction,0),ConvertOperand(instruction,1));
                 break;
+            case Arm64Mnemonic.LSL:
             case Arm64Mnemonic.LSR:
             case Arm64Mnemonic.ASR:
+                if(Analysis.Arm64ShiftedLogicalRecovery.LowerStandalone(instruction,context.AppContext.SystemTypes) is {} scalarShift)
+                {
+                    foreach(var operation in scalarShift)Add(address,operation.OpCode,operation.Operands.ToList()).NativeArithmeticSize=operation.NativeArithmeticSize;
+                    break;
+                }
+                if(instruction.Mnemonic==Arm64Mnemonic.LSL)
+                {
+                    Add(address,OpCode.ShiftLeft,ConvertOperand(instruction,0),ConvertOperand(instruction,1),ConvertOperand(instruction,2));break;
+                }
                 Add(address, OpCode.ShiftRight, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+            case Arm64Mnemonic.BFI:
+            case Arm64Mnemonic.BFXIL:
+                if(Analysis.Arm64BitfieldInsertRecovery.Lower(instruction,context.AppContext.SystemTypes) is {} bitfield)
+                    foreach(var operation in bitfield)
+                        Add(address,operation.OpCode,operation.Operands.ToList()).NativeArithmeticSize=operation.NativeArithmeticSize;
+                else Add(address,OpCode.NotImplemented,new StringLiteral("Unproven scalar bitfield insert"));
                 break;
             case Arm64Mnemonic.UBFX:
             case Arm64Mnemonic.SBFX:
-                {
-                    // dest = (src >> lsb) & ((1 << width) - 1)
-                    var dest = ConvertOperand(instruction, 0);
-                    Add(address, OpCode.ShiftRight, dest, ConvertOperand(instruction, 1), Imm(instruction.Op2Imm));
-                    Add(address, OpCode.And, dest, dest, Imm((1L << (int)instruction.Op3Imm) - 1));
-                    break;
-                }
             case Arm64Mnemonic.UBFIZ:
             case Arm64Mnemonic.SBFIZ:
-                {
-                    // dest = (src & ((1 << width) - 1)) << shift
-                    var dest = ConvertOperand(instruction, 0);
-                    var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.And, temp, ConvertOperand(instruction, 1), Imm((1L << (int)instruction.Op3Imm) - 1));
-                    Add(address, OpCode.ShiftLeft, dest, temp, Imm(instruction.Op2Imm));
-                    break;
-                }
+                if(Analysis.Arm64BitfieldExtractRecovery.Lower(instruction,context.AppContext.SystemTypes) is {} extract)
+                    foreach(var operation in extract)
+                        Add(address,operation.OpCode,operation.Operands.ToList()).NativeArithmeticSize=operation.NativeArithmeticSize;
+                else Add(address,OpCode.NotImplemented,new StringLiteral("Unproven scalar bitfield extract"));
+                break;
             case Arm64Mnemonic.MUL:
             case Arm64Mnemonic.FMUL:
             case Arm64Mnemonic.SMULL:

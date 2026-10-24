@@ -11,6 +11,25 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class Arm64HfaRecoveryTests
 {
+    [Test]
+    public void IncomingProjectionIsOutsideNativeLoopBackedges()
+    {
+        var app=TestGameLoader.LoadSimple2019Game();app.InstructionSet=new NewArmV8InstructionSet();
+        var vector=app.Assemblies.SelectMany(a=>a.Types).Single(t=>t.FullName=="UnityEngine.Vector3");
+        var method=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Loop",app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public|MethodAttributes.Static,[vector]);
+        var graph=new ISILControlFlowGraph([]);var loop=new Block{ID=2,BlockType=BlockType.OneWay};
+        loop.Instructions=[new Instruction(0,OpCode.Jump,loop)];
+        graph.EntryBlock.Successors=[loop];loop.Predecessors=[graph.EntryBlock,loop];loop.Successors=[loop];
+        graph.Blocks.Add(loop);method.ControlFlowGraph=graph;
+        Assert.That(Arm64HfaRecovery.Run(method),Is.True);
+        var prologue=graph.EntryBlock.Successors.Single();
+        Assert.That(prologue,Is.Not.SameAs(loop));Assert.That(prologue.Successors.Single(),Is.SameAs(loop));
+        Assert.That(prologue.Predecessors,Is.EqualTo(new[]{graph.EntryBlock}));
+        Assert.That(loop.Successors.Single(),Is.SameAs(loop));
+        Assert.That(loop.Predecessors,Is.EqualTo(new[]{prologue,loop}));
+        Assert.That(graph.EntryBlock.Instructions,Is.Empty);
+    }
     [TestCase(false)]
     [TestCase(true)]
     public void ScalarFloatIsNotAnAggregate(bool useDouble)
@@ -71,6 +90,12 @@ public class Arm64HfaRecoveryTests
         var method=owner.InjectMethodContext("Identity",vector,MethodAttributes.Public|MethodAttributes.Static,[vector]);
         var ret=new Instruction(0,OpCode.Return,new Register(null,"V0"));method.ControlFlowGraph=new([ret]);
         Assert.That(Arm64HfaRecovery.Run(method),Is.True);
+        Assert.That(method.ControlFlowGraph.EntryBlock.Instructions,Is.Empty,"synthetic Entry is not emitted to CIL");
+        var prologue=method.ControlFlowGraph.EntryBlock.Successors.Single();
+        Assert.That(prologue.BlockType,Is.EqualTo(BlockType.Fall));
+        Assert.That(prologue.Instructions.Count,Is.EqualTo(3));
+        Assert.That(prologue.Predecessors,Is.EqualTo(new[]{method.ControlFlowGraph.EntryBlock}));
+        Assert.That(prologue.Successors.Single().Predecessors,Does.Contain(prologue));
         var instructions=method.ControlFlowGraph.Instructions;
         Assert.That(instructions.Count(i=>i is {OpCode:OpCode.Move,Operands:[Register,MemoryOperand]}),Is.EqualTo(3));
         Assert.That(instructions.Count(i=>i is {OpCode:OpCode.Move,Operands:[MemoryOperand,Register]}),Is.EqualTo(3));

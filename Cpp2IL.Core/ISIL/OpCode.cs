@@ -138,5 +138,23 @@ public enum OpCode
     NumericConvert,
 
     /// <summary>Checked unboxing: destination managed byref, value type token, boxed object.</summary>
-    Unbox
+    Unbox,
+
+    /// <summary>Checked unbox/cast to a managed value: destination, type token, boxed object.</summary>
+    UnboxAny,
+
+    /// <summary>Null-check a managed array at this site, with no bounds check or result.</summary>
+    ArrayNullCheck,
+
+    /// <summary>Logical integer right shift; zero fills, unlike arithmetic ShiftRight.</summary>
+    ShiftRightUnsigned,
+
+    /// <summary>Destination, proven virtual method, receiver. Preserves ldvirtftn dispatch/null semantics.</summary>
+    LoadVirtualFunction,
+
+    /// <summary>Destination delegate, constructor, proven virtual method, receiver. One atomic bound delegate creation.</summary>
+    NewVirtualDelegate,
+
+    /// <summary>Scalar IEEE absolute value: destination, source. Native floating width is mandatory.</summary>
+    Absolute
 }

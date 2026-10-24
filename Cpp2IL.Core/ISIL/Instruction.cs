@@ -34,8 +34,12 @@ public class Instruction : IOperand
     public int NativeWriteSize;
     // Proven native memory read width; destination register size can differ (LDRSW).
     public int NativeReadSize;
-    // Width of a directly lifted integer ADD/SUB result, not an inferred pointer/type.
+    // Proven width of a lifted integer arithmetic/shift result, not an inferred pointer/type.
     public int NativeArithmeticSize;
+    // Original multiply input width/sign, retained without hiding affine
+    // address expressions behind scalar casts before array/field recovery.
+    public int NativeMultiplyInputSize;
+    public bool NativeMultiplySigned;
     // Width of an unmodified native register/address copy; extensions are not copies.
     public int NativeRegisterCopySize;
     // Scalar floating result width proven by S/D operands, not inferred from a
@@ -43,11 +47,17 @@ public class Instruction : IOperand
     public int NativeFloatingPointSize;
     // Signedness is part of the comparison, not inferred from a C# type name.
     public bool UnsignedComparison;
-    // Width proven zero by a full native register initialization (not a scalar guess).
+    // Width proven zero by native initialization or contiguous effect-free stack zero stores (not a scalar guess).
     public int NativeZeroSize;
     // Proven vtable/interface dispatch, distinct from a direct call to a virtual
     // method (e.g. base.Method). Preserve that distinction in managed IL.
     public bool NativeVirtualDispatch;
+    // A separately proven native null guard is carried by CIL callvirt on a
+    // NONvirtual method. This does not claim vtable or interface dispatch.
+    public bool NativeNullCheckedCall;
+    // Original direct native entry, captured before metadata replaces the raw
+    // call operand. Not inferred from a generic definition's boxed wrapper.
+    public ulong NativeDirectCallTarget;
 
     public bool IsFallThrough =>
         OpCode switch
@@ -118,11 +128,13 @@ public class Instruction : IOperand
             case OpCode.Modulo:
             case OpCode.ShiftLeft:
             case OpCode.ShiftRight:
+            case OpCode.ShiftRightUnsigned:
             case OpCode.And:
             case OpCode.Or:
             case OpCode.Xor:
             case OpCode.Not:
             case OpCode.Negate:
+            case OpCode.Absolute:
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
             case OpCode.CheckLess:
@@ -135,7 +147,10 @@ public class Instruction : IOperand
             case OpCode.IsInst:
             case OpCode.CastClass:
             case OpCode.Unbox:
+            case OpCode.UnboxAny:
             case OpCode.NumericConvert:
+            case OpCode.LoadVirtualFunction:
+            case OpCode.NewVirtualDelegate:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -173,15 +188,18 @@ public class Instruction : IOperand
         var sources = OpCode switch
         {
             OpCode.Move or OpCode.ConditionalJump
-                or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
+                or OpCode.ShiftStack or OpCode.Not or OpCode.Negate or OpCode.Absolute
                 or OpCode.Newobj
                 => [_operands[1]],
 
-            OpCode.Box or OpCode.IsInst or OpCode.CastClass or OpCode.Unbox => [_operands[2]],
+            OpCode.Box or OpCode.IsInst or OpCode.CastClass or OpCode.Unbox or OpCode.UnboxAny => [_operands[2]],
+            OpCode.ArrayNullCheck => [_operands[0]],
             OpCode.NumericConvert => [_operands[3]],
+            OpCode.LoadVirtualFunction => [_operands[2]],
+            OpCode.NewVirtualDelegate => [_operands[3]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
-                or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
+                or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 => [_operands[2], _operands[1]],
 

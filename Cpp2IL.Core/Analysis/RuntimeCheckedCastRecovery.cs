@@ -83,7 +83,7 @@ public static class RuntimeCheckedCastRecovery
         return true;
     }
 
-    private static bool Contains(IOperand operand, LocalVariable value) => operand switch
+    internal static bool Contains(IOperand operand, LocalVariable value) => operand switch
     {
         LocalVariable local => ReferenceEquals(local, value),
         MemoryOperand memory => memory.Base != null && Contains(memory.Base, value)

@@ -49,6 +49,9 @@ public class ClosedGenericValueFieldTests
         Assert.That(result,Is.Not.Null);
         Assert.That(result!.Field.Name,Is.EqualTo(field));
         Assert.That(result.Parent?.Field.Name,Is.EqualTo(parent));
+        var combined=0;
+        for(var link=result;link!=null;link=link.Parent)combined+=link.Offset;
+        Assert.That(combined,Is.EqualTo(offset),"Each storage offset contributes exactly once");
     }
 
     [Test]

@@ -29,6 +29,7 @@ public static class Simplifier
         private readonly Dictionary<Block, Dictionary<Instruction, OperandList>> _sourceCache = [];
         private readonly MethodAnalysisContext _method = method;
         private readonly ISILControlFlowGraph _graph = method.ControlFlowGraph!;
+        private readonly HashSet<LocalVariable> _mutableStructs = SsaSimplifier.MutableStructStorage(method.ControlFlowGraph!);
 
         public void Process()
         {
@@ -95,6 +96,8 @@ public static class Simplifier
                     // If it's move and it moves something to local, replace and remove it
                     if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local)
                     {
+                        if (SsaSimplifier.PreserveStructCopy(local, instruction.Operands[1], _mutableStructs))
+                            continue;
                         // These operands evaluate a load/check NOW. Substituting
                         // them at later uses re-reads mutable storage, duplicates
                         // checks, and moves exceptions across observable work.
@@ -204,6 +207,8 @@ public static class Simplifier
                     // If it's move and it moves local to local, replace and remove it
                     if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] })
                     {
+                        if (SsaSimplifier.PreserveStructCopy(local, source, _mutableStructs))
+                            continue;
                         // A local with several definitions is not in SSA form, so its value at a join
                         // depends on the path taken; don't carry this definition across that join.
                         var stopAtJoins = definitionCounts.TryGetValue(local, out var defs) && defs > 1;
@@ -332,7 +337,7 @@ public static class Simplifier
                         else if (operand is FieldReference field && replacement is LocalVariable fieldReplacement &&
                                  field.Local == local)
                         {
-                            field.Local = fieldReplacement;
+                            field.ReplaceLocal(local, fieldReplacement);
                         }
                     }
                 }

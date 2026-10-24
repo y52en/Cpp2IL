@@ -71,22 +71,41 @@ public static class InterfaceDispatchRecovery
         // IL emission consumes explicit parameters only. For fully known,
         // non-generic managed calls, one trailing runtime MethodInfo is not a
         // C# argument and must not keep an unrelated lookup alive.
+        var trimmedMetadata = false;
         foreach(var instruction in cfg.Blocks.SelectMany(b=>b.Instructions))
             if(instruction.Operands.Count>0 && (IsMatchedInvokeDataInfo(instruction.Operands[^1],definitions,
                 matchedLookups.Select(m=>m.Lookup.InvokeDataPhi))
                 || IsMatchedLookupMetadataPhi(instruction.Operands[^1],definitions,homeBlock,
-                    matchedLookups.Select(m=>m.Lookup.InvokeDataPhi))))
-                changed |= TrimIgnoredMethodInfo(instruction);
+                    matchedLookups.Select(m=>m.Lookup.InvokeDataPhi))
+                || IsMatchedLookupMetadataPhi(instruction.Operands[^1],definitions,homeBlock,
+                    matchedLookups.Select(m=>m.Lookup.InvokeDataPhi),
+                    local=>method.Locals.Contains(local) && local.Type is null && !local.IsThis
+                        && !local.IsReturn && !local.IsReturnBuffer && local.ParameterIndex<0)))
+            {
+                var trimmed = TrimIgnoredMethodInfo(instruction);
+                changed |= trimmed;
+                trimmedMetadata |= trimmed;
+            }
+
+        // Pruning a proven ignored operand makes its ordinary metadata phi
+        // and +8 load dead. Use the existing all-use DCE proof before checking
+        // lookup escape/deadness; do not exempt a still-live metadata consumer.
+        if (trimmedMetadata) DeadCodeEliminator.Run(method);
 
         // A later proven dispatch can still carry stale raw argument-register
         // phis while we inspect an earlier lookup. Resolve ALL dispatches before
         // testing deadness; never ignore an unresolved call's uses.
-        foreach(var (dispatch,lookup) in matchedLookups)
+        // Hidden MethodInfo register junk from an earlier lookup may be an
+        // extra argument of a later slow lookup. Prove/remove later regions
+        // first so earlier deadness sees the actual surviving graph. All
+        // closed-region, side-effect and escape proofs remain mandatory.
+        foreach(var (dispatch,lookup) in matchedLookups.AsEnumerable().Reverse())
             TryExciseLookup(cfg,lookup,definitions,homeBlock,
                 trace ? gate=>System.Console.Error.WriteLine($"INTERFACE LOOKUP index={dispatch.Index} gate={gate}") : null);
 
         if (changed)
             DeadCodeEliminator.Run(method);
+
     }
 
     private const int InvokeDataShift = 4; // sizeof(VirtualInvokeData) == 16
@@ -285,24 +304,43 @@ public static class InterfaceDispatchRecovery
 
     internal static bool IsMatchedLookupMetadataPhi(IOperand operand,
         Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homes,
-        IEnumerable<Instruction> matchedPhis)
+        IEnumerable<Instruction> matchedPhis, System.Func<LocalVariable,bool>? ignoredNativeIncoming=null)
     {
         // The slow interface path may set a caller's hidden MethodInfo register
         // to zero. Later ordinary joins retain that phi as a trailing hidden
         // argument to a known NON-generic managed call, keeping the whole lookup
         // alive. Accept only incoming MethodInfo/zero leaves, with an actual phi
         // in THIS matched lookup's merge. Never globally trim arbitrary metadata.
-        var merges = matchedPhis.Where(homes.ContainsKey).Select(p => homes[p]).ToHashSet();
+        var matched = matchedPhis.ToArray();
+        var merges = matched.Where(homes.ContainsKey).Select(p => homes[p]).ToHashSet();
         if (merges.Count == 0) return false;
         var path = new HashSet<LocalVariable>();
-        var sawIncoming = false; var sawZero = false; var sawMerge = false; var budget = 256;
+        var sawIncoming = false; var sawIgnoredIncoming = false; var sawZero = false;
+        var sawMerge = false; var sawMatchedInfo = false; var budget = 256;
         bool Visit(IOperand value)
         {
             if (--budget < 0) return false;
             if (value is Immediate { Value: 0 }) { sawZero = true; return true; }
             if (value is not LocalVariable local) return false;
             if (!definitions.TryGetValue(local, out var definition))
-            { sawIncoming |= local.IsMethodInfo; return local.IsMethodInfo; }
+            {
+                sawIncoming |= local.IsMethodInfo;
+                if(local.IsMethodInfo)return true;
+                // Only the exact hidden operand of a known non-generic call
+                // may opt in. Its OTHER phi leaf must be a full MethodInfo
+                // load from THIS proven lookup; no arbitrary dead phi, zero
+                // route, parameter, field read or foreign lookup qualifies.
+                var ignored=ignoredNativeIncoming?.Invoke(local)==true;
+                sawIgnoredIncoming |= ignored;
+                return ignored;
+            }
+            // Another ordinary join can combine the caller's incoming metadata
+            // with MethodInfo loaded from THIS already resolved dispatch. This
+            // remains metadata even when the join is outside the lookup merge.
+            // A raw pointer/read, foreign lookup or partial load proves nothing.
+            if (definition is { OpCode: OpCode.Move, NativeReadSize: 8 }
+                && IsMatchedInvokeDataInfo(local, definitions, matched))
+            { sawMatchedInfo = true; return true; }
             if (!path.Add(local)) return false;
             try
             {
@@ -313,7 +351,8 @@ public static class InterfaceDispatchRecovery
             }
             finally { path.Remove(local); }
         }
-        return Visit(operand) && sawIncoming && sawZero && sawMerge;
+        return Visit(operand) && (sawIgnoredIncoming ? sawMatchedInfo
+            : sawIncoming && (sawMatchedInfo || sawZero && sawMerge));
     }
 
     private static Instruction? ChaseCopies(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
@@ -418,13 +457,8 @@ public static class InterfaceDispatchRecovery
             || !homeBlock.TryGetValue(klassDefinition, out var head) || head == merge)
         { trace?.Invoke("head-block"); return; }
 
-        if (!TryCollectRegion(cfg, head, merge, out var region) || !region.Contains(slowBlock))
-        { trace?.Invoke("closed-region"); return; }
-
-        if (!RegionIsSideEffectFree(region, match.SlowCall))
-        { trace?.Invoke("side-effects"); return; }
-        if (AnyValueEscapes(cfg, region, merge))
-        { trace?.Invoke("escaping-values"); return; }
+        if (!TryFindLookupRegion(cfg, head, merge, match.SlowCall, out head, out var region))
+        { trace?.Invoke("closed-pure-region"); return; }
 
         if (!MergePhisAreDead(cfg, merge, out var removable, trace))
         { trace?.Invoke("live-merge-phis"); return; }
@@ -465,6 +499,37 @@ public static class InterfaceDispatchRecovery
             block.Predecessors.Clear();
             cfg.Blocks.Remove(block);
         }
+    }
+
+    // The klass pointer can be loaded BEFORE a source-level branch and reused
+    // by several independent interface lookups. Its defining block is then
+    // not this lookup's entry. Choose a smaller DOMINATING closed cut, keeping
+    // every instruction in its entry block and every original escape/effect
+    // check. Never consume the intervening business branch or its callbacks.
+    internal static bool TryFindLookupRegion(ISILControlFlowGraph cfg, Block klassHead, Block merge,
+        Instruction slowCall, out Block head, out HashSet<Block> region)
+    {
+        head=klassHead;region=[];
+        var slowBlock=cfg.Blocks.SingleOrDefault(b=>b.Instructions.Contains(slowCall));
+        if(slowBlock==null)return false;
+        bool Proved(Block candidate,out HashSet<Block> found) =>
+            TryCollectRegion(cfg,candidate,merge,out found) && found.Contains(slowBlock)
+            && RegionIsSideEffectFree(found,slowCall) && !AnyValueEscapes(cfg,found,merge);
+        if(Proved(klassHead,out region))return true;
+        if(cfg.Blocks.Count>256)return false;
+        var dominance=new DominatorInfo(cfg);
+        if(!dominance.Dominates(klassHead,merge))return false;
+        var visited=new HashSet<Block>();var current=merge;
+        while(dominance.ImmediateDominators.TryGetValue(current,out var parent)
+            && parent!=null && visited.Add(parent))
+        {
+            current=parent;
+            if(ReferenceEquals(current,klassHead))break;
+            if(!dominance.Dominates(klassHead,current) || current.Instructions.Count==0
+                || current.Instructions[^1].OpCode is not (OpCode.Jump or OpCode.ConditionalJump))continue;
+            if(Proved(current,out var found)){head=current;region=found;return true;}
+        }
+        region=[];return false;
     }
 
     // The region has to be closed, so nothing else may enter or leave it

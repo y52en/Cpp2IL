@@ -10,6 +10,46 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class InlinedConstructorRecoveryTests
 {
+    [TestCase("exact",true)]
+    [TestCase("reversed",true)]
+    [TestCase("mixed",true)]
+    [TestCase("unknown-width",false)]
+    [TestCase("wide-store",false)]
+    [TestCase("narrow-store",false)]
+    [TestCase("interior",false)]
+    [TestCase("header",false)]
+    [TestCase("index",false)]
+    [TestCase("scale",false)]
+    [TestCase("other-receiver",false)]
+    [TestCase("duplicate-offset",false)]
+    [TestCase("callback",false)]
+    [TestCase("missing",false)]
+    public void RawAllocationStoresRequireExactMetadataOffsetsAndWidths(string shape,bool expected)
+    {
+        var f=Fixture();f.A.Offset=16;f.B.Offset=20;
+        var template=InlinedConstructorRecovery.Extract(f.Ctor)!;
+        var caller=new InjectedMethodAnalysisContext(f.Type,"Caller",f.Ctor.ReturnType,MethodAttributes.Static,[]);
+        var obj=Local("obj",f.Type);var other=Local("other",f.Type);
+        var allocation=new Instruction(0,OpCode.Newobj,obj,f.Type);
+        var call=new Instruction(1,OpCode.CallVoid,f.Base,obj);
+        var memory=new MemoryOperand(shape=="other-receiver"?other:obj,
+            shape=="index"?Local("index",f.A.FieldType):null,
+            shape=="interior"?17:shape=="header"?8:16,shape=="scale"?2:0);
+        var a=new Instruction(2,OpCode.Move,memory,new Immediate(42))
+            {NativeWriteSize=shape=="unknown-width"?0:shape=="wide-store"?8:shape=="narrow-store"?2:4};
+        var b=new Instruction(3,OpCode.Move,shape=="mixed"?new FieldReference(f.B,obj,20):new MemoryOperand(obj,addend:20),new FloatLiteral(1.5f))
+            {NativeWriteSize=4};
+        if(shape=="duplicate-offset")f.Type.InjectFieldContext("overlap",f.A.FieldType,FieldAttributes.Public).Offset=16;
+        var list=new List<Instruction>{allocation,call};
+        if(shape=="callback")list.Add(new(9,OpCode.CallVoid,new StringLiteral("effect")));
+        if(shape=="reversed")list.AddRange([b,a]);else{list.Add(a);if(shape!="missing")list.Add(b);}
+        list.Add(new(4,OpCode.Return));caller.ControlFlowGraph=new(list);
+        Assert.That(InlinedConstructorRecovery.Recover(caller,allocation,[template]),Is.EqualTo(expected));
+        Assert.That(call.Operands[0],Is.SameAs(expected?f.Ctor:f.Base));
+        Assert.That(a.OpCode,Is.EqualTo(expected?OpCode.Nop:OpCode.Move));
+        Assert.That(b.OpCode,Is.EqualTo(expected?OpCode.Nop:OpCode.Move));
+    }
+
     private static LocalVariable Local(string name,TypeAnalysisContext type) => new(name,new Register(null,name),type);
 
     private static (InjectedTypeAnalysisContext Type,InjectedMethodAnalysisContext Ctor,FieldAnalysisContext A,FieldAnalysisContext B,MethodAnalysisContext Base) Fixture()

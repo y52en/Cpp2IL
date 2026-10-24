@@ -19,9 +19,17 @@ public static class NestedFieldAccess
     {
         if(width<=0 || remaining<=0 || offset<0 || offset>long.MaxValue-width
             || owner.AppContext.Binary.PointerSizeBytes!=8 || !seen.Add(owner)) return null;
+        if(!owner.IsValueType && root.Type is ByRefTypeAnalysisContext)return null;
         var fields=new List<(FieldAnalysisContext Field,long Offset,long Size)>();
         for(var type=owner;type!=null;type=type.BaseType)
         {
+            if(type is GenericInstanceTypeAnalysisContext && !type.IsValueType)
+            {
+                var layout=GenericInstanceFieldLayout.InheritedFields(owner);
+                if(layout==null)return null;
+                fields.Clear();fields.AddRange(layout.Select(f=>(f.Field,f.Offset,f.Size)));
+                break;
+            }
             if(type is GenericInstanceTypeAnalysisContext && type.IsValueType)
             {
                 var layout=ClosedGenericValueLayout.Fields(type,8)
@@ -34,9 +42,11 @@ public static class NestedFieldAccess
                 .Select(f=>(f,(long)f.Offset,StorageSize(f.FieldType))));
         }
         var matches=fields.Where(f=>f.Size>0 && offset>=f.Offset && offset+width<=f.Offset+f.Size).ToArray();
-        if(matches.Length!=1) return null;
+        if(matches.Length!=1 || matches[0].Offset>int.MaxValue) return null;
         var field=matches[0].Field;var delta=offset-matches[0].Offset;
-        var access=new FieldReference(field,root,(int)offset){Parent=parent};
+        // Each link identifies its own storage start, not the requested leaf
+        // address. Otherwise parent+child offsets count a component twice.
+        var access=new FieldReference(field,root,(int)matches[0].Offset){Parent=parent};
         // A reference INSIDE a proven inline value type is an exact pointer
         // slot, not another embedded object layout. Never descend through it
         // or reinterpret a partial pointer read as a managed reference.

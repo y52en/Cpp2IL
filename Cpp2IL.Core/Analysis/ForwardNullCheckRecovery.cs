@@ -12,7 +12,7 @@ using Cpp2IL.Core.Model.Contexts;
 namespace Cpp2IL.Core.Analysis;
 
 // Remove an automatic null helper only when the very next observable operation
-// is a managed callvirt on that SAME value. The managed call retains the throw.
+// is a managed dereference on that SAME value. Preserve exception ordering.
 public static class ForwardNullCheckRecovery
 {
     private const string HelperHash = "04831e6180d248d5984385074bf616e1db3587640830919a81190a5eb9ae0f69";
@@ -110,6 +110,85 @@ public static class ForwardNullCheckRecovery
         return false;
     }
 
+    internal static bool TryPreserveAtManagedDereference(ISILControlFlowGraph cfg,Instruction guard)
+    {
+        if(guard is not {OpCode:OpCode.Call,Operands:[Immediate,LocalVariable result,LocalVariable input,..]}
+            || input.Type==null || input.Type.IsValueType
+            || input.Type is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || cfg.Instructions.Any(i=>!ReferenceEquals(i,guard) && i.Operands.Any(o=>Uses(o,result))))return false;
+        var homes=cfg.Blocks.Where(b=>b.Instructions.Contains(guard)).ToArray();if(homes.Length!=1)return false;
+        return TryPreserveNextManagedDereference(cfg,homes[0],homes[0].Instructions.IndexOf(guard)+1,input);
+    }
+
+    // Shared with the exact inline null-branch recognizer. The caller must
+    // independently prove its automatic throw; this only proves the next
+    // observable operation retains that same receiver's null exception.
+    internal static bool TryPreserveNextManagedDereference(ISILControlFlowGraph cfg,Block initial,int first,LocalVariable input)
+    {
+        if(input.Type==null || input.Type.IsValueType || input.Type is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || !cfg.Blocks.Contains(initial) || first<0 || first>initial.Instructions.Count)return false;
+        var definitions=cfg.Instructions.Where(i=>i.Destination is LocalVariable)
+            .GroupBy(i=>(LocalVariable)i.Destination!).Where(g=>g.Count()==1).ToDictionary(g=>g.Key,g=>g.Single());
+        LocalVariable Root(LocalVariable value)
+        {
+            var seen=new HashSet<LocalVariable>();
+            while(seen.Add(value) && definitions.TryGetValue(value,out var d)
+                && d is {OpCode:OpCode.Move,Operands:[_,LocalVariable source]})value=source;
+            return value;
+        }
+        var root=Root(input);
+        bool Field(IOperand value)=>value is FieldReference {Parent:null} field
+            && !field.Field.IsStatic && field.Offset==field.Field.Offset
+            && field.Local.Type?.IsValueType==false && ReferenceEquals(Root(field.Local),root);
+        static bool Materialized(IOperand value)=>value is LocalVariable or Immediate or FloatLiteral or DoubleLiteral;
+        var current=initial;var start=first;
+        var visited=new HashSet<Block>();var budget=128;
+        while(visited.Count<8 && visited.Add(current))
+        {
+            foreach(var operation in current.Instructions.Skip(start))
+            {
+                if(--budget<0)return false;
+                if(operation.OpCode==OpCode.Nop)continue;
+                if(operation is {OpCode:OpCode.Move,Operands:[LocalVariable destination,LocalVariable or Immediate or TypeAnalysisContext]})
+                {
+                    if(ReferenceEquals(destination,root) || ReferenceEquals(destination,input))return false;
+                    continue;
+                }
+                // Both operations perform the SAME null check before any
+                // other observable work. Nested/static/raw accesses do not.
+                if(operation is {OpCode:OpCode.Move,Operands:[LocalVariable,var source]} && Field(source))return true;
+                if(operation is {OpCode:OpCode.Move,Operands:[var field,var value]} && Field(field) && Materialized(value))return true;
+                if(operation.OpCode==OpCode.Jump && ReferenceEquals(operation,current.Instructions.LastOrDefault()))continue;
+                if(operation.OpCode is not (OpCode.Call or OpCode.CallVoid)
+                    || operation.Operands[0] is not MethodAnalysisContext target || target.IsStatic
+                    || target.Name.StartsWith(".",StringComparison.Ordinal) || target.DeclaringType?.IsValueType!=false
+                    || operation.NativeVirtualDispatch)return false;
+                var delegateInvoke=target.IsVirtual && target.Name=="Invoke"
+                    && target.DeclaringType is {IsDelegate:true,IsSealed:true};
+                // A sealed delegate's runtime Invoke is intrinsically a
+                // virtual managed invocation. Never apply this to arbitrary
+                // virtual/base calls, an unsealed owner, or another member.
+                if(target.IsVirtual && !delegateInvoke)return false;
+                var receiverIndex=operation.OpCode==OpCode.Call?2:1;
+                if(operation.Operands.Count<receiverIndex+1+target.Parameters.Count
+                    || operation.Operands[receiverIndex] is not LocalVariable receiver
+                    || receiver.Type?.IsValueType!=false || !ReferenceEquals(Root(receiver),root)
+                    || operation.Operands.Skip(receiverIndex+1).Take(target.Parameters.Count).Any(a=>!Materialized(a)))return false;
+                if(delegateInvoke && !NullBypassRuntimeCastRecovery.SameCastType(receiver.Type!,target.DeclaringType!))return false;
+                // CIL callvirt on nonvirtual metadata still statically binds
+                // this exact target, while supplying the native null check.
+                if(delegateInvoke)operation.NativeVirtualDispatch=true;
+                else operation.NativeNullCheckedCall=true;
+                return true;
+            }
+            if(current.Successors.Count!=1)return false;
+            var next=current.Successors[0];
+            if(next==cfg.ExitBlock || next.Predecessors.Count!=1 || next.Predecessors[0]!=current)return false;
+            current=next;start=0;
+        }
+        return false;
+    }
+
     public static int Run(MethodAnalysisContext method)
     {
         if (method.AppContext.InstructionSet is not NewArmV8InstructionSet || method.AppContext.Binary.PointerSizeBytes != 8
@@ -118,7 +197,8 @@ public static class ForwardNullCheckRecovery
         foreach (var block in cfg.Blocks)
         foreach (var instruction in block.Instructions)
             if (instruction is { OpCode: OpCode.Call, Operands: [Immediate helper, ..] }
-                && Prove(method, helper.UnsignedValue) && FollowedBySameVirtualReceiver(cfg, instruction))
+                && Prove(method, helper.UnsignedValue) && (FollowedBySameVirtualReceiver(cfg, instruction)
+                    || TryPreserveAtManagedDereference(cfg,instruction)))
             {
                 instruction.OpCode = OpCode.Nop; instruction.SetOperands(); block.CalculateBlockType(); changed++;
             }

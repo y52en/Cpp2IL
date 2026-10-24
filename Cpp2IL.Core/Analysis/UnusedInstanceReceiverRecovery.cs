@@ -12,7 +12,8 @@ namespace Cpp2IL.Core.Analysis;
 
 // An optimized nonvirtual instance callee can ignore its incoming X0 entirely.
 // Do not generate a throwing cross-type cast for that dead argument. Only the
-// caller's existing, same-owner non-null `this` is an authorized substitute.
+// caller's existing, metadata-compatible non-null `this` is an authorized
+// substitute, including an exact nongeneric class ancestor.
 public static class UnusedInstanceReceiverRecovery
 {
     private sealed record Proof(bool Unused);
@@ -72,20 +73,38 @@ public static class UnusedInstanceReceiverRecovery
     }
 
     public static int Run(MethodAnalysisContext caller)
+        => Recover(caller,target=>Proofs.GetValue(target,t=>new Proof(Prove(t))).Unused);
+
+    private static bool CompatibleOwner(TypeAnalysisContext caller,TypeAnalysisContext target)
+    {
+        var seen=new HashSet<TypeAnalysisContext>();
+        for(var current=caller;current!=null && seen.Add(current) && seen.Count<=32;current=current.BaseType)
+        {
+            if(current.IsValueType || current.IsGenericInstance || current.GenericParameters.Count!=0)return false;
+            if(TrivialConstructorRecovery.SameType(current,target))return true;
+        }
+        return false;
+    }
+
+    internal static int Recover(MethodAnalysisContext caller,Func<MethodAnalysisContext,bool> receiverUnused)
     {
         if(caller.IsStatic || caller.ControlFlowGraph==null || caller.DeclaringType?.IsValueType!=false
             || caller.DeclaringType.HasAnyGenericParameters())return 0;
         var selves=caller.ParameterLocals.Where(l=>l.IsThis).ToArray();
-        if(selves.Length!=1)return 0;
+        if(selves.Length!=1 || !TrivialConstructorRecovery.SameType(selves[0].Type,caller.DeclaringType))return 0;
         var self=selves[0];
         var count=0;
         foreach(var call in caller.ControlFlowGraph.Instructions)
         {
             if(!call.IsCall || call.NativeVirtualDispatch || call.Operands[0] is not MethodAnalysisContext target
-                || !TrivialConstructorRecovery.SameType(target.DeclaringType,caller.DeclaringType))continue;
+                || target.IsStatic || target.IsVirtual || target.Name is ".ctor" or ".cctor"
+                || target.DeclaringType is not {} owner || !CompatibleOwner(caller.DeclaringType,owner))continue;
+            if(!TrivialConstructorRecovery.SameType(owner,caller.DeclaringType)
+                && target.Visibility is not (System.Reflection.MethodAttributes.Public or System.Reflection.MethodAttributes.Family
+                    or System.Reflection.MethodAttributes.FamORAssem))continue;
             var receiverIndex=call.OpCode==OpCode.Call ? 2 : 1;
             if(call.Operands.Count<=receiverIndex || ReferenceEquals(call.Operands[receiverIndex],self)
-                || !Proofs.GetValue(target,t=>new Proof(Prove(t))).Unused)continue;
+                || !receiverUnused(target))continue;
             call.SetOperand(receiverIndex,self);
             if(!caller.Locals.Contains(self))caller.Locals.Add(self);
             count++;

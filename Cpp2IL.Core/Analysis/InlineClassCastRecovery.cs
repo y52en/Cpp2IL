@@ -72,6 +72,48 @@ public static class InlineClassCastRecovery
         return false;
     }
 
+    // A previous explicit cast proves type membership, NOT non-nullness.
+    // Repeated native checks can omit their own null predecessor only when
+    // the original input's actual throwing null guard dominates this check.
+    internal static bool HasDominatingNonNullCast(MethodAnalysisContext method, Match match,
+        IReadOnlyDictionary<LocalVariable, Instruction> defs)
+    {
+        var cfg = method.ControlFlowGraph!;
+        if (Resolve(match.Object, defs) is not LocalVariable source
+            || !defs.TryGetValue(source, out var cast)
+            || cast is not { OpCode: OpCode.CastClass, Operands: [_, TypeAnalysisContext actual, LocalVariable input] }
+            || !TrivialConstructorRecovery.SameType(actual, match.Target)
+            || !InlineClassTestRecovery.StableSource(method, source, match.Depth)
+            || !InlineClassTestRecovery.StableSource(method, input, match.Depth)
+            || match.Depth.Instructions.Count == 0
+            || !ForwardNullCheckRecovery.DefinitionDominates(cfg, cast, match.Depth.Instructions[0])) return false;
+        var dominance = new DominatorInfo(cfg);
+        foreach (var guard in cfg.Blocks)
+        {
+            if (guard.Successors.Count != 2 || guard.Successors.Distinct().Count() != 2
+                || !dominance.Dominates(guard, match.Depth)
+                || guard.Instructions.LastOrDefault() is not
+                    { OpCode: OpCode.ConditionalJump, Operands: [Block branch, LocalVariable flag] }
+                || !guard.Successors.Contains(branch) || !defs.TryGetValue(flag, out var predicate)
+                || !guard.Instructions.Contains(predicate)
+                || predicate is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                    Operands: [_, var value, Immediate { Value: 0 }] }
+                || !ReferenceEquals(Resolve(value, defs), Resolve(input, defs))) continue;
+            // No clobber or extra operation between this predicate and branch.
+            var at = guard.Instructions.IndexOf(predicate);
+            if (guard.Instructions.Skip(at + 1).SkipLast(1).Any(i => i.OpCode != OpCode.Nop)) continue;
+            var other = guard.Successors.Single(b => !ReferenceEquals(b, branch));
+            var nullExit = predicate.OpCode == OpCode.CheckEqual ? branch : other;
+            var nonNull = ReferenceEquals(nullExit, branch) ? other : branch;
+            if (!dominance.Dominates(nonNull, match.Depth)
+                || nullExit.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray() is not
+                    [Instruction { OpCode: OpCode.Throw, Operands: [TypeAnalysisContext { FullName: "System.NullReferenceException" }] }]
+                || nullExit.Successors.Count != 1 || !ReferenceEquals(nullExit.Successors[0], cfg.ExitBlock)) continue;
+            return true;
+        }
+        return false;
+    }
+
     private static HashSet<Block>? ExceptionTransport(MethodAnalysisContext method, Match match,
         IReadOnlyDictionary<LocalVariable, Instruction> defs)
     {
@@ -140,6 +182,46 @@ public static class InlineClassCastRecovery
         _ => false
     };
 
+    // SSA destruction can place the SAME reference copy on both the null guard
+    // and ancestor edge. Removing the ancestor must not discard that value.
+    // Accept only copies of this proven cast input, with every surviving read
+    // dominated by success. This is not general local-type inference.
+    internal static bool CanPreserveSuccessCopy(MethodAnalysisContext method, Match match,
+        Block insertion, HashSet<Block> removed, HashSet<Block> successOnly,
+        LocalVariable source, LocalVariable alias, IReadOnlyDictionary<LocalVariable, Instruction> defs)
+    {
+        if (ReferenceEquals(alias, source) || method.ParameterLocals.Contains(alias)
+            || alias.Type is { IsValueType: true }
+            || alias.Type is PointerTypeAnalysisContext or ByRefTypeAnalysisContext or RuntimeClassTypeAnalysisContext
+            || method.ControlFlowGraph is not { } cfg) return false;
+        if (cfg.Instructions.Any(i => i.ImplicitDefinition is { } clobbered
+            && clobbered.Number == alias.Register.Number && clobbered.Name == alias.Register.Name)) return false;
+        var writes = cfg.Blocks.SelectMany(b => b.Instructions.Select(i => (Block: b, Instruction: i)))
+            .Where(p => ReferenceEquals(p.Instruction.Destination, alias)).ToArray();
+        if (writes.Length is < 1 or > 2 || !writes.Any(p => ReferenceEquals(p.Block, match.Ancestor))
+            || writes.Any(p => !ReferenceEquals(p.Block, match.Ancestor) && !ReferenceEquals(p.Block, insertion)
+                || p.Instruction is not { OpCode: OpCode.Move, Operands: [_, LocalVariable input] }
+                || !ReferenceEquals(Resolve(input, defs), source)
+                || p.Instruction.NativeRegisterCopySize is not (0 or 8)
+                || p.Instruction.NativeRegisterCopySize == 0 && p.Instruction.Index != -1)) return false;
+        foreach (var block in cfg.Blocks.Where(b => !removed.Contains(b)))
+            foreach (var instruction in block.Instructions)
+                foreach (var operand in instruction.Operands)
+                    if (!(operand is LocalVariable && ReferenceEquals(operand, instruction.Destination))
+                        && Contains(operand, alias)
+                        && (!successOnly.Contains(block) || instruction.OpCode == OpCode.Phi
+                            || TakesAddress(operand, alias))) return false;
+        return true;
+    }
+
+    private static bool TakesAddress(IOperand operand, LocalVariable local) => operand switch
+    {
+        AddressOf address => Contains(address.Target, local),
+        MemoryOperand memory => memory.Base != null && TakesAddress(memory.Base, local)
+            || memory.Index != null && TakesAddress(memory.Index, local),
+        _ => false
+    };
+
     public static int Run(MethodAnalysisContext method)
     {
         if (method.AppContext.UnityVersion.Major != 2018 || method.AppContext.UnityVersion.Minor != 4
@@ -162,19 +244,15 @@ public static class InlineClassCastRecovery
                     && source.Type is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext or RuntimeClassTypeAnalysisContext)
                     && method.AppContext.InstructionSet is Cpp2IL.Core.InstructionSets.NewArmV8InstructionSet
                     && InlineClassTestRecovery.PureKernel(match))
-                || !HasNullBypass(match, defs)
+                || !(HasNullBypass(match, defs) || InlineClassTestRecovery.PureKernel(match)
+                    && (HasDominatingNonNullCast(method, match, defs)
+                        || DominatingReferenceGuardProof.NonNullAt(method,source,match.Depth)))
                 || match.Success.Instructions.Any(i => i.OpCode == OpCode.Phi)) continue;
             var insertion=InlineClassTestRecovery.CheckInsertionBlock(method,match,source);
             if(insertion==null)continue;
             var transport = ExceptionTransport(method, match, defs);
             if (trace) Console.WriteLine($"CAST_TRANSPORT {depth.ID} proven={transport != null}");
             if (transport == null) continue;
-            // Avoid losing SSA values whose definitions would disappear with the lookup/throw path.
-            var removed = new HashSet<Block>(transport) { match.Ancestor };
-            var locals = removed.SelectMany(b => b.Instructions).Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
-            if (cfg.Blocks.Where(b => !removed.Contains(b)).SelectMany(b => b.Instructions)
-                .SelectMany(i => i.Operands).Any(o => locals.Any(l => Contains(o, l)))) continue;
-
             // Only substitute uses on paths dominated by success; null bypasses and other phi inputs stay unchanged.
             var bypassReachable = new HashSet<Block>();
             var queue = new Queue<Block>(); queue.Enqueue(cfg.EntryBlock);
@@ -184,6 +262,22 @@ public static class InlineClassCastRecovery
                 if (ReferenceEquals(block, match.Success) || !bypassReachable.Add(block)) continue;
                 foreach (var successor in block.Successors) queue.Enqueue(successor);
             }
+            var successOnly = cfg.Blocks.Where(b => !bypassReachable.Contains(b)).ToHashSet();
+            // Avoid losing SSA values whose definitions would disappear with the lookup/throw path.
+            var removed = new HashSet<Block>(transport) { match.Ancestor };
+            var locals = removed.SelectMany(b => b.Instructions).Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
+            var aliases = new HashSet<LocalVariable>();
+            var escapes = false;
+            foreach (var local in locals)
+            {
+                if (!cfg.Blocks.Where(b => !removed.Contains(b)).SelectMany(b => b.Instructions)
+                    .SelectMany(i => i.Operands)
+                    .Any(o => Contains(o, local))) continue;
+                if (!CanPreserveSuccessCopy(method, match, insertion, removed, successOnly, source, local, defs))
+                { escapes = true; break; }
+                aliases.Add(local);
+            }
+            if (escapes) continue;
             var result = new LocalVariable("cast_" + depth.ID, new Register(null, "cast_" + depth.ID), match.Target);
             method.Locals.Add(result);
             insertion.Instructions.Insert(insertion.Instructions.Count - 1,
@@ -202,6 +296,8 @@ public static class InlineClassCastRecovery
                         if (instruction.Operands[i] is LocalVariable local && ReferenceEquals(local, instruction.Destination)) continue;
                         if (instruction.OpCode == OpCode.Phi && (i == 0 || bypassReachable.Contains(block.Predecessors[i - 1]))) continue;
                         instruction.SetOperand(i, Replace(instruction.Operands[i], source, result));
+                        foreach (var alias in aliases)
+                            instruction.SetOperand(i, Replace(instruction.Operands[i], alias, result));
                     }
             depth.CalculateBlockType();
             changes++;

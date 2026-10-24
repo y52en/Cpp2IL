@@ -15,6 +15,8 @@ public class LocalVariable(string name, Register register, TypeAnalysisContext? 
     public bool IsThis = false;
     public bool IsReturn = false;
     public bool IsMethodInfo = false;
+    // Metadata ordinal of the actual incoming local, never its display name.
+    public int ParameterIndex = -1;
     // Set only when metadata/native ABI identifies the incoming return buffer.
     public bool IsReturnBuffer = false;
 

@@ -19,7 +19,7 @@ public static class FloatLiteralRecovery
             // proves that integer constants forwarded into its operands are
             // native IEEE bits, not numbers requiring conv.r4/conv.r8.
             if(instruction.NativeFloatingPointSize is 4 or 8
-                && instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Negate)
+                && instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Negate or OpCode.Absolute)
             {
                 var type=instruction.NativeFloatingPointSize==4
                     ? method.AppContext.SystemTypes.SystemSingleType : method.AppContext.SystemTypes.SystemDoubleType;

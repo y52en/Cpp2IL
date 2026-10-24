@@ -3,6 +3,7 @@ using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Tests.Analysis;
 
@@ -18,14 +19,14 @@ public class InjectedCheckRemoverTests
     {
         var app=TestGameLoader.LoadSimple2019Game();
         var exception=app.SystemTypes.SystemExceptionType.DeclaringAssembly.GetTypeByFullName("System.NullReferenceException")!;
-        var value=new LocalVariable("value",new Register(null,"value"),app.SystemTypes.SystemObjectType);
+        var value=new LocalVariable("value",new Register(null,"value"),new SzArrayTypeAnalysisContext(app.SystemTypes.SystemInt32Type));
         var cmp=new LocalVariable("cmp",new Register(null,"cmp"),typed?app.SystemTypes.SystemBooleanType:null);
         var cond=new LocalVariable("cond",new Register(null,"cond"),typed?app.SystemTypes.SystemBooleanType:null);
         var forwarded=new LocalVariable("forwarded",new Register(null,"forwarded"),typed?app.SystemTypes.SystemBooleanType:null);
         var check=new Instruction(0,OpCode.CheckEqual,cmp,value,Imm(0));
         var invert=new Instruction(1,OpCode.Not,cond,cmp);
         var throwing=new Instruction(5,OpCode.Throw,exception);
-        var success=new Instruction(8,OpCode.Return,value);
+        var success=new Instruction(8,OpCode.Move,new LocalVariable("length",new Register(null,"length"),app.SystemTypes.SystemInt32Type),new ArrayLength(value));
         var jump=new Instruction(3,OpCode.ConditionalJump,success,copy?forwarded:cond);
         var deadEffect=new Instruction(6,OpCode.Move,new MemoryOperand(value,null,24,0),Imm(2));
         var beforeEffect=new Instruction(4,OpCode.Move,new MemoryOperand(value,null,16,0),Imm(1));
@@ -57,12 +58,12 @@ public class InjectedCheckRemoverTests
         var app=TestGameLoader.LoadSimple2019Game();
         var exception=app.SystemTypes.SystemExceptionType.DeclaringAssembly.GetTypeByFullName("System.NullReferenceException")!;
         Assert.That(exception,Is.Not.Null);
-        var value=new LocalVariable("value",new Register(null,"value"),app.SystemTypes.SystemObjectType);
+        var value=new LocalVariable("value",new Register(null,"value"),new SzArrayTypeAnalysisContext(app.SystemTypes.SystemInt32Type));
         var cond=new LocalVariable("cond",new Register(null,"cond"),app.SystemTypes.SystemBooleanType);
         var check=new Instruction(0,targetThrows?OpCode.CheckEqual:OpCode.CheckNotEqual,cond,
             reversedOperands?Imm(0):value,reversedOperands?value:Imm(0));
         var throwing=new Instruction(targetThrows?4:2,OpCode.Throw,exception);
-        var success=new Instruction(targetThrows?2:4,OpCode.Return,value);
+        var success=new Instruction(targetThrows?2:4,OpCode.Move,new LocalVariable("length",new Register(null,"length"),app.SystemTypes.SystemInt32Type),new ArrayLength(value));
         var jump=new Instruction(1,OpCode.ConditionalJump,targetThrows?throwing:success,cond);
         var graph=new ISILControlFlowGraph(targetThrows
             ? [check,jump,success,new(3,OpCode.Return),throwing,new(5,OpCode.Return)]

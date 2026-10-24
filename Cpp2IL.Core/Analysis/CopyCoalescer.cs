@@ -23,8 +23,10 @@ public static class CopyCoalescer
                 if (local.IsThis || local.IsMethodInfo)
                     inputs.Add(local);
 
+        var mutableStructs = SsaSimplifier.MutableStructStorage(cfg);
         var copies = FindSameSlotCopies(cfg)
-            .Where(copy => !inputs.Contains(copy.Destination) && !inputs.Contains(copy.Source)).ToList();
+            .Where(copy => !inputs.Contains(copy.Destination) && !inputs.Contains(copy.Source)
+                && !SsaSimplifier.PreserveStructCopy(copy.Destination, copy.Source, mutableStructs)).ToList();
         var escapedSlots = FindEscapedSlotGroups(cfg)
             .Select(group => group.Where(local => !inputs.Contains(local)).ToList())
             .Where(group => group.Count > 1).ToList();
@@ -296,7 +298,7 @@ public static class CopyCoalescer
                             instruction.SetOperand(i, memory); // MemoryOperand is a struct, write the copy back
                             break;
                         case FieldReference field:
-                            field.Local = groups.Find(field.Local);
+                            field.ReplaceLocal(field.Local, groups.Find(field.Local));
                             break;
                         case ArrayAccess array:
                             array.Array = groups.Find(array.Array);

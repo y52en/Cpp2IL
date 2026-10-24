@@ -24,7 +24,7 @@ public class BoxAddressRecoveryTests
         SsaForm.Build(graph,new DominatorInfo(graph));
         var target = (Register)((AddressOf)address.Operands[1]).Target;
         Assert.That(target,Is.EqualTo((Register)store.Destination!));
-        Assert.That(target.Version,Is.GreaterThan(0));
+        Assert.That(target.Version,Is.EqualTo(-1),"an addressed physical stack slot remains stable mutable storage");
     }
 
     [TestCase("unknown-call")]

@@ -52,7 +52,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         foreach (var type in context.Assemblies.SelectMany(a => a.Types))
         {
             var templates = new List<InlinedConstructorRecovery.Template>();
-            if (type.IsValueType || type.BaseType?.FullName != "System.Object") continue;
+            var structural = new List<StructuralConstructorRecovery.Template>();
+            if (type.IsValueType || type.BaseType==null || type.HasAnyGenericParameters()) continue;
             foreach (var ctor in type.Methods.Where(m => m.Name == ".ctor" && !m.IsStatic
                 && m.UnderlyingPointer != 0 && m.Parameters.Count is > 0 and <= 8))
             {
@@ -64,11 +65,13 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                     if (ctor.RawBytes.Length > 512) continue;
                     ctor.Analyze();
                     if (InlinedConstructorRecovery.Extract(ctor) is { } template) templates.Add(template);
+                    if (StructuralConstructorRecovery.Extract(ctor) is { } shape) structural.Add(shape);
                 }
                 catch { /* Unproved constructors remain unmodified and diagnostic. */ }
                 finally { ctor.ReleaseAnalysisData(); }
             }
             type.PutExtraData(InlinedConstructorRecovery.CacheKey, templates.ToArray());
+            type.PutExtraData(StructuralConstructorRecovery.CacheKey, structural.ToArray());
             count += templates.Count;
         }
         Logger.InfoNewline($"Prepared {count} pure field-initialization constructor templates.");
@@ -101,9 +104,14 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             UnusedInstanceReceiverRecovery.Run(methodContext);
 
             InlinedConstructorRecovery.Run(methodContext);
+            StructuralConstructorRecovery.Run(methodContext);
             TrivialConstructorRecovery.Run(methodContext);
+            ForwardedConstructorRecovery.Run(methodContext);
+            MergedAllocationRecovery.Run(methodContext);
+            ArgumentForwardingConstructorRecovery.Run(methodContext);
             ConstantFieldConstructorRecovery.Run(methodContext);
             EmptyObjectBaseConstructorRecovery.Run(methodContext);
+            ConstructorPrologueRecovery.Run(methodContext);
             // Constructor reconstruction consumes allocation-adjacent stores;
             // do not hide those stores behind setters before it has run.
             InlinedFieldMethodRecovery.Run(methodContext);

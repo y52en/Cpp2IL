@@ -280,6 +280,7 @@ public static class IlGenerator
         MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
         var body = method.CilMethodBody!;
+        BindParameterIdentities(context);
         var instructions = body.Instructions;
         var currentCount = instructions.Count;
         var startIndex = instructions.Count;
@@ -323,6 +324,15 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.LoadVirtualFunction:
+                if (instruction.Operands is not [LocalVariable { Type.FullName: "System.IntPtr" },
+                    MethodAnalysisContext { IsVirtual: true, IsStatic: false } virtualTarget, LocalVariable receiver])
+                    throw new DecompilerException("Invalid proven virtual function load");
+                LoadLocal(receiver, method, locals);
+                instructions.Add(CilOpCodes.Ldvirtftn, virtualTarget.ToMethodDescriptor());
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
             case OpCode.Move:
                 if (instruction.Operands[1] is MemoryOperand { Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } referent } }, Index: null, Scale: 0, Addend: 0 }
                     && instruction.NativeReadSize > 0
@@ -343,7 +353,7 @@ public static class IlGenerator
                 if (instruction.Operands[0] is ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } stored } } target)
                 {
                     LoadLocal(target.Array, method, locals);
-                    LoadOperand(target.Index, method, locals, writeLine);
+                    LoadArrayIndex(target.Index, method, locals, writeLine);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stored);
                     instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
                     break;
@@ -362,6 +372,23 @@ public static class IlGenerator
                 else
                     instructions.Add(CilOpCodes.Ldnull);
 
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
+            case OpCode.NewVirtualDelegate:
+                if (instruction.Operands is not [LocalVariable { Type.IsDelegate: true },
+                    MethodAnalysisContext { Name: ".ctor", IsStatic: false, DeclaringType.IsDelegate: true } delegateConstructor,
+                    MethodAnalysisContext { IsVirtual: true, IsStatic: false } delegateTarget, LocalVariable delegateReceiver]
+                    || delegateConstructor.Parameters.Count != 2
+                    || delegateConstructor.Parameters[0].ParameterType.FullName != "System.Object"
+                    || delegateConstructor.Parameters[1].ParameterType.FullName != "System.IntPtr")
+                    throw new DecompilerException("Invalid proven virtual delegate creation");
+                // A future pointer local must NEVER feed the early Newobj fusion.
+                // This standard contiguous CIL pattern also round-trips through ILSpy.
+                LoadLocal(delegateReceiver, method, locals);
+                instructions.Add(CilOpCodes.Dup);
+                instructions.Add(CilOpCodes.Ldvirtftn, delegateTarget.ToMethodDescriptor());
+                instructions.Add(CilOpCodes.Newobj, delegateConstructor.ToMethodDescriptor());
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -429,6 +456,24 @@ public static class IlGenerator
                 LoadOperand(castValue, method, locals, writeLine, context.AppContext.SystemTypes.SystemObjectType);
                 instructions.Add(CilOpCodes.Castclass, castType.ToTypeSignature().ToTypeDefOrRef());
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
+            case OpCode.UnboxAny:
+                if (instruction.Operands is not [_, TypeAnalysisContext valueType, var boxedSource]
+                    || valueType is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                        or RuntimeFieldInfoAnalysisContext or ByRefTypeAnalysisContext)
+                    throw new DecompilerException("Unresolved UnboxAny operands");
+                LoadOperand(boxedSource,method,locals,writeLine,context.AppContext.SystemTypes.SystemObjectType);
+                instructions.Add(CilOpCodes.Unbox_Any,valueType.ToTypeSignature().ToTypeDefOrRef());
+                StoreToOperand(instruction.Operands[0],method,locals,writeLine);
+                break;
+
+            case OpCode.ArrayNullCheck:
+                if(instruction.Operands is not [LocalVariable {Type:SzArrayTypeAnalysisContext} checkedArray])
+                    throw new DecompilerException("Managed array null-check type is unproven");
+                LoadOperand(checkedArray,method,locals,writeLine);
+                instructions.Add(CilOpCodes.Ldlen);
+                instructions.Add(CilOpCodes.Pop);
                 break;
 
             case OpCode.Unbox:
@@ -521,7 +566,10 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, instructions);
                 }
 
-                instructions.Add(instruction.NativeVirtualDispatch ? CilOpCodes.Callvirt : CilOpCodes.Call, importedMethod);
+                if(instruction.NativeNullCheckedCall && (targetMethod.IsStatic || targetMethod.IsVirtual
+                    || targetMethod.Name.StartsWith(".",System.StringComparison.Ordinal) || targetMethod.DeclaringType?.IsValueType!=false))
+                    throw new DecompilerException("Proven null-checked direct call contract changed");
+                instructions.Add(instruction.NativeVirtualDispatch || instruction.NativeNullCheckedCall ? CilOpCodes.Callvirt : CilOpCodes.Call, importedMethod);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack
@@ -597,6 +645,7 @@ public static class IlGenerator
 
             case OpCode.ShiftLeft:
             case OpCode.ShiftRight:
+            case OpCode.ShiftRightUnsigned:
 
             case OpCode.And:
             case OpCode.Or:
@@ -618,13 +667,25 @@ public static class IlGenerator
                     ? integralResult : null;
                 var comparison = instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
                     or OpCode.CheckLess or OpCode.CheckGreater or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual;
+                var comparisonType=comparison?ComparisonStackType(instruction):null;
+                var nativeArithmeticType=NativeIntegerArithmeticType(instruction,context);
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine,
-                    comparison ? DestinationType(instruction.Operands[2]) : integralArithmeticType ?? bitwiseType);
+                if(nativeArithmeticType!=null)
+                    LoadNativeArithmeticOperand(instruction,instruction.Operands[1],context,method,locals,writeLine);
+                else LoadOperandCore(instruction.Operands[1], method, locals, writeLine,
+                    comparison ? comparisonType ?? DestinationType(instruction.Operands[2]) : nativeArithmeticType ?? integralArithmeticType ?? bitwiseType,
+                    coerceIntegral:comparison || nativeArithmeticType!=null);
+                if (EnumArithmeticConversion(instruction.Operands[1], integralArithmeticType ?? bitwiseType) is { } enumConv1)
+                    instructions.Add(enumConv1);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
-                LoadOperand(instruction.Operands[2], method, locals, writeLine,
-                    comparison ? DestinationType(instruction.Operands[1]) : integralArithmeticType ?? bitwiseType);
+                if(nativeArithmeticType!=null)
+                    LoadNativeArithmeticOperand(instruction,instruction.Operands[2],context,method,locals,writeLine);
+                else LoadOperandCore(instruction.Operands[2], method, locals, writeLine,
+                    comparison ? comparisonType ?? DestinationType(instruction.Operands[1]) : nativeArithmeticType ?? integralArithmeticType ?? bitwiseType,
+                    coerceIntegral:comparison || nativeArithmeticType!=null);
+                if (EnumArithmeticConversion(instruction.Operands[2], integralArithmeticType ?? bitwiseType) is { } enumConv2)
+                    instructions.Add(enumConv2);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 
@@ -661,18 +722,50 @@ public static class IlGenerator
 
                     case OpCode.ShiftLeft: instructions.Add(CilOpCodes.Shl); break;
                     case OpCode.ShiftRight: instructions.Add(CilOpCodes.Shr); break;
+                    case OpCode.ShiftRightUnsigned: instructions.Add(CilOpCodes.Shr_Un); break;
 
                     case OpCode.And: instructions.Add(CilOpCodes.And); break;
                     case OpCode.Or: instructions.Add(CilOpCodes.Or); break;
                     case OpCode.Xor: instructions.Add(CilOpCodes.Xor); break;
                 }
 
+                if(nativeArithmeticType!=null && IntegralLoadConversion(
+                    new LocalVariable("nativeResult",new Register(null,"NATIVE_RESULT"),nativeArithmeticType),
+                    DestinationType(instruction.Operands[0])) is {} resultConversion)
+                    instructions.Add(resultConversion);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
+            case OpCode.Absolute:
+                if(instruction.NativeFloatingPointSize is not (4 or 8)
+                    || context.DeclaringType?.FullName=="System.Math" && context.Name=="Abs")
+                    throw new DecompilerException("Native floating absolute requires a nonrecursive runtime intrinsic reference");
+                var absoluteType=instruction.NativeFloatingPointSize==4?context.AppContext.SystemTypes.SystemSingleType:
+                    context.AppContext.SystemTypes.SystemDoubleType;
+                var absoluteSource=instruction.Operands[1];
+                if(DestinationType(instruction.Operands[0])?.FullName!=absoluteType.FullName
+                    || DestinationType(absoluteSource)?.FullName!=absoluteType.FullName
+                        && !(instruction.NativeFloatingPointSize==4 && absoluteSource is FloatLiteral)
+                        && !(instruction.NativeFloatingPointSize==8 && absoluteSource is DoubleLiteral))
+                    throw new DecompilerException("Native floating absolute source width/type differs");
+                var absoluteModule=method.DeclaringModule!;
+                var absoluteSignature=instruction.NativeFloatingPointSize==4?absoluteModule.CorLibTypeFactory.Single:
+                    absoluteModule.CorLibTypeFactory.Double;
+                var absolute=absoluteModule.CorLibTypeFactory.CorLibScope.CreateTypeReference("System","Math")
+                    .CreateMemberReference("Abs",MethodSignature.CreateStatic(absoluteSignature,[absoluteSignature]));
+                LoadOperand(instruction.Operands[1],method,locals,writeLine,absoluteType);
+                instructions.Add(CilOpCodes.Call,absolute);
+                StoreToOperand(instruction.Operands[0],method,locals,writeLine);
                 break;
 
             case OpCode.Not:
             case OpCode.Negate:
-                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                var nativeNegateType=instruction.OpCode==OpCode.Negate && instruction.NativeArithmeticSize is 4 or 8
+                    && IntegralStackWidth(DestinationType(instruction.Operands[1])?.FullName)!=0
+                    && IntegralStackWidth(DestinationType(instruction.Operands[0])?.FullName)!=0
+                    ? instruction.NativeArithmeticSize==4?context.AppContext.SystemTypes.SystemUInt32Type
+                        :context.AppContext.SystemTypes.SystemUInt64Type : null;
+                LoadOperand(instruction.Operands[1], method, locals, writeLine,nativeNegateType);
 
                 if (instruction.OpCode == OpCode.Negate)
                     instructions.Add(CilOpCodes.Neg);
@@ -684,6 +777,9 @@ public static class IlGenerator
                 else
                     instructions.Add(CilOpCodes.Not);
 
+                if(nativeNegateType!=null && IntegralLoadConversion(
+                    new LocalVariable("nativeNegateResult",new Register(null,"NATIVE_NEGATE_RESULT"),nativeNegateType),
+                    DestinationType(instruction.Operands[0])) is {} negateConversion)instructions.Add(negateConversion);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -732,6 +828,24 @@ public static class IlGenerator
         return matches.Count==1?matches.Single():null;
     }
 
+    internal static CilOpCode? EnumArithmeticConversion(IOperand operand, TypeAnalysisContext? expected)
+    {
+        // The native arithmetic has already been typed as a primitive integer.
+        // Preserve the enum declaration, but make its integer use explicit in IL
+        // so a C# decompiler cannot emit the invalid `int - enum` expression.
+        // These conversions are evaluation-stack bit-pattern identities only:
+        // never infer an enum width or widen/narrow it to fit another operand.
+        if (DestinationType(operand) is not { IsEnumType: true, EnumUnderlyingType: { } underlying })
+            return null;
+        return (underlying.FullName, expected?.FullName) switch
+        {
+            ("System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32",
+                "System.Int32" or "System.UInt32") => CilOpCodes.Conv_I4,
+            ("System.Int64" or "System.UInt64", "System.Int64" or "System.UInt64") => CilOpCodes.Conv_I8,
+            _ => null,
+        };
+    }
+
     private static CilOpCode? FloatArithmeticConversion(Instruction instruction)
     {
         if (instruction.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo))
@@ -745,9 +859,96 @@ public static class IlGenerator
         };
     }
 
+    // CIL evaluation-stack widths must agree with the exact managed field,
+    // element, parameter or result contract. Never coerce references, pointer
+    // carriers, bools, floats or unknown storage into integers to silence IL.
+    static int IntegralStackWidth(string? type)=>type switch
+    {
+        "System.SByte" or "System.Byte" or "System.Int16" or "System.UInt16"
+            or "System.Char" or "System.Int32" or "System.UInt32"=>4,
+        "System.Int64" or "System.UInt64"=>8,_=>0,
+    };
+
+    static void LoadNativeArithmeticOperand(Instruction instruction,IOperand value,MethodAnalysisContext context,
+        MethodDefinition method,Dictionary<LocalVariable,CilLocalVariable> locals,IMethodDescriptor writeLine)
+    {
+        var types=context.AppContext.SystemTypes;
+        if(instruction.OpCode==OpCode.Multiply && instruction.NativeArithmeticSize==8 && instruction.NativeMultiplyInputSize==4)
+        {
+            var narrow=instruction.NativeMultiplySigned?types.SystemInt32Type:types.SystemUInt32Type;
+            LoadOperand(value,method,locals,writeLine,narrow);
+            // Native long multiply reads W bits, then sign/zero extends each
+            // input independently BEFORE the full-width product.
+            method.CilMethodBody!.Instructions.Add(instruction.NativeMultiplySigned?CilOpCodes.Conv_I4:CilOpCodes.Conv_U4);
+            method.CilMethodBody.Instructions.Add(instruction.NativeMultiplySigned?CilOpCodes.Conv_I8:CilOpCodes.Conv_U8);
+        }
+        else LoadOperand(value,method,locals,writeLine,NativeIntegerArithmeticType(instruction,context));
+    }
+
+    internal static TypeAnalysisContext? NativeIntegerArithmeticType(Instruction instruction,MethodAnalysisContext context)
+    {
+        if(instruction.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Multiply)
+            || instruction.NativeArithmeticSize is not (4 or 8) || instruction.Operands.Count!=3
+            || IntegralStackWidth(DestinationType(instruction.Operands[0])?.FullName)==0)return null;
+        foreach(var value in instruction.Operands.Skip(1))
+        {
+            var type=DestinationType(value);if(type?.IsEnumType==true)type=type.EnumUnderlyingType;
+            if(value is not Immediate && IntegralStackWidth(type?.FullName)==0)return null;
+        }
+        // Only modulo add/sub/mul under an explicit native width. Division,
+        // shifts, pointer carriers and floats require their own contracts.
+        return instruction.NativeArithmeticSize==8?context.AppContext.SystemTypes.SystemUInt64Type
+            :context.AppContext.SystemTypes.SystemUInt32Type;
+    }
+
+    internal static TypeAnalysisContext? ComparisonStackType(Instruction instruction)
+    {
+        var a=DestinationType(instruction.Operands[1]);var b=DestinationType(instruction.Operands[2]);
+        if(a?.IsEnumType==true)a=a.EnumUnderlyingType;if(b?.IsEnumType==true)b=b.EnumUnderlyingType;
+        // Widen the I4 side; never independently swap/narrow the two stack
+        // widths or truncate an I8 index just to compare against an I4 length.
+        return (IntegralStackWidth(a?.FullName),IntegralStackWidth(b?.FullName)) switch
+        { (8,4)=>a,(4,8)=>b,_=>null };
+    }
+
+    internal static CilOpCode? IntegralLoadConversion(IOperand operand,TypeAnalysisContext? expected)
+    {
+        var source=DestinationType(operand);
+        if(source?.IsEnumType==true)source=source.EnumUnderlyingType;
+        if(expected?.IsEnumType==true)expected=expected.EnumUnderlyingType;
+        var from=IntegralStackWidth(source?.FullName);var to=IntegralStackWidth(expected?.FullName);
+        if(from==0 || to==0 || from==to)return null;
+        if(to==8)return source!.FullName is "System.Byte" or "System.UInt16" or "System.Char" or "System.UInt32"
+            ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8;
+        return expected!.FullName switch
+        {
+            "System.SByte"=>CilOpCodes.Conv_I1,"System.Byte"=>CilOpCodes.Conv_U1,
+            "System.Int16"=>CilOpCodes.Conv_I2,"System.UInt16" or "System.Char"=>CilOpCodes.Conv_U2,
+            "System.UInt32"=>CilOpCodes.Conv_U4,_=>CilOpCodes.Conv_I4,
+        };
+    }
+
+    private static void LoadArrayIndex(IOperand index,MethodDefinition method,
+        Dictionary<LocalVariable,CilLocalVariable> locals,IMethodDescriptor writeLine)
+    {
+        LoadOperand(index,method,locals,writeLine);
+        var type=DestinationType(index);
+        // These checked width-preserving conversions cannot overflow on the
+        // matching 64-bit image. Unlike unchecked conv.i/u, ILSpy recognizes
+        // them as normal C# 7.3 long/ulong array indexes, not void* casts.
+        if(type is {AppContext.Binary.PointerSizeBytes:8,FullName:"System.Int64" or "System.UInt64"})
+            method.CilMethodBody!.Instructions.Add(type.FullName=="System.UInt64"
+                ? CilOpCodes.Conv_Ovf_U_Un : CilOpCodes.Conv_Ovf_I);
+    }
+
     private static void LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
         TypeAnalysisContext? expectedType = null)
+        =>LoadOperandCore(operand,method,locals,writeLine,expectedType,true);
+
+    private static void LoadOperandCore(IOperand operand, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
+        TypeAnalysisContext? expectedType,bool coerceIntegral)
     {
         var instructions = method.CilMethodBody!.Instructions;
 
@@ -812,13 +1013,13 @@ public static class IlGenerator
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadLocal(elementAddress.Array, method, locals);
-                LoadOperand(elementAddress.Index, method, locals, writeLine);
+                LoadArrayIndex(elementAddress.Index, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldelema,
                     ((SzArrayTypeAnalysisContext)elementAddress.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case ArrayAccess arrayAccess:
                 LoadLocal(arrayAccess.Array, method, locals);
-                LoadOperand(arrayAccess.Index, method, locals, writeLine);
+                LoadArrayIndex(arrayAccess.Index, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldelem,
                     ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
@@ -840,7 +1041,9 @@ public static class IlGenerator
 
                     // A load through a managed pointer (byref) dereferences it to yield the referent.
                     if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } referent })
-                        instructions.Add(referent.IsValueType
+                        // An unconstrained generic parameter may be a value
+                        // type at runtime. ldind.ref would misread its storage.
+                        instructions.Add(referent.IsValueType || referent is GenericParameterTypeAnalysisContext
                             ? new CilInstruction(CilOpCodes.Ldobj, referent.ToTypeSignature().ToTypeDefOrRef())
                             : new CilInstruction(CilOpCodes.Ldind_Ref));
                     break;
@@ -904,6 +1107,8 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldnull);
                 break;
         }
+        if(coerceIntegral && IntegralLoadConversion(operand,expectedType) is {} integralConversion)
+            instructions.Add(integralConversion);
     }
     
     private static bool TryEmitExactTypeComparison(Instruction instruction, MethodDefinition method,
@@ -991,6 +1196,27 @@ public static class IlGenerator
             _ => null
         };
 
+    private static void BindParameterIdentities(MethodAnalysisContext context)
+    {
+        // The complete ordered incoming set, not display names, identifies
+        // parameters. A partial set needs explicit ordinals from CreateAll.
+        var incoming=context.ParameterLocals.Where(l=>!l.IsThis && !l.IsMethodInfo).ToArray();
+        if(incoming.Length!=context.Parameters.Count)return;
+        for(var ordinal=0;ordinal<incoming.Length;ordinal++)
+        {
+            if(incoming[ordinal].ParameterIndex<0)incoming[ordinal].ParameterIndex=context.Parameters[ordinal].ParameterIndex;
+        }
+    }
+
+    private static AsmResolver.DotNet.Collections.Parameter? ParameterFor(LocalVariable local,MethodDefinition method)
+    {
+        if(local.ParameterIndex<0)return null;
+        var signatureIndex=local.ParameterIndex+method.Parameters.MethodSignatureIndexBase;
+        if(!method.Parameters.ContainsSignatureIndex(signatureIndex))
+            throw new DecompilerException("incoming parameter ordinal outside managed signature");
+        return method.Parameters.GetBySignatureIndex(signatureIndex);
+    }
+
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
     {
         var instructions = method.CilMethodBody!.Instructions;
@@ -1001,7 +1227,7 @@ public static class IlGenerator
             return;
         }
 
-        var parameter = method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+        var parameter = ParameterFor(local,method);
 
         if (parameter != null)
             instructions.Add(CilOpCodes.Ldarg, parameter);
@@ -1018,7 +1244,7 @@ public static class IlGenerator
         {
             if(root.Type?.IsValueType==true && !root.IsThis)
             {
-                var parameter=method.Parameters.FirstOrDefault(p=>p.Name==root.Name);
+                var parameter=ParameterFor(root,method);
                 if(parameter!=null) method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarga,parameter);
                 else method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldloca,locals[root]);
             }
@@ -1068,7 +1294,7 @@ public static class IlGenerator
 
                 instructions.Add(CilOpCodes.Stloc, elementScratch);
                 LoadLocal(arrayAccess.Array, method, locals);
-                LoadOperand(arrayAccess.Index, method, locals, writeLine);
+                LoadArrayIndex(arrayAccess.Index, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldloc, elementScratch);
                 instructions.Add(CilOpCodes.Stelem, elementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
@@ -1084,7 +1310,9 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Stloc, value);
                         LoadLocal(local2, method, locals);
                         instructions.Add(CilOpCodes.Ldloc, value);
-                        instructions.Add(referent.IsValueType
+                        // stobj !0 is valid for both generic instantiation
+                        // kinds; stind.ref is valid only for known references.
+                        instructions.Add(referent.IsValueType || referent is GenericParameterTypeAnalysisContext
                             ? new CilInstruction(CilOpCodes.Stobj, referent.ToTypeSignature().ToTypeDefOrRef())
                             : new CilInstruction(CilOpCodes.Stind_Ref));
                     }

@@ -124,6 +124,7 @@ public static class LocalVariables
                 continue;
 
             local.Name = method.Parameters[i].ParameterName;
+            local.ParameterIndex = i;
             paramLocals.Add(local);
         }
 
@@ -244,6 +245,15 @@ public static class LocalVariables
             {
                 destination.Type = targetType; // exact native conversion contract, not a copy's inferred type
                 if (source is LocalVariable sourceLocal) SetTypeIfUnknown(sourceLocal, sourceType);
+            }
+        foreach(var instruction in method.ControlFlowGraph.Instructions)
+            if(instruction is {OpCode:OpCode.Absolute,NativeFloatingPointSize:4 or 8,
+                Operands:[LocalVariable destination,var source]})
+            {
+                var scalar=instruction.NativeFloatingPointSize==4?method.AppContext.SystemTypes.SystemSingleType:
+                    method.AppContext.SystemTypes.SystemDoubleType;
+                destination.Type=scalar;
+                if(source is LocalVariable local)SetTypeIfUnknown(local,scalar);
             }
 
         // Everywhere there's a CallVoid after a Newobj, we can resolve the constructor call.
@@ -381,6 +391,17 @@ public static class LocalVariables
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
+            // A recovered value_box helper reads storage of its represented
+            // managed type. Its address may be exposed only after the late
+            // array/SSA passes, after the ordinary type fixpoint has ended.
+            // Keep the fact monotonic; never retag an already typed local.
+            if (instruction is { OpCode: OpCode.Box, Operands: [_, TypeAnalysisContext boxedType,
+                    AddressOf { Target: LocalVariable boxedStorage }] }
+                && boxedType is not (RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                    or RuntimeFieldInfoAnalysisContext or ByRefTypeAnalysisContext)
+                && boxedType.FullName != "System.Void")
+                changed |= SetTypeIfUnknown(boxedStorage, boxedType);
+
             if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext calledMethod)
                 continue;
 
@@ -414,6 +435,14 @@ public static class LocalVariables
     private static bool SetTypeIfUnknown(LocalVariable local, TypeAnalysisContext? type)
     {
         if (type == null || local.Type != null)
+            return false;
+
+        // A bare generic definition (Foo`1) is not a managed value type
+        // annotation. A later MethodInfo/virtual-call resolution can provide
+        // Foo<T>; prematurely accepting the definition permanently poisons
+        // this monotonic fixpoint. Explicit generic instances, including ones
+        // containing the current method's T, remain valid evidence.
+        if(type is not GenericInstanceTypeAnalysisContext && type.GenericParameters.Count>0)
             return false;
 
         local.Type = type;
@@ -468,7 +497,7 @@ public static class LocalVariables
                     changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
                 case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
-                    or OpCode.ShiftLeft or OpCode.ShiftRight:
+                    or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned:
                     changed |= PropagateBooleanResult(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
             }
@@ -532,6 +561,18 @@ public static class LocalVariables
         var rightType=IntegerResultType(right,method);
         var type=leftType ?? rightType;
         if(type==null) return false;
+        var nativeWidth=instruction.NativeArithmeticSize;
+        if(nativeWidth is 4 or 8)
+        {
+            // A native ADD X is an I8 computation even when both source
+            // metadata values happen to be I4. Do not truncate before a Phi.
+            if((leftType==null && left is not Immediate) || (rightType==null && right is not Immediate))return false;
+            // Native bits do not declare managed unsignedness. Keep canonical
+            // signed index temporaries for affine array analysis; the CIL
+            // emitter separately preserves W-result zero extension.
+            return SetTypeIfUnknown(destination,nativeWidth==8?method.AppContext.SystemTypes.SystemInt64Type
+                :method.AppContext.SystemTypes.SystemInt32Type);
+        }
         bool Compatible(IOperand operand,TypeAnalysisContext? known)
             => known?.FullName==type.FullName || known==null && operand is Immediate immediate
                 && (type.FullName=="System.Int64" || immediate.Value is >=int.MinValue and <=int.MaxValue);

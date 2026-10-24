@@ -13,6 +13,66 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class WholeStructInitializationRecoveryTests
 {
+    [TestCase(0)]
+    [TestCase(4)]
+    [TestCase(20)]
+    [TestCase(64)]
+    public void CollapsedTailFirstDefaultCarriesExactlyTheCompleteVerifiedExtent(int previousExtent)
+    {
+        var types=TestGameLoader.LoadSimple2019Game().SystemTypes;
+        var type=new InjectedTypeAnalysisContext(types.SystemObjectType.DeclaringAssembly,"Test","TwentyByteData",types.SystemValueTypeType,TypeAttributes.Public);
+        var root=new Register(null,"stack_-80");var block=new Block();
+        var tail=new Instruction(0,OpCode.Move,new Register(null,"stack_-70"),new Immediate(0))
+            {NativeWriteSize=4,NativeZeroSize=previousExtent};
+        var low=new Instruction(1,OpCode.Move,root,new Immediate(0)){NativeWriteSize=8,NativeZeroSize=20};
+        var middle=new Instruction(2,OpCode.Move,new Register(null,"stack_-78"),new Immediate(0)){NativeWriteSize=8,NativeZeroSize=12};
+        block.Instructions=[tail,low,middle];
+        Assert.That(WholeStructInitializationRecovery.RecoverGroup(block,0,root,type,20),Is.True);
+        Assert.That(tail.Operands[0],Is.EqualTo(root));
+        Assert.That(tail.Operands[1],Is.TypeOf<DefaultStructValue>());
+        Assert.That(tail.NativeWriteSize,Is.Zero);
+        Assert.That(tail.NativeZeroSize,Is.EqualTo(20),"whole union, neither the first tail nor unrelated neighboring bytes");
+        Assert.That(low.NativeZeroSize,Is.Zero);Assert.That(middle.NativeZeroSize,Is.Zero);
+    }
+    [TestCase(16,false,false,40)]
+    [TestCase(8,false,false,0)]
+    [TestCase(16,true,false,0)]
+    [TestCase(16,false,true,0)]
+    public void DeferredVectorZeroRequiresFullRegisterProofWithoutClobber(int zeroWidth,bool overwritten,bool call,int expected)
+    {
+        var vector=new Register(null,"V0");
+        var list=new System.Collections.Generic.List<Instruction>{new(0,OpCode.Move,vector,new Immediate(0)){NativeZeroSize=zeroWidth}};
+        if(overwritten)list.Add(new(1,OpCode.Move,vector,new Immediate(1)));
+        if(call)list.Add(new(2,OpCode.CallVoid,new Immediate(123)));
+        list.Add(new(3,OpCode.Move,new Register(null,"stack_-40"),new Immediate(0)){NativeWriteSize=8});
+        list.Add(new(4,OpCode.Move,new Register(null,"stack_-50"),vector){NativeWriteSize=16});
+        var root=new Instruction(5,OpCode.Move,new Register(null,"stack_-60"),vector){NativeWriteSize=16};list.Add(root);
+        WholeStructInitializationRecovery.MarkZeroExtents(new ISILControlFlowGraph(list));
+        Assert.That(root.NativeZeroSize,Is.EqualTo(expected));
+    }
+
+    [TestCase("ordered",24)]
+    [TestCase("reordered",24)]
+    [TestCase("gap",8)]
+    [TestCase("nonzero",8)]
+    [TestCase("call",8)]
+    [TestCase("read",8)]
+    [TestCase("unknown-width",8)]
+    public void DeferredZeroCoverageNeverCrossesUnprovenBytesOrEffects(string shape,int expected)
+    {
+        var root=new Instruction(0,OpCode.Move,new Register(null,"stack_-58"),new Immediate(0)){NativeWriteSize=8};
+        var middle=new Instruction(1,OpCode.Move,new Register(null,shape=="gap"?"stack_-48":"stack_-50"),new Immediate(shape=="nonzero"?1:0))
+            {NativeWriteSize=shape=="unknown-width"?0:8};
+        var last=new Instruction(2,OpCode.Move,new Register(null,shape=="gap"?"stack_-40":"stack_-48"),new Immediate(0)){NativeWriteSize=8};
+        var list=shape=="reordered"?new System.Collections.Generic.List<Instruction>{middle,last,root}:new(){root,middle,last};
+        if(shape=="call")list.Insert(1,new(3,OpCode.CallVoid,new Immediate(123)));
+        if(shape=="read")list.Insert(1,new(3,OpCode.Move,new Register(null,"X0"),new Register(null,"stack_-58")));
+        var graph=new ISILControlFlowGraph(list);
+        WholeStructInitializationRecovery.MarkZeroExtents(graph);
+        Assert.That(root.NativeZeroSize,Is.EqualTo(expected));
+        Assert.That(root.Operands[1],Is.TypeOf<Immediate>(),"no managed type or initializer is invented by coverage annotation");
+    }
+
     [TestCase("ref",true)]
     [TestCase("value",false)]
     [TestCase("objectref",false)]

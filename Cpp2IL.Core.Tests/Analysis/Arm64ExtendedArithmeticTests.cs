@@ -34,6 +34,7 @@ public class Arm64ExtendedArithmeticTests
             .Invoke(new NewArmV8InstructionSet(), [native, lifted, new List<ulong>(), context]);
         var basis = new LocalVariable("basis", new Register(null, "basis"), t.SystemUInt64Type);
         var value = new LocalVariable("payload", new Register(null, "payload"), t.SystemUInt64Type);
+        context.ParameterLocals=[basis,value];
         var versions = new Dictionary<string, LocalVariable> { ["X8"] = basis, ["X9"] = value };
         var locals = new List<LocalVariable> { basis, value };
         foreach (var instruction in lifted)

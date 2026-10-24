@@ -12,6 +12,48 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class Arm64FrameAliasRecoveryTests
 {
+    [TestCase("preserved",true)]
+    [TestCase("self-copy",true)]
+    [TestCase("nonvolatile-call",true)]
+    [TestCase("nested",true)]
+    [TestCase("killed",false)]
+    [TestCase("shifted",false)]
+    [TestCase("volatile-call",false)]
+    [TestCase("unanchored",false)]
+    [TestCase("unreachable",false)]
+    [TestCase("missing-entry-definition",false)]
+    public void LoopsKeepOnlyEntryAnchoredInvariantFrameAddresses(string shape,bool expected)
+    {
+        foreach(var reverse in new[]{false,true})
+        {
+            var register=shape=="volatile-call"?"X8":"X29";
+            var graph=new ISILControlFlowGraph([]);
+            var initial=new Block{ID=2,Instructions=shape is "unanchored" or "missing-entry-definition"?[]:[Root(name:register)]};
+            var read=Read(1,register);var loop=new Block{ID=3,Instructions=[read]};var back=new Block{ID=4};
+            if(shape=="killed")back.Instructions.Add(new(2,OpCode.Move,R(register),new Immediate(0)));
+            if(shape=="shifted")back.Instructions.Add(new Instruction(2,OpCode.Add,R(register),R(register),new Immediate(4)){NativeArithmeticSize=8});
+            if(shape=="self-copy")back.Instructions.Add(new Instruction(2,OpCode.Move,R(register),R(register)){NativeRegisterCopySize=8});
+            if(shape is "nonvolatile-call" or "volatile-call")back.Instructions.Add(new(2,OpCode.CallVoid,new Immediate(0x1000)));
+            if(shape=="missing-entry-definition")back.Instructions.Add(Root(2,register));
+            graph.EntryBlock.Successors=[initial];initial.Predecessors=[graph.EntryBlock];initial.Successors=[loop];
+            loop.Predecessors=[initial,back];loop.Successors=[back,graph.ExitBlock];back.Predecessors=[loop];back.Successors=[loop];
+            graph.ExitBlock.Predecessors=[loop];graph.Blocks=[graph.EntryBlock,initial,loop,back,graph.ExitBlock];
+            if(shape=="nested")
+            {
+                var inner=new Block{ID=5};loop.Successors=[inner,graph.ExitBlock];inner.Predecessors=[loop,inner];
+                inner.Successors=[inner,back];back.Predecessors=[inner];graph.Blocks.Add(inner);
+            }
+            if(shape=="unreachable")
+            {
+                graph.EntryBlock.Successors=[graph.ExitBlock];graph.ExitBlock.Predecessors=[graph.EntryBlock];initial.Predecessors=[];
+            }
+            if(reverse)graph.Blocks.Reverse();
+            Arm64FrameAliasRecovery.Recover(graph,graph.Instructions.ToDictionary(i=>i,_=>-0x80));
+            Assert.That(read.Operands[1] is StackOffset,Is.EqualTo(expected),shape+" reversed="+reverse);
+            if(expected)Assert.That(read.Operands[1],Is.EqualTo(new StackOffset(0x38)));
+        }
+    }
+
     private static Register R(string name) => new(null, name);
     private static Instruction Root(int index = 0, string name = "X29") =>
         new(index, OpCode.Move, R(name), new AddressOf(new StackOffset(0x70))) { NativeRegisterCopySize = 8 };

@@ -149,6 +149,11 @@ public class StructArrayComponentTests
     public void GeneratedManagedIlReadsAndWritesActualElementStorage(bool store)
     {
         var (context, access, _) = Create(store, true, 36, 4);
+        // This isolated emitter fixture declares its CLR signature below and
+        // bypasses CreateAll, so explicitly identify its incoming values.
+        context.Locals.Single(l=>l.Name=="array").ParameterIndex=0;
+        context.Locals.Single(l=>l.Name=="index").ParameterIndex=1;
+        if(store)context.Locals.Single(l=>l.Name=="value").ParameterIndex=2;
         Assert.That(ArrayRecovery.RecoverStructComponents(context), Is.True);
         var field = (FieldReference)access.Operands[store ? 0 : 1];
         var vector = field.Field.DeclaringType;

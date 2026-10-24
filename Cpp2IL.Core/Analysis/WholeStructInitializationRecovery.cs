@@ -15,6 +15,7 @@ public static class WholeStructInitializationRecovery
     {
         if(method.AppContext.InstructionSet is not NewArmV8InstructionSet) return false;
         var graph=method.ControlFlowGraph!;
+        MarkZeroExtents(graph);
         var trace=System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_STRUCT_INIT_RVAS")?.Split(',')
             .Any(r=>string.Equals(r.Trim(),method.UnderlyingPointer.ToString("X"),System.StringComparison.OrdinalIgnoreCase))==true;
         if(trace)
@@ -83,7 +84,44 @@ public static class WholeStructInitializationRecovery
                 changed |= RecoverGroup(block,start,target.Storage,target.Type,(int)size);
             }
         }
+        changed |= AddressedStackFieldStoreRecovery.Recover(graph,targets.Select(t=>(t.Storage,t.Type)))>0;
         return changed;
+    }
+
+    // Keep byte coverage even if a shared generic return's managed type can
+    // only be resolved later from MethodInfo. DCE may remove unused sibling
+    // scalar slots before then. This annotates evidence, not a guessed type.
+    internal static void MarkZeroExtents(ISILControlFlowGraph graph)
+    {
+        foreach(var block in graph.Blocks)
+        {
+            var group=new List<(Instruction Store,int Offset,int Width)>();
+            void Flush()
+            {
+                foreach(var item in group)
+                {
+                    long cursor=item.Offset;
+                    while(true)
+                    {
+                        var next=group.Where(x=>x.Offset<=cursor && (long)x.Offset+x.Width>cursor)
+                            .Select(x=>(long)x.Offset+x.Width).DefaultIfEmpty(cursor).Max();
+                        if(next==cursor || next-item.Offset>256)break;
+                        cursor=next;
+                    }
+                    item.Store.NativeZeroSize=System.Math.Max(item.Store.NativeZeroSize,(int)(cursor-item.Offset));
+                }
+                group.Clear();
+            }
+            for(var index=0;index<block.Instructions.Count;index++)
+            {
+                var instruction=block.Instructions[index];
+                if(instruction is {OpCode:OpCode.Move,Operands:[Register slot,var value],NativeWriteSize:1 or 2 or 4 or 8 or 16}
+                    && Offset(slot,out var offset) && ZeroAt(block,index,value,instruction.NativeWriteSize))
+                    group.Add((instruction,offset,instruction.NativeWriteSize));
+                else Flush(); // No read, call, unknown write or control flow may be crossed.
+            }
+            Flush();
+        }
     }
 
     public static bool RecoverGroup(Block block,int start,Register storage,TypeAnalysisContext type,int size)
@@ -106,7 +144,12 @@ public static class WholeStructInitializationRecovery
             if(bytes.Count!=size) continue;
             stores[0].SetOperands(storage,new DefaultStructValue(type));
             stores[0].NativeWriteSize=0;
-            foreach(var other in stores.Skip(1)){other.OpCode=OpCode.Nop;other.SetOperands();other.NativeWriteSize=0;}
+            // The first chronological store can be only a 4-byte tail. Carry
+            // the FULL independently checked byte union, not that tail's old
+            // extent (and not any larger neighboring raw zero extent).
+            stores[0].NativeZeroSize=size;
+            foreach(var other in stores.Skip(1))
+            {other.OpCode=OpCode.Nop;other.SetOperands();other.NativeWriteSize=0;other.NativeZeroSize=0;}
             return true;
         }
         return false;
