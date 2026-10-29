@@ -20,11 +20,44 @@ public class Instruction : IOperand
                 return;
 
             field = value;
+            _arm64IndirectArgumentSnapshot = null;
             ResetSources();
         }
     }
 
     private List<IOperand> _operands;
+
+    // Ordered physical argument slots are established ONLY on a raw ARM64
+    // BR/BLR snapshot. SSA may substitute a value from another register into
+    // an existing slot; that does not change the slot's physical position.
+    // Keep a storage witness too: externally aliased constructor lists cannot
+    // silently reorder a previously certified snapshot.
+    private IOperand[]? _arm64IndirectArgumentSnapshot;
+
+    internal bool HasArm64IndirectArgumentSnapshot
+    {
+        get
+        {
+            if (OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump)
+                || _arm64IndirectArgumentSnapshot is not { Length: 18 } witness
+                || _operands.Count != 18) return false;
+            for (var i = 0; i < 18; i++)
+                if (!ReferenceEquals(_operands[i], witness[i])) return false;
+            return true;
+        }
+    }
+
+    internal bool MarkArm64IndirectArgumentSnapshot()
+    {
+        _arm64IndirectArgumentSnapshot = null;
+        if (OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump) || _operands.Count != 18)
+            return false;
+        for (var i = 0; i < 16; i++)
+            if (_operands[2 + i] is not Register r
+                || r.Name != (i < 8 ? "X" + i : "V" + (i - 8))) return false;
+        _arm64IndirectArgumentSnapshot = _operands.ToArray();
+        return true;
+    }
 
     public OperandList Operands => new(_operands);
 
@@ -47,6 +80,12 @@ public class Instruction : IOperand
     public int NativeFloatingPointSize;
     // Signedness is part of the comparison, not inferred from a C# type name.
     public bool UnsignedComparison;
+    // Proven native INTEGER comparison operand width; not the boolean result
+    // width or an inferred managed signedness. Zero means unknown.
+    public int NativeComparisonSize;
+    // Integer extension reads a low-bit VIEW of a GPR. Its conversion source
+    // type must not retag the entire producer local (which may have X users).
+    public bool NativeIntegerSourceView;
     // Width proven zero by native initialization or contiguous effect-free stack zero stores (not a scalar guess).
     public int NativeZeroSize;
     // Proven vtable/interface dispatch, distinct from a direct call to a virtual
@@ -58,6 +97,9 @@ public class Instruction : IOperand
     // Original direct native entry, captured before metadata replaces the raw
     // call operand. Not inferred from a generic definition's boxed wrapper.
     public ulong NativeDirectCallTarget;
+    // Exact pre-SSA result-storage extent, proved by unanimous native ABI or
+    // the call's own reaching MethodInfo and registered native entry.
+    public int NativeReturnStorageSize;
 
     public bool IsFallThrough =>
         OpCode switch
@@ -87,24 +129,30 @@ public class Instruction : IOperand
     [MemberNotNull(nameof(_operands))]
     public void SetOperands(params List<IOperand> operands)
     {
+        _arm64IndirectArgumentSnapshot = null;
         _operands = operands;
         ResetSources();
     }
 
     public void SetOperand(int index, IOperand value)
     {
+        var preserveSnapshot = HasArm64IndirectArgumentSnapshot;
         _operands[index] = value;
+        if (preserveSnapshot) _arm64IndirectArgumentSnapshot![index] = value;
+        else _arm64IndirectArgumentSnapshot = null;
         ResetSources();
     }
 
     public void AddOperands(IEnumerable<IOperand> operands)
     {
+        _arm64IndirectArgumentSnapshot = null;
         _operands.AddRange(operands);
         ResetSources();
     }
 
     public void RemoveOperandAt(int index)
     {
+        _arm64IndirectArgumentSnapshot = null;
         _operands.RemoveAt(index);
         ResetSources();
     }

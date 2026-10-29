@@ -27,6 +27,8 @@ public class SharedClassTestRecoveryTests
     [TestCase("wrong-null-object", 0)]
     [TestCase("value-source", 0)]
     [TestCase("byref-source", 0)]
+    [TestCase("extra-dead-object-read", 1)]
+    [TestCase("extra-dead-depth-read", 1)]
     public void SharedSnapshotsRequireEveryIncomingDefinitionAndPreserveBusinessEffects(string shape, int expected)
     {
         var app = TestGameLoader.LoadSimple2019Game(); var types = app.SystemTypes;
@@ -110,6 +112,10 @@ public class SharedClassTestRecoveryTests
         if (shape == "callback-after-reload") reload.Instructions.Add(callback);
         if (shape == "escaping-table") observableFailure.SetOperand(1, tableA);
         if (shape == "source-redefined") success.Instructions.Insert(0, new(35, OpCode.Move, obj, other));
+        if (shape == "extra-dead-object-read")
+            ancestorA.Instructions.Insert(0, new(40, OpCode.Move, Local("deadClass", classType), new MemoryOperand(other)) { NativeReadSize = 8 });
+        if (shape == "extra-dead-depth-read")
+            ancestorA.Instructions.Insert(0, new(40, OpCode.Move, Local("deadDepth"), new MemoryOperand(targetA, addend: 0x120)) { NativeReadSize = 1 });
         var method = new InjectedMethodAnalysisContext(types.SystemObjectType, "Caller", types.SystemBooleanType,
             MethodAttributes.Public | MethodAttributes.Static, []) { ControlFlowGraph = graph, ParameterLocals = [obj, other] };
         var original = graph.Instructions.ToArray(); var callCount = original.Count(i => i.IsCall);
@@ -120,6 +126,12 @@ public class SharedClassTestRecoveryTests
             Assert.That(graph.Instructions.Contains(operation), Is.True);
         Assert.That(graph.Blocks.Contains(success) && graph.Blocks.Contains(failure) && graph.Blocks.Contains(nullExit), Is.True);
         Assert.That(graph.Instructions.Any(i => i.OpCode == OpCode.CastClass), Is.False);
+        if (shape is "extra-dead-object-read" or "extra-dead-depth-read")
+        {
+            Assert.That(graph.Blocks.Contains(ancestorA), Is.True);
+            Assert.That(graph.Instructions.Any(i => i.Index == 40 && i.OpCode == OpCode.Move
+                && i.Operands[1] is MemoryOperand), Is.True, "extra possibly throwing read must remain intact");
+        }
         if (expected == 0) Assert.That(graph.Instructions, Is.EqualTo(original));
     }
 }

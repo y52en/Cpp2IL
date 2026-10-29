@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -29,6 +30,8 @@ public static class FlagConditionRecovery
     public static void Run(ISILControlFlowGraph cfg)
     {
         var defOf = BuildDefMap(cfg);
+        var ambiguous=cfg.Instructions.Where(i=>i.Destination is LocalVariable)
+            .GroupBy(i=>(LocalVariable)i.Destination!).Where(g=>g.Count()!=1).Select(g=>g.Key).ToHashSet();
 
         foreach (var block in cfg.Blocks)
         {
@@ -46,10 +49,50 @@ public static class FlagConditionRecovery
                 // Rewrite the condition's defining instruction in place into a single comparison.
                 // Its destination (the condition local the branch reads) is preserved.
                 var definition = defOf[condition];
+                var comparisonSize=ProveComparisonSize(condition,defOf,ambiguous,op0!,op1!);
                 definition.OpCode = relop;
                 definition.SetOperands(definition.Operands[0], op0!, op1!);
+                definition.NativeComparisonSize=comparisonSize;
             }
         }
+    }
+
+    // Preserve the originating operation's width before flag temporaries die.
+    // Do not follow input producers: an X-width comparison can consume values
+    // which happened to originate in W registers, and is still 64-bit.
+    internal static int ProveComparisonSize(LocalVariable condition,
+        Dictionary<LocalVariable,Instruction> definitions,HashSet<LocalVariable> ambiguous,
+        IOperand left,IOperand right)
+    {
+        var visited=new HashSet<LocalVariable>();var active=new HashSet<LocalVariable>();var widths=new HashSet<int>();
+        var found=false;
+        bool Same(IOperand a,IOperand b)=>ReferenceEquals(a,b)
+            || a is Immediate x && b is Immediate y && x.Value==y.Value;
+        bool Visit(IOperand value,int depth)
+        {
+            if(depth>32)return false;
+            if(Same(value,left)||Same(value,right)||value is Immediate)return true;
+            if(value is not LocalVariable local||ambiguous.Contains(local))return false;
+            if(active.Contains(local))return false;
+            if(!visited.Add(local))return true;
+            active.Add(local);
+            if(!definitions.TryGetValue(local,out var instruction))return false;
+            if(instruction.NativeComparisonSize!=0)
+            {
+                if(instruction.NativeComparisonSize is not (4 or 8))return false;
+                widths.Add(instruction.NativeComparisonSize);
+            }
+            if(instruction is {OpCode:OpCode.Subtract,Operands:[_,var a,var b]})
+            {
+                if(!Same(a,left)||!Same(b,right)||instruction.NativeArithmeticSize is not (4 or 8))return false;
+                widths.Add(instruction.NativeArithmeticSize);found=true;active.Remove(local);return true;
+            }
+            if(instruction.OpCode is not (OpCode.Not or OpCode.CheckEqual or OpCode.CheckLess
+                or OpCode.CheckNotEqual or OpCode.And or OpCode.Or or OpCode.Xor))return false;
+            var valid=instruction.Sources.All(source=>Visit(source,depth+1));
+            active.Remove(local);return valid;
+        }
+        return Visit(condition,0)&&found&&widths.Count==1?widths.Single():0;
     }
 
     private static Dictionary<LocalVariable, Instruction> BuildDefMap(ISILControlFlowGraph cfg)

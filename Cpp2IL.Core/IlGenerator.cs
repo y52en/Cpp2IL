@@ -313,6 +313,10 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Conv_R_Un);
                 instructions.Add(numericTarget.FullName switch
                 {
+                    "System.SByte" => CilOpCodes.Conv_I1,
+                    "System.Byte" => CilOpCodes.Conv_U1,
+                    "System.Int16" => CilOpCodes.Conv_I2,
+                    "System.UInt16" => CilOpCodes.Conv_U2,
                     "System.Int32" => CilOpCodes.Conv_I4,
                     "System.UInt32" => CilOpCodes.Conv_U4,
                     "System.Int64" => CilOpCodes.Conv_I8,

@@ -90,6 +90,7 @@ public static class MergedAllocationRecovery
                 {
                     ImplicitDefinition=instruction.ImplicitDefinition,NativeWriteSize=instruction.NativeWriteSize,
                     NativeReadSize=instruction.NativeReadSize,NativeArithmeticSize=instruction.NativeArithmeticSize,
+                    NativeComparisonSize=instruction.NativeComparisonSize,NativeIntegerSourceView=instruction.NativeIntegerSourceView,
                     NativeRegisterCopySize=instruction.NativeRegisterCopySize,NativeFloatingPointSize=instruction.NativeFloatingPointSize,
                     UnsignedComparison=instruction.UnsignedComparison,NativeZeroSize=instruction.NativeZeroSize,
                     NativeVirtualDispatch=instruction.NativeVirtualDispatch,NativeDirectCallTarget=instruction.NativeDirectCallTarget

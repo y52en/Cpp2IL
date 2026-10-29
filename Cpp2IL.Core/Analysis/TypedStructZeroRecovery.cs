@@ -14,12 +14,22 @@ public static class TypedStructZeroRecovery
         var count = 0;
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable { Type: { } type }, Immediate { Value: 0 }] }
+            if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable { Type: { } type }, var source] }
                 || !type.IsValueType || type.HasAnyGenericParameters() || TypeSizes.IsScalarValueType(type))continue;
+            if(source is DefaultStructValue initialized && TrivialConstructorRecovery.SameType(initialized.Type,type))continue;
+            if(source is not (Immediate {Value:0} or LocalVariable or DefaultStructValue))continue;
             var size=type is GenericInstanceTypeAnalysisContext
                 ? ClosedGenericValueLayout.TryGet(type,method.AppContext.Binary.PointerSizeBytes)?.Size??0
                 : TypeSizes.UnboxedSize(type,method.AppContext.Binary.PointerSizeBytes);
-            if(size is <=0 or >256 || instruction.NativeWriteSize!=size && instruction.NativeZeroSize<size)continue;
+            if(size is <=0 or >256)continue;
+            // NativeZeroSize is an independently checked original byte union,
+            // recorded before SSA/typing can turn a shared zero register into
+            // one particular aggregate. A partial vector store can therefore
+            // initialize a DIFFERENT full aggregate without copying that
+            // register's inferred managed type. Width alone only proves an
+            // immediate zero; an arbitrary local needs the full zero proof.
+            if(instruction.NativeZeroSize<size
+                && (source is not Immediate {Value:0} || instruction.NativeWriteSize!=size))continue;
             instruction.SetOperand(1, new DefaultStructValue(type));
             count++;
         }

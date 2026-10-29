@@ -53,9 +53,10 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         {
             var templates = new List<InlinedConstructorRecovery.Template>();
             var structural = new List<StructuralConstructorRecovery.Template>();
+            var baseInitializers = new List<ParameterizedBaseInitializerRecovery.Template>();
             if (type.IsValueType || type.BaseType==null || type.HasAnyGenericParameters()) continue;
             foreach (var ctor in type.Methods.Where(m => m.Name == ".ctor" && !m.IsStatic
-                && m.UnderlyingPointer != 0 && m.Parameters.Count is > 0 and <= 8))
+                && m.UnderlyingPointer != 0 && m.Parameters.Count <= 8))
             {
                 if (SkipAssemblyRecovery(type.DeclaringAssembly.Name + ".dll", ctor.UnderlyingPointer,
                     Environment.GetEnvironmentVariable("CPP2IL_RECOVERY_INCLUDE_FRAMEWORKS") == "1")) continue;
@@ -65,13 +66,21 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                     if (ctor.RawBytes.Length > 512) continue;
                     ctor.Analyze();
                     if (InlinedConstructorRecovery.Extract(ctor) is { } template) templates.Add(template);
-                    if (StructuralConstructorRecovery.Extract(ctor) is { } shape) structural.Add(shape);
+                    // Constant-only parameterless templates use the same complete
+                    // native base-call/store proof. Other template families keep
+                    // their existing nonempty-parameter input contract.
+                    if (ctor.Parameters.Count > 0)
+                    {
+                        if (StructuralConstructorRecovery.Extract(ctor) is { } shape) structural.Add(shape);
+                        if (ParameterizedBaseInitializerRecovery.Extract(ctor) is { } initializer) baseInitializers.Add(initializer);
+                    }
                 }
                 catch { /* Unproved constructors remain unmodified and diagnostic. */ }
                 finally { ctor.ReleaseAnalysisData(); }
             }
             type.PutExtraData(InlinedConstructorRecovery.CacheKey, templates.ToArray());
             type.PutExtraData(StructuralConstructorRecovery.CacheKey, structural.ToArray());
+            type.PutExtraData(ParameterizedBaseInitializerRecovery.CacheKey, baseInitializers.ToArray());
             count += templates.Count;
         }
         Logger.InfoNewline($"Prepared {count} pure field-initialization constructor templates.");
@@ -110,8 +119,10 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             MergedAllocationRecovery.Run(methodContext);
             ArgumentForwardingConstructorRecovery.Run(methodContext);
             ConstantFieldConstructorRecovery.Run(methodContext);
+            ParameterizedBaseInitializerRecovery.Run(methodContext);
             EmptyObjectBaseConstructorRecovery.Run(methodContext);
             ConstructorPrologueRecovery.Run(methodContext);
+            ZeroStateConstructorRecovery.Run(methodContext);
             // Constructor reconstruction consumes allocation-adjacent stores;
             // do not hide those stores behind setters before it has run.
             InlinedFieldMethodRecovery.Run(methodContext);

@@ -14,6 +14,8 @@ public class InterfaceLookupMetadataPhiTests
     [TestCase("not-approved-incoming", false)]
     [TestCase("no-matched-load", false)]
     [TestCase("effectful-incoming", false)]
+    [TestCase("known-defined-metadata", true)]
+    [TestCase("unknown-defined-metadata", false)]
     [TestCase("cycle", false)]
     public void IgnoredRawIncomingRequiresActualMatchedMetadataLoad(string shape, bool expected)
     {
@@ -32,6 +34,8 @@ public class InterfaceLookupMetadataPhiTests
             {[matched]=new(){ID=20},[phi]=new(){ID=21}};
         if(shape=="effectful-incoming")
             definitions[incoming]=new(3,OpCode.Move,incoming,new MemoryOperand(foreign));
+        if(shape is "known-defined-metadata" or "unknown-defined-metadata")
+            definitions[incoming]=new(3,OpCode.Move,incoming,new MemoryOperand(foreign));
         if(shape=="cycle")phi.SetOperand(2,merged);
         // The default metadata-only recognizer must continue rejecting raw
         // registers, even when the stronger hidden-operand proof can opt in.
@@ -39,7 +43,8 @@ public class InterfaceLookupMetadataPhiTests
             merged,definitions,homes,[matched]),Is.False);
         Assert.That(InterfaceDispatchRecovery.IsMatchedLookupMetadataPhi(
             merged,definitions,homes,[matched],
-            local=>ReferenceEquals(local,incoming)&&shape!="not-approved-incoming"),Is.EqualTo(expected));
+            local=>ReferenceEquals(local,incoming)&&shape!="not-approved-incoming",
+            local=>ReferenceEquals(local,incoming)&&shape=="known-defined-metadata"),Is.EqualTo(expected));
     }
 
     [Test]

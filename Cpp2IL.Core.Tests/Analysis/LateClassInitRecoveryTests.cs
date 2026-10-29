@@ -10,6 +10,40 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class LateClassInitRecoveryTests
 {
+    [TestCase(false)] [TestCase(true)]
+    public void CachedBatchMatchesFreshDefinitionsAfterEachSuccessfulRemoval(bool callbackInSecondRegion)
+    {
+        var types=TestGameLoader.LoadSimple2019Game().SystemTypes;
+        var metadata=new RuntimeClassTypeAnalysisContext(types.SystemObjectType,types.SystemObjectType.DeclaringAssembly);
+        ISILControlFlowGraph Build()
+        {
+            var code=new List<Instruction>();
+            for(var n=0;n<2;n++)
+            {
+                var klass=new LocalVariable("klass"+n,new Register(null,"klass"+n),metadata);
+                var bit=new LocalVariable("bit"+n,new Register(null,"bit"+n));
+                var flag=new LocalVariable("flag"+n,new Register(null,"flag"+n),types.SystemBooleanType);
+                var result=new LocalVariable("result"+n,new Register(null,"result"+n));
+                var effect=new Instruction(n*20+9,OpCode.CallVoid,new StringLiteral("effect"+n));
+                code.AddRange([new(n*20,OpCode.Move,klass,metadata),
+                    new(n*20+1,OpCode.And,bit,new MemoryOperand(klass,addend:0x126),new Immediate(1)),
+                    new(n*20+2,OpCode.CheckNotEqual,flag,bit,new Immediate(0)),
+                    new(n*20+3,OpCode.ConditionalJump,effect,flag)]);
+                if(n==1 && callbackInSecondRegion)code.Add(new(n*20+4,OpCode.CallVoid,new StringLiteral("callback")));
+                code.AddRange([new(n*20+6,OpCode.Call,new Immediate(0x100+n*8),result,metadata),new(n*20+7,OpCode.Jump,effect),effect]);
+            }
+            code.Add(new(50,OpCode.Return));return new ISILControlFlowGraph(code);
+        }
+        var fresh=Build();var cached=Build();var before=0;
+        foreach(var guard in fresh.Blocks.ToArray())if(LateClassInitRecovery.TryRecover(fresh,guard,0x126,_=>true))before++;
+        var after=LateClassInitRecovery.RecoverGuards(cached,0x126,_=>true);
+        Assert.That(before,Is.EqualTo(callbackInSecondRegion?1:2));Assert.That(after,Is.EqualTo(before));
+        string Snapshot(ISILControlFlowGraph graph)=>string.Join("\n",graph.Blocks.Select(b=>b.ID+":"+
+            string.Join(",",b.Successors.Select(s=>s.ID))+":"+string.Join(",",b.Instructions.Select(i=>i.Index+"/"+i.OpCode))));
+        Assert.That(Snapshot(cached),Is.EqualTo(Snapshot(fresh)));
+        Assert.That(cached.Instructions.Count(i=>i.OpCode==OpCode.CallVoid && i.Operands[0] is StringLiteral {Value:"effect0" or "effect1"}),Is.EqualTo(2));
+    }
+
     [TestCase("valid",true)]
     [TestCase("inverted",true)]
     [TestCase("callback",false)]

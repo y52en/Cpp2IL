@@ -3,6 +3,7 @@ using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -11,6 +12,21 @@ namespace Cpp2IL.Core.Analysis;
 // Never generalize this to an unsealed class, interface, array or value type.
 public static class SealedClassCastRecovery
 {
+    // A closed metadata-backed generic sealed class is just as exact a native
+    // class identity as a non-generic sealed class. Open/partial/malformed
+    // instantiations are not proof, even when their definition is sealed.
+    private static bool ClosedTarget(TypeAnalysisContext target)
+    {
+        if (target is not GenericInstanceTypeAnalysisContext generic)
+            return target.GenericParameters.Count == 0 && !target.IsGenericInstance;
+        return generic.GenericType.Definition != null && !generic.GenericType.IsGenericInstance
+            && generic.GenericArguments.Count > 0
+            && generic.GenericArguments.Count == generic.GenericType.GenericParameters.Count
+            && !generic.HasAnyGenericParameters()
+            && generic.GenericArguments.All(a => a is not PointerTypeAnalysisContext
+                and not ByRefTypeAnalysisContext and not RuntimeClassTypeAnalysisContext
+                and not RuntimeMethodInfoAnalysisContext and not RuntimeFieldInfoAnalysisContext);
+    }
     public static int Run(MethodAnalysisContext method)
     {
         if (method.AppContext.InstructionSet is not Cpp2IL.Core.InstructionSets.NewArmV8InstructionSet
@@ -34,7 +50,7 @@ public static class SealedClassCastRecovery
             || !ReferenceEquals(testedClass, klass) || !target.IsSealed || target.IsValueType || target.IsInterface
             || target is SzArrayTypeAnalysisContext or PointerTypeAnalysisContext or ByRefTypeAnalysisContext
                 or RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
-            || target.GenericParameters.Count != 0 || target.IsGenericInstance
+            || !ClosedTarget(target)
             || source.Type is not { IsValueType: false }
             || source.Type is PointerTypeAnalysisContext or ByRefTypeAnalysisContext or RuntimeClassTypeAnalysisContext
             || check[^1] is not { OpCode: OpCode.ConditionalJump, Operands: [Block branch, var condition] }

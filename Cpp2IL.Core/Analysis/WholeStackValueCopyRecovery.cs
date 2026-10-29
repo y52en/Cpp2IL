@@ -7,6 +7,7 @@ using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
+using LibCpp2IL.Elf;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -29,21 +30,27 @@ public static class WholeStackValueCopyRecovery
             if (call is not { OpCode: OpCode.Call, Operands: [Immediate address, Register storage, ..] }
                 || !Offset(storage, out _) || !method.AppContext.MethodsByAddress.TryGetValue(address.UnsignedValue, out var targets)
                 || targets.Count == 0) continue;
-            var size = resolver.ReturnStorageSize(targets[0]);
-            if (size is <= 16 or > 4096 || targets.Any(t => !resolver.ReturnsViaHiddenBuffer(t)
+            var size = call.NativeReturnStorageSize>0?call.NativeReturnStorageSize:resolver.ReturnStorageSize(targets[0]);
+            if (size is <= 16 or > 4096 || call.NativeReturnStorageSize<=0 && targets.Any(t => !resolver.ReturnsViaHiddenBuffer(t)
                     || resolver.HiddenReturnBufferRegister(t)?.Name != "X8"
                     || resolver.ReturnStorageSize(t) != size)) continue;
-            if (Recover(graph, block, block.Instructions.IndexOf(call) + 1, storage, (int)size)) changed++;
+            if (Recover(graph, block, block.Instructions.IndexOf(call) + 1, storage, (int)size,
+                slot=>method.AppContext.Binary is ElfFile elf&&elf.IsGlobalOffsetTableEntry(slot))) changed++;
         }
         return changed;
     }
 
     public static bool Recover(ISILControlFlowGraph graph, Block firstBlock, int start, Register storage, int size)
+        =>Recover(graph,firstBlock,start,storage,size,null);
+
+    public static bool Recover(ISILControlFlowGraph graph, Block firstBlock, int start, Register storage, int size,
+        Func<ulong,bool>? readableGot)
     {
         if (size is <= 0 or > 4096 || !Offset(storage, out var basis)) return false;
         var chunks = new Dictionary<string, Chunk>();
         var loads = new HashSet<Instruction>();
         var stores = new List<Instruction>();
+        var independent = new HashSet<Instruction>();
         var covered = new HashSet<int>();
         var visited = new HashSet<Block>();
         int? destination = null;
@@ -72,11 +79,13 @@ public static class WholeStackValueCopyRecovery
                         if (!covered.Add(b)) return false;
                     stores.Add(instruction); loads.Add(chunk.Load);
                     if (covered.Count != size) continue;
-                    // Stores must be one uninterrupted copy: no intervening read
-                    // can observe a partially changed destination during collapse.
+                    // Only disjoint source reads and proved independent register/
+                    // mapped-GOT moves may interleave. No intervening operation
+                    // can observe a partially changed destination or alter source.
                     var firstStore = block.Instructions.IndexOf(stores[0]);
                     if (firstStore < 0 || block.Instructions.Skip(firstStore).Take(index - firstStore + 1)
-                        .Any(i => i.OpCode != OpCode.Nop && !stores.Contains(i))) return false;
+                        .Any(i => i.OpCode != OpCode.Nop && !stores.Contains(i)
+                            && !loads.Contains(i) && !independent.Contains(i))) return false;
                     var destinationRegister = (Register)stores[0].Operands[0];
                     // The first physical store may be the last chunk (ARM64
                     // commonly stores +32 before +0). Use the proven base.
@@ -104,7 +113,17 @@ public static class WholeStackValueCopyRecovery
                     chunks[destinationRegisterRead.Name] = new(destinationRegisterRead, offset,
                         instruction.NativeReadSize, instruction);
                 }
-                else if (stores.Count != 0) return false;
+                else if (stores.Count != 0)
+                {
+                    var interleavedValue=instruction.Operands[1];
+                    var pure=instruction.NativeReadSize==0&&instruction.NativeWriteSize==0
+                        &&(interleavedValue is Immediate || interleavedValue is Register value&&!Offset(value,out _));
+                    var got=instruction.NativeReadSize==8&&instruction.NativeWriteSize==0
+                        &&interleavedValue is MemoryOperand{Base:null,Index:null,Scale:0} cell
+                        &&readableGot?.Invoke(unchecked((ulong)cell.Addend))==true;
+                    if(!pure&&!got)return false;
+                    independent.Add(instruction);
+                }
             }
             if (scanned > 96 || stores.Count != 0 || block.Successors.Count != 1
                 || block.Successors[0].Predecessors.Count != 1) return false;

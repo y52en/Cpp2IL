@@ -52,8 +52,17 @@ public static class RuntimeCheckedCastRecovery
             || ReferenceEquals(nullExit, guard) || !before.Successors.Contains(nullExit)
             || cfg.Instructions.Count(i => ReferenceEquals(i.Destination, nullFlag)) != 1) return false;
         var nullBody = nullExit.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
-        if (nullBody is not [Instruction { OpCode: OpCode.Throw, Operands: [TypeAnalysisContext { FullName: "System.NullReferenceException" }] }]
-            || nullExit.Successors.Count != 1 || !ReferenceEquals(nullExit.Successors[0], cfg.ExitBlock)) return false;
+        // The inspected IntrospectionExtensions.GetTypeInfo also uses this
+        // exact non-null cast guard, but returns null on the preceding null
+        // edge. Keep that edge and its return intact. It is not a merge into
+        // success, an arbitrary return value, or a nullable value-type result.
+        var nullThrows = nullBody is [Instruction { OpCode: OpCode.Throw,
+            Operands: [TypeAnalysisContext { FullName: "System.NullReferenceException" }] }];
+        var nullReturns = nullBody is [Instruction { OpCode: OpCode.Return,
+            Operands: [Immediate { Value: 0 }] }]
+            && NullBypassRuntimeCastRecovery.ReferenceType(method.ReturnType);
+        if ((!nullThrows && !nullReturns) || nullExit.Successors.Count != 1
+            || !ReferenceEquals(nullExit.Successors[0], cfg.ExitBlock)) return false;
         if (!InlineClassTestRecovery.StableSource(method, source, guard)) return false;
 
         var body = failure.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();

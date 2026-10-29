@@ -13,6 +13,25 @@ namespace Cpp2IL.Core.Analysis;
 // a unique metadata signature authorize replacing the synthetic destination.
 public static class HiddenStructReturnRecovery
 {
+    internal static MethodAnalysisContext? ExactZeroArgumentTarget(MethodAnalysisContext caller,Block block,int before,
+        ulong address,IReadOnlyList<MethodAnalysisContext> targets,
+        System.Func<ulong,MethodAnalysisContext?>? metadata=null,System.Func<ulong,ulong?>? got=null)
+    {
+        if(targets.Count==0 || targets.Any(target=>target.Parameters.Count!=0)
+            || targets.Any(target=>target.IsStatic!=targets[0].IsStatic))return null;
+        var infoRegister=new Register(null,targets[0].IsStatic?"X0":"X1");
+        var method=RawHiddenMethodInfoRecovery.Resolve(caller,block,before,infoRegister,metadata,got);
+        if(method==null || System.Object.ReferenceEquals(method,caller) || method.Parameters.Count!=0
+            || method.IsStatic!=targets[0].IsStatic || method.ReturnType.HasAnyGenericParameters())return null;
+        static MethodAnalysisContext Base(MethodAnalysisContext value)
+            =>value is ConcreteGenericMethodAnalysisContext concrete?concrete.BaseMethodContext:value;
+        if(!targets.Any(target=>System.Object.ReferenceEquals(Base(target),Base(method))))return null;
+        // MetadataUsage may hold the exact real MethodSpec without copying its
+        // native pointer. Require the existing registered full-identity proof;
+        // a display name or an inferred return size cannot authorize this path.
+        return MetadataResolver.UnmappedNativeEntryMatches(method,address)?method:null;
+    }
+
     public static bool Run(MethodAnalysisContext method)
     {
         if (method.AppContext.InstructionSet is not NewArmV8InstructionSet) return false;
@@ -24,19 +43,32 @@ public static class HiddenStructReturnRecovery
         {
             if(call.OpCode!=OpCode.Call || call.Operands[0] is not Immediate address
                 || !method.AppContext.MethodsByAddress.TryGetValue(address.UnsignedValue,out var targets)
-                || targets.Count==0 || !resolver.ReturnsViaHiddenBuffer(targets[0])) continue;
+                || targets.Count==0) continue;
             // ICF/shared generic aliases do not identify a declaring type, but
             // ALL candidates can prove the same native result-storage ABI.
             // Leave the concrete target/type to the separate MethodInfo pass.
-            var buffer=resolver.HiddenReturnBufferRegister(targets[0]);
-            var size=resolver.ReturnStorageSize(targets[0]);
-            if(buffer is not { } register
-                || targets.Any(target=>!resolver.ReturnsViaHiddenBuffer(target)
+            var signature=targets[0];
+            var size=resolver.ReturnStorageSize(signature);
+            var unanimous=resolver.ReturnsViaHiddenBuffer(signature)
+                && targets.All(target=>resolver.ReturnsViaHiddenBuffer(target)
+                    && resolver.HiddenReturnBufferRegister(target)?.Name==resolver.HiddenReturnBufferRegister(signature)?.Name
+                    && resolver.ReturnStorageSize(target)==size);
+            if(!unanimous)
+            {
+                var exact=ExactZeroArgumentTarget(method,block,block.Instructions.IndexOf(call),address.UnsignedValue,targets);
+                if(exact==null||!resolver.ReturnsViaHiddenBuffer(exact))continue;
+                signature=exact;
+                size=resolver.ReturnStorageSize(signature);
+            }
+            var buffer=resolver.HiddenReturnBufferRegister(signature);
+            if(size is <=16 or >4096 || buffer is not { } register
+                || unanimous && targets.Any(target=>!resolver.ReturnsViaHiddenBuffer(target)
                     || resolver.HiddenReturnBufferRegister(target)?.Name!=register.Name
                     || resolver.ReturnStorageSize(target)!=size)
                 || ResolveStackAddress(block,block.Instructions.IndexOf(call),register) is not { } storage) continue;
             call.Destination=storage;
             call.ImplicitDefinition=new Register(null,"X0");
+            call.NativeReturnStorageSize=(int)size;
             changed=true;
         }
         return changed;

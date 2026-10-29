@@ -10,6 +10,53 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class MethodInfoTailRecoveryTests
 {
+    [TestCase("same-vector", true)]
+    [TestCase("nested-vector", true)]
+    [TestCase("different-element", false)]
+    [TestCase("same-name-impostor", false)]
+    [TestCase("rank-one-array", false)]
+    [TestCase("wrong-hidden-method", false)]
+    public void TailReturnWrappersRequireExactMetadataAndHiddenMethod(string shape, bool expected)
+    {
+        var app=TestGameLoader.LoadSimple2019Game(); app.InstructionSet=new NewArmV8InstructionSet();
+        var owner=app.SystemTypes.SystemObjectType;
+        var element=app.SystemTypes.SystemStringType;
+        TypeAnalysisContext targetReturn=new SzArrayTypeAnalysisContext(element);
+        TypeAnalysisContext callerReturn=shape switch {
+            "different-element"=>new SzArrayTypeAnalysisContext(owner),
+            "same-name-impostor"=>new SzArrayTypeAnalysisContext(new InjectedTypeAnalysisContext(
+                element.DeclaringAssembly,element.Namespace,element.Name,owner,TypeAttributes.Public)),
+            "rank-one-array"=>new ArrayTypeAnalysisContext(element,1),
+            _=>new SzArrayTypeAnalysisContext(element)
+        };
+        if(shape=="nested-vector") {
+            callerReturn=new SzArrayTypeAnalysisContext(callerReturn);
+            targetReturn=new SzArrayTypeAnalysisContext(targetReturn);
+        }
+        var target=new InjectedMethodAnalysisContext(owner,"ArrayTarget",targetReturn,MethodAttributes.Public,[]);
+        var method=new InjectedMethodAnalysisContext(owner,"ArrayCaller",callerReturn,MethodAttributes.Public|MethodAttributes.Static,[]);
+        var info=new RuntimeMethodInfoAnalysisContext(target,owner.DeclaringAssembly);
+        var hidden=shape=="wrong-hidden-method"?new RuntimeMethodInfoAnalysisContext(
+            new InjectedMethodAnalysisContext(owner,"Other",targetReturn,MethodAttributes.Public,[]),owner.DeclaringAssembly):info;
+        var receiver=new LocalVariable("receiver",new Register(null,"X0"),owner);
+        var jump=new Instruction(0,OpCode.IndirectJump,new MemoryOperand(info),receiver);
+        var args=new List<IOperand>{receiver,hidden};
+        args.AddRange(Enumerable.Range(2,6).Select(i=>(IOperand)new LocalVariable("arg"+i,new Register(null,"X"+i))));
+        args.AddRange(Enumerable.Range(0,8).Select(i=>(IOperand)new LocalVariable("fp"+i,new Register(null,"V"+i))));
+        jump.AddOperands(args);
+        method.ControlFlowGraph=new([jump]);method.Locals=[receiver];method.ParameterLocals=[];method.AnalysisWarnings=[];
+        Assert.That(MethodInfoTailRecovery.Recover(method),Is.EqualTo(expected));
+        if(!expected) {
+            Assert.That(jump.OpCode,Is.EqualTo(OpCode.IndirectJump));
+            Assert.That(method.ControlFlowGraph.Instructions.Any(i=>i.OpCode==OpCode.Return),Is.False);
+            return;
+        }
+        Assert.That(jump.Operands[0],Is.SameAs(target));
+        Assert.That(jump.Destination,Is.Not.SameAs(receiver));
+        Assert.That(method.ControlFlowGraph.Instructions.Single(i=>i.OpCode==OpCode.Return).Operands.Single(),Is.SameAs(jump.Destination));
+        Assert.That(MethodInfoTailRecovery.Recover(method),Is.False);
+    }
+
     [TestCase("reference", true)]
     [TestCase("integer", true)]
     [TestCase("void", true)]

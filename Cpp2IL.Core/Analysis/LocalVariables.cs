@@ -244,7 +244,7 @@ public static class LocalVariables
                 Operands: [LocalVariable destination, TypeAnalysisContext targetType, TypeAnalysisContext sourceType, var source] })
             {
                 destination.Type = targetType; // exact native conversion contract, not a copy's inferred type
-                if (source is LocalVariable sourceLocal) SetTypeIfUnknown(sourceLocal, sourceType);
+                if (!instruction.NativeIntegerSourceView && source is LocalVariable sourceLocal) SetTypeIfUnknown(sourceLocal, sourceType);
             }
         foreach(var instruction in method.ControlFlowGraph.Instructions)
             if(instruction is {OpCode:OpCode.Absolute,NativeFloatingPointSize:4 or 8,

@@ -77,7 +77,11 @@ public class DominatorInfo
             Dominators[block] = dominators;
         }
 
-        var remaining = new Stack<Block>(graph.Blocks);
+        // Keep the same monotone intersection fixpoint. A changed predecessor
+        // need not enqueue a block that is already scheduled; large joins used
+        // to accumulate duplicate stack entries and repeat identical set work.
+        var remaining = new Queue<Block>(graph.Blocks);
+        var scheduled = new HashSet<Block>(graph.Blocks);
         var tempDoms = new HashSet<Block>();
 
 #if NET5_0_OR_GREATER
@@ -87,7 +91,8 @@ public class DominatorInfo
         // Get dominators
         while (remaining.Count > 0)
         {
-            var block = remaining.Pop();
+            var block = remaining.Dequeue();
+            scheduled.Remove(block);
 
             if (block == graph.EntryBlock)
                 continue;
@@ -117,7 +122,7 @@ public class DominatorInfo
 
                 foreach (var successor in block.Successors)
                 {
-                    remaining.Push(successor);
+                    if(scheduled.Add(successor))remaining.Enqueue(successor);
                 }
             }
         }

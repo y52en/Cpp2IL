@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -12,7 +13,8 @@ namespace Cpp2IL.Core.Analysis;
 public static class InlinedFieldMethodRecovery
 {
     public const string CacheKey = "NativeInlineFieldMethodTemplates";
-    public sealed record Store(FieldAnalysisContext Field, int Parameter, Immediate? Constant = null);
+    public sealed record Store(FieldAnalysisContext Field, int Parameter, IOperand? Constant = null)
+    { public int NativeWidth {get;init;} }
     public sealed record Template(MethodAnalysisContext Method, Store[] Stores,
         MethodAnalysisContext? Tail, int[] TailParameters, bool TailVirtualDispatch = false);
 
@@ -24,22 +26,25 @@ public static class InlinedFieldMethodRecovery
         return false;
     }
 
-    static bool ProvenConstant(TypeAnalysisContext type,Immediate value)
+    static bool ProvenConstant(TypeAnalysisContext type,IOperand value)
     {
-        if(!type.IsValueType)return value.Value==0;
+        if(value is FloatLiteral)return type.FullName=="System.Single";
+        if(value is DoubleLiteral)return type.FullName=="System.Double";
+        if(value is not Immediate immediate)return false;
+        if(!type.IsValueType)return immediate.Value==0;
         if(type.IsEnumType)
         {
             if(type.EnumUnderlyingType is not {} underlying)return false;
             type=underlying;
         }
         return type.FullName switch {
-            "System.Boolean" => value.Value is 0 or 1,
-            "System.SByte" => value.Value is >=sbyte.MinValue and <=sbyte.MaxValue,
-            "System.Byte" => value.Value is >=byte.MinValue and <=byte.MaxValue,
-            "System.Int16" => value.Value is >=short.MinValue and <=short.MaxValue,
-            "System.UInt16" => value.Value is >=ushort.MinValue and <=ushort.MaxValue,
-            "System.Int32" => value.Value is >=int.MinValue and <=int.MaxValue,
-            "System.UInt32" => value.Value is >=0 and <=uint.MaxValue,
+            "System.Boolean" => immediate.Value is 0 or 1,
+            "System.SByte" => immediate.Value is >=sbyte.MinValue and <=sbyte.MaxValue,
+            "System.Byte" => immediate.Value is >=byte.MinValue and <=byte.MaxValue,
+            "System.Int16" => immediate.Value is >=short.MinValue and <=short.MaxValue,
+            "System.UInt16" => immediate.Value is >=ushort.MinValue and <=ushort.MaxValue,
+            "System.Int32" => immediate.Value is >=int.MinValue and <=int.MaxValue,
+            "System.UInt32" => immediate.Value is >=0 and <=uint.MaxValue,
             "System.Int64" or "System.UInt64" => true,
             _ => false };
     }
@@ -100,13 +105,15 @@ public static class InlinedFieldMethodRecovery
                 && !field.Field.IsStatic && field.Field.Offset >= 0 && field.Offset == field.Field.Offset
                 && !stores.Any(s => s.Field == field.Field))
             {
-                if(argument is Immediate constant && ProvenConstant(field.Field.FieldType,constant))
-                    stores.Add(new(field.Field,-1,constant));
+                if(argument is FloatLiteral or DoubleLiteral
+                    && instruction.NativeWriteSize!=(argument is FloatLiteral?4:8))return null;
+                if(argument is Immediate or FloatLiteral or DoubleLiteral && ProvenConstant(field.Field.FieldType,argument))
+                    stores.Add(new(field.Field,-1,argument){NativeWidth=instruction.NativeWriteSize});
                 else if(argument is LocalVariable local)
                 {
                     var index=parameters.IndexOf(local);
                     if(index<0 || !TrivialConstructorRecovery.SameType(local.Type,field.Field.FieldType))return null;
-                    stores.Add(new(field.Field,index));
+                    stores.Add(new(field.Field,index){NativeWidth=instruction.NativeWriteSize});
                 }
                 else return null;
             }
@@ -160,6 +167,47 @@ public static class InlinedFieldMethodRecovery
     }
 
     public static int Run(MethodAnalysisContext caller)
+        => Recover(caller,caller.AppContext.UnityVersion.Major==2018 && caller.AppContext.UnityVersion.Minor==4
+            && caller.AppContext.Binary.PointerSizeBytes==8
+            && caller.AppContext.InstructionSet is Cpp2IL.Core.InstructionSets.NewArmV8InstructionSet);
+
+    private static int ScalarWidth(FieldAnalysisContext field)
+    {
+        var raw=field.BackingData?.Field.RawFieldType;
+        if(raw!=null && (raw.NumMods!=0 || raw.Byref!=0 || raw.Pinned!=0))return 0;
+        if(field.IsStatic || (field.Attributes&FieldAttributes.InitOnly)!=0)return 0;
+        var type=field.FieldType.IsEnumType?field.FieldType.EnumUnderlyingType:field.FieldType;
+        return type?.FullName switch {
+            "System.Boolean" or "System.Byte" or "System.SByte"=>1,
+            "System.Char" or "System.Int16" or "System.UInt16"=>2,
+            "System.Int32" or "System.UInt32" or "System.Single"=>4,
+            "System.Int64" or "System.UInt64" or "System.Double"=>8,_=>0};
+    }
+
+    private static bool IndependentScalarStores(Template template)
+    {
+        var owner=template.Method.DeclaringType!;var seen=new HashSet<TypeAnalysisContext>();
+        for(var type=owner;type!=null;type=type.BaseType)
+        {
+            if(seen.Count>=32 || !seen.Add(type) || type.IsValueType || type.HasAnyGenericParameters()
+                || (type.Attributes&TypeAttributes.LayoutMask)==TypeAttributes.ExplicitLayout
+                || type.Methods.Any(m=>m.Name==".cctor" || m.Name=="Finalize"
+                    && !ReferenceEquals(type,owner.AppContext.SystemTypes.SystemObjectType)))return false;
+        }
+        var fields=new HashSet<FieldAnalysisContext>();var ranges=new List<(long Start,long End)>();
+        foreach(var store in template.Stores)
+        {
+            var field=store.Field;var width=ScalarWidth(field);
+            if(width==0 || store.NativeWidth!=width || field.Offset<16 || !fields.Add(field)
+                || !seen.Contains(field.DeclaringType))return false;
+            var start=(long)field.Offset;var end=start+width;
+            if(ranges.Any(r=>start<r.End && r.Start<end))return false;
+            ranges.Add((start,end));
+        }
+        return fields.Count>0;
+    }
+
+    internal static int Recover(MethodAnalysisContext caller,bool allowScalarReordering)
     {
         // Constructor bodies have their own base/allocation reconstruction.
         // Their own fields are already accessible; leave that evidence intact.
@@ -176,16 +224,30 @@ public static class InlinedFieldMethodRecovery
                 var matches = new List<(Template Template, IOperand[] Arguments, int Length)>();
                 foreach (var template in templates.Where(t => t.Method != caller))
                 {
+                    // LLVM may commute independent scalar stores while
+                    // inlining. Reference writes, unknown widths, overlaps,
+                    // custom modifiers and class/finalizer effects never use
+                    // this path. Argument expressions remain precomputed.
+                    var reorder=allowScalarReordering && IndependentScalarStores(template);
                     var length = template.Stores.Length + (template.Tail == null ? 0 : 1);
                     if (index + length > instructions.Length) continue;
                     var arguments = new IOperand[template.Method.Parameters.Count];
                     var valid = true;
                     for (var n = 0; n < template.Stores.Length; n++)
                     {
-                        var store = template.Stores[n];
                         if (instructions[index + n] is not { OpCode: OpCode.Move, Operands: [FieldReference actual, var value] }
-                            || actual.Local != field.Local || actual.Parent != null || actual.Offset != store.Field.Offset || actual.Field != store.Field
-                            || value is not (LocalVariable or Immediate)) { valid = false; break; }
+                            || actual.Local != field.Local || actual.Parent != null
+                            || value is not (LocalVariable or Immediate or FloatLiteral or DoubleLiteral)) { valid = false; break; }
+                        var store=reorder?template.Stores.SingleOrDefault(s=>ReferenceEquals(s.Field,actual.Field)):template.Stores[n];
+                        if(store==null || actual.Offset!=store.Field.Offset || actual.Field!=store.Field
+                            || reorder && instructions[index+n].NativeWriteSize!=store.NativeWidth)
+                        {valid=false;break;}
+                        if(value is FloatLiteral or DoubleLiteral
+                            && (!ProvenConstant(actual.Field.FieldType,value) || store.NativeWidth!=ScalarWidth(actual.Field)
+                                || instructions[index+n].NativeWriteSize!=store.NativeWidth))
+                        {valid=false;break;}
+                        if(reorder && instructions.Skip(index).Take(n).Any(i=>i.Operands[0] is FieldReference previousField
+                            && ReferenceEquals(previousField.Field,actual.Field))) {valid=false;break;}
                         if(store.Constant is {} constant)
                         {
                             if(!Same(constant,value)){valid=false;break;}
@@ -216,6 +278,9 @@ public static class InlinedFieldMethodRecovery
         return count;
     }
 
-    static bool Same(IOperand a, IOperand b) => ReferenceEquals(a, b)
-        || a is Immediate x && b is Immediate y && Equals(x.Value, y.Value);
+    static bool Same(IOperand a, IOperand b) => ReferenceEquals(a, b) || (a,b)switch {
+        (Immediate x,Immediate y)=>x.Value==y.Value,
+        (FloatLiteral x,FloatLiteral y)=>BitConverter.SingleToInt32Bits(x.Value)==BitConverter.SingleToInt32Bits(y.Value),
+        (DoubleLiteral x,DoubleLiteral y)=>BitConverter.DoubleToInt64Bits(x.Value)==BitConverter.DoubleToInt64Bits(y.Value),
+        _=>false};
 }

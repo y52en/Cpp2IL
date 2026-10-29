@@ -26,7 +26,19 @@ public static class FloatLiteralRecovery
                 for(var index=1;index<instruction.Operands.Count;index++)TryConvert(instruction,index,type,true);
             }
             if (instruction.OpCode == OpCode.Move && instruction.Operands is [FieldReference field, _])
-                TryConvert(instruction, 1, field.Field.FieldType);
+            {
+                // A scalar field type proves only its own bytes. Preserve the
+                // original integer bits when a wider/partial native write could
+                // include adjacent fields. Packed recovery must prove coverage.
+                var width = field.Field.FieldType.FullName switch
+                {
+                    "System.Single" => 4,
+                    "System.Double" => 8,
+                    _ => 0
+                };
+                if (width == 0 || instruction.NativeWriteSize == 0 || instruction.NativeWriteSize == width)
+                    TryConvert(instruction, 1, field.Field.FieldType);
+            }
             else if (instruction.OpCode == OpCode.Move && instruction.Operands is [LocalVariable { Type: { } localType }, _])
                 TryConvert(instruction, 1, localType);
             else if (instruction.IsCall && instruction.Operands is [MethodAnalysisContext target, ..])

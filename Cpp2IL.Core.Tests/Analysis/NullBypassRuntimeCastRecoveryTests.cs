@@ -18,7 +18,16 @@ public class NullBypassRuntimeCastRecoveryTests
             "extra-result-definition","escaping-flag","escaping-metadata","nested-escaping-metadata","unknown-source",
             "value-target","wrong-copy","wrong-merge-type","merge-parameter","escaping-cast","redefined-cast",
             "array-target","wrong-array-element"})
-            yield return new TestCaseData("merge/"+shape,shape is "valid" or "runtime-class-target" or "null-jump" or "array-target");
+            yield return new TestCaseData("merge/"+shape,shape is "valid" or "runtime-class-target" or "null-jump" or "array-target" or "shared-null-path");
+        foreach(var shape in new[]{"shared-return","shared-return-local","shared-return-nop-before",
+            "shared-return-wrong-type","shared-return-unknown-type","shared-return-self-copy","shared-return-missing-copy",
+            "shared-return-wrong-destination","shared-return-native-write","shared-return-native-index",
+            "shared-return-second-write","shared-return-extra-successor","shared-return-after-copy-call",
+            "shared-return-duplicate-edge","shared-return-escaping-flag",
+            "shared-return-conditional-to-success","shared-return-conditional-away","shared-return-conditional-bad-flag",
+            "shared-return-conditional-bad-target","shared-return-conditional-third-edge"})
+            yield return new TestCaseData("merge/"+shape,shape is "shared-return" or "shared-return-local" or "shared-return-nop-before"
+                or "shared-return-conditional-to-success" or "shared-return-conditional-away");
     }
 
     [TestCaseSource(nameof(MergeCases))]
@@ -41,7 +50,7 @@ public class NullBypassRuntimeCastRecoveryTests
     [TestCase("wrong-null-result",false)]
     [TestCase("shared-failure",false)]
     [TestCase("shared-transport",false)]
-    [TestCase("shared-null-path",false)]
+    [TestCase("shared-null-path",true)]
     [TestCase("reassigned-source",false)]
     [TestCase("extra-result-definition",false)]
     [TestCase("escaping-flag",false)]
@@ -123,12 +132,60 @@ public class NullBypassRuntimeCastRecoveryTests
                 failure.Instructions[2].SetOperand(3,new SzArrayTypeAnalysisContext(t.SystemStringType));
             }
         }
+        Block? incomingApplicationPath=null;
+        if(shape.StartsWith("shared-return",System.StringComparison.Ordinal))
+        {
+            var incoming=new Block{ID=30};var split=new Block{ID=31};incomingApplicationPath=incoming;
+            graph.Blocks.Add(incoming);graph.Blocks.Add(split);
+            graph.RemoveEdge(graph.EntryBlock,before);Edge(graph.EntryBlock,split);
+            Edge(split,incoming);Edge(split,before);Edge(incoming,success);
+            var select=Local("applicationNull",t.SystemBooleanType);method.Locals.Add(select);
+            split.Instructions=[new(16,OpCode.CheckEqual,select,source,new Immediate(0)),
+                new(17,OpCode.ConditionalJump,incoming,select)];
+            IOperand value=new Immediate(0);
+            if(shape is "shared-return-local" or "shared-return-wrong-type" or "shared-return-unknown-type")
+            {
+                var supplied=Local("applicationValue",shape=="shared-return-unknown-type"?null:
+                    shape=="shared-return-wrong-type"?t.SystemInt32Type:target);
+                method.Locals.Add(supplied);incoming.Instructions.Add(new(18,OpCode.Move,supplied,new Immediate(0)));value=supplied;
+            }
+            if(shape=="shared-return-self-copy")value=result;
+            var applicationCopy=new Instruction(-1,OpCode.Move,result,value);
+            incoming.Instructions.Add(applicationCopy);incoming.Instructions.Add(new(19,OpCode.Jump,success));
+            if(shape=="shared-return-nop-before")incoming.Instructions.Insert(0,new(20,OpCode.Nop));
+            if(shape=="shared-return-missing-copy")incoming.Instructions.Remove(applicationCopy);
+            if(shape=="shared-return-wrong-destination")applicationCopy.SetOperand(0,other);
+            if(shape=="shared-return-native-write")applicationCopy.NativeWriteSize=8;
+            if(shape=="shared-return-native-index")applicationCopy.Index=20;
+            if(shape=="shared-return-second-write")incoming.Instructions.Insert(0,new(-1,OpCode.Move,result,new Immediate(0)));
+            if(shape.StartsWith("shared-return-conditional",System.StringComparison.Ordinal))
+            {
+                Edge(incoming,nullPath);
+                var branchTarget=shape=="shared-return-conditional-away"?nullPath:success;
+                incoming.Instructions[^1]=new(19,OpCode.ConditionalJump,branchTarget,select);
+                if(shape=="shared-return-conditional-bad-flag")incoming.Instructions[^1].SetOperand(1,Local("notBoolean",t.SystemInt32Type));
+                if(shape=="shared-return-conditional-bad-target")incoming.Instructions[^1].SetOperand(0,transport);
+                if(shape=="shared-return-conditional-third-edge")Edge(incoming,transport);
+            }
+            if(shape=="shared-return-extra-successor")Edge(incoming,nullPath);
+            if(shape=="shared-return-after-copy-call")incoming.Instructions.Insert(incoming.Instructions.Count-1,new(20,OpCode.CallVoid,new StringLiteral("callback")));
+            if(shape=="shared-return-duplicate-edge")Edge(incoming,success);
+            if(shape=="shared-return-escaping-flag")incoming.Instructions.Insert(0,new(20,OpCode.CallVoid,new StringLiteral("observe"),flag));
+        }
+        var applicationInstructions=incomingApplicationPath?.Instructions.ToArray();
+        var originalContinuation=success.Instructions.ToArray();
         foreach(var block in graph.Blocks)block.CalculateBlockType();
         var originals=graph.Instructions.ToArray();
+        var originalNullInstructions=nullPath.Instructions.ToArray();
+        var originalNullPredecessors=nullPath.Predecessors.ToArray();
         Assert.That(NullBypassRuntimeCastRecovery.TryRecover(method,guard,a=>a==0x1234 && shape!="wrong-helper"),Is.EqualTo(expected));
         if(!expected)Assert.That(graph.Instructions,Is.EqualTo(originals));
         else
         {
+            Assert.That(success.Instructions,Is.EqualTo(originalContinuation));
+            if(incomingApplicationPath!=null)Assert.That(incomingApplicationPath.Instructions,Is.EqualTo(applicationInstructions));
+            Assert.That(nullPath.Instructions,Is.EqualTo(originalNullInstructions));
+            Assert.That(nullPath.Predecessors,Is.EqualTo(originalNullPredecessors));
             Assert.That(guard.Instructions[0].OpCode,Is.EqualTo(OpCode.CastClass));
             Assert.That(guard.Instructions.Last().Operands[0],Is.SameAs(success));
             Assert.That(before.Instructions.Last().Operands[0],Is.SameAs(nullPath));

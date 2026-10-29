@@ -106,6 +106,52 @@ public static class ArrayRecovery
     private static bool Int32IndexOperand(IOperand operand) => operand is
         LocalVariable {Type.FullName:"System.Int32"} or Immediate {Value:>=int.MinValue and <=int.MaxValue};
 
+    // A pointer passed directly to a reviewed bulk copy is not a memory load.
+    // Reuse the same affine address proof, keeping every typed word computation
+    // atomic so its wrap/sign boundary cannot become pointer arithmetic.
+    internal static ArrayAccess? MatchFullStructPointer(IOperand pointer,TypeAnalysisContext type,int pointerSize,
+        Dictionary<LocalVariable,Instruction?> definitions)
+    {
+        var size=type is GenericInstanceTypeAnalysisContext
+            ? ClosedGenericValueLayout.TryGet(type,pointerSize)?.Size??0
+            : TypeSizes.UnboxedSize(type,pointerSize);
+        if(size is <=0 or >4096)return null;
+        var atomic=new Dictionary<LocalVariable,Instruction?>(definitions);
+        foreach(var local in atomic.Keys.ToArray())
+            if(local.Type?.FullName is "System.Int32" or "System.UInt32")atomic[local]=null;
+        bool FullWidth(IOperand value,int depth=0)
+        {
+            if(depth>12)return false;
+            if(value is Immediate)return true;
+            if(value is not LocalVariable local)return false;
+            if(local.Type is SzArrayTypeAnalysisContext || local.Type?.FullName is "System.Int32" or "System.UInt32")return true;
+            if(!atomic.TryGetValue(local,out var definition)||definition==null)return false;
+            if(definition is {OpCode:OpCode.Move,Operands:[_,LocalVariable source]})return FullWidth(source,depth+1);
+            return definition.NativeArithmeticSize==8 && definition.OpCode is OpCode.Add or OpCode.Multiply or OpCode.ShiftLeft
+                && definition.Operands.Skip(1).All(o=>FullWidth(o,depth+1));
+        }
+        if(!FullWidth(pointer))return null;
+        var terms=new Dictionary<LocalVariable,long>();long offset=0;
+        try
+        {
+            if(!AccumulateAddress(pointer,1,terms,ref offset,atomic,0))return null;
+            var arrays=terms.Where(t=>t.Value!=0 && t.Key.Type is SzArrayTypeAnalysisContext).ToArray();
+            if(arrays.Length!=1||arrays[0].Value!=1)return null;
+            var array=arrays[0].Key;
+            if(array.Type is not SzArrayTypeAnalysisContext {ElementType:var element}
+                || !TrivialConstructorRecovery.SameType(element,type))return null;
+            var indices=terms.Where(t=>t.Value!=0&&!ReferenceEquals(t.Key,array)).ToArray();
+            var delta=checked(offset-ElementsOffset(pointerSize));
+            if(indices.Length==0 && delta>=0 && delta%size==0 && delta/size<=int.MaxValue)
+                return new(array,new Immediate(delta/size));
+            if(indices.Length==1 && indices[0].Value==size && delta==0
+                && indices[0].Key.Type?.FullName is "System.Int32" or "System.UInt32")
+                return new(array,indices[0].Key);
+        }
+        catch(OverflowException){ /* A wrapped/unknown native address is not an array proof. */ }
+        return null;
+    }
+
     public static void Run(MethodAnalysisContext method)
     {
         RecoverSplitAccesses(method);
@@ -184,12 +230,29 @@ public static class ArrayRecovery
         var definitions = SingleDefinitions(cfg);
         var nextIndex = cfg.Instructions.Select(i => i.Index).DefaultIfEmpty(-1).Max() + 1;
         var changed = false;
+        // This pass inserts fresh address locals and rewrites operands, but
+        // never changes block edges or redefines an existing local. Reuse one
+        // dominance snapshot; live same-block instruction order is still checked
+        // after prefix insertion. Unknown/duplicated instruction homes decline.
+        var blocks=cfg.Blocks.ToHashSet();
+        var invalidPredecessors=cfg.Blocks.Any(b=>b.Predecessors.Any(p=>!blocks.Contains(p)));
+        var homes=new Dictionary<Instruction,Block?>();
+        foreach(var owner in cfg.Blocks)
+        foreach(var item in owner.Instructions)
+            if(!homes.TryAdd(item,owner) && !ReferenceEquals(homes[item],owner))homes[item]=null;
+        DominatorInfo? dominance=null;
+        bool DefinitionDominates(Instruction definition,Instruction use)
+        {
+            if(!homes.TryGetValue(definition,out var first) || first==null
+                || !homes.TryGetValue(use,out var last) || last==null)return false;
+            return ReferenceEquals(first,last)?first.Instructions.IndexOf(definition)<first.Instructions.IndexOf(use)
+                :(dominance??=new DominatorInfo(cfg)).Dominates(first,last);
+        }
         bool StableFullWidthTerm(LocalVariable value,Instruction use)
         {
-            if(cfg.Blocks.Any(b=>b.Predecessors.Any(p=>!cfg.Blocks.Contains(p))))return false;
-            var writes=cfg.Instructions.Where(i=>ReferenceEquals(i.Destination,value)).ToArray();
-            return method.ParameterLocals.Contains(value)?writes.Length==0
-                :writes.Length==1 && ForwardNullCheckRecovery.DefinitionDominates(cfg,writes[0],use);
+            if(invalidPredecessors)return false;
+            return method.ParameterLocals.Contains(value)?!definitions.ContainsKey(value)
+                :definitions.TryGetValue(value,out var write) && write!=null && DefinitionDominates(write,use);
         }
         bool FullWidthAddressStable(IOperand? value,Instruction use,int depth=0)
         {
@@ -198,7 +261,7 @@ public static class ArrayRecovery
             if(value is not LocalVariable local)return false;
             if(method.ParameterLocals.Contains(local))return !definitions.ContainsKey(local);
             if(!definitions.TryGetValue(local,out var definition) || definition==null
-                || !ForwardNullCheckRecovery.DefinitionDominates(cfg,definition,use))return false;
+                || !DefinitionDominates(definition,use))return false;
             // This matches AccumulateAddress: a typed Int32 add/sub is a
             // snapshot index, not a pointer expression to expand further.
             if(local.Type?.FullName=="System.Int32"

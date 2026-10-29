@@ -13,10 +13,16 @@ namespace Cpp2IL.Core.Analysis;
 public static class InterfaceDispatchRecovery
 {
     public static void Run(MethodAnalysisContext method)
+        => RunWithState(method);
+
+    internal sealed record RecoveryState(ISILControlFlowGraph Graph,List<(Instruction Dispatch,Match Lookup)> Lookups,
+        List<OwnedDceLookupAnchor> EliminatedAnchors);
+
+    internal static RecoveryState? RunWithState(MethodAnalysisContext method,RecoveryState? previous=null)
     {
         // offsets below are the 64-bit Il2CppClass layout
         if (method.AppContext.Binary.PointerSizeBytes != 8)
-            return;
+            return null;
 
         var cfg = method.ControlFlowGraph!;
         // Opt-in local diagnostics only; do not change recovery or its gates.
@@ -46,6 +52,19 @@ public static class InterfaceDispatchRecovery
 
         var changed = false;
         var matchedLookups=new List<(Instruction Dispatch,Match Lookup)>();
+        var eliminatedAnchors=previous!=null && ReferenceEquals(previous.Graph,cfg)
+            ? new List<OwnedDceLookupAnchor>(previous.EliminatedAnchors) : [];
+        // Local state from THIS method/graph only. An early resolved call no
+        // longer looks indirect on the typed retry, but its exact still-live
+        // phi/call identities retain the original proof. Recompute every
+        // escape/side-effect check below; stale/removed/foreign entries reject.
+        if(previous!=null && ReferenceEquals(previous.Graph,cfg))
+            foreach(var pending in previous.Lookups)
+                if((IsCurrentResolvedLookup(cfg,pending.Dispatch,pending.Lookup.InvokeDataPhi,
+                    pending.Lookup.Resolved) || eliminatedAnchors.Any(receipt=>receipt.IsCurrent(cfg,pending.Dispatch,pending.Lookup)))
+                    && homeBlock.TryGetValue(pending.Lookup.InvokeDataPhi,out var merge)
+                    && ReferenceEquals(merge,pending.Lookup.Merge))
+                    matchedLookups.Add(pending);
 
         foreach (var block in cfg.Blocks.ToList())
         {
@@ -80,7 +99,11 @@ public static class InterfaceDispatchRecovery
                 || IsMatchedLookupMetadataPhi(instruction.Operands[^1],definitions,homeBlock,
                     matchedLookups.Select(m=>m.Lookup.InvokeDataPhi),
                     local=>method.Locals.Contains(local) && local.Type is null && !local.IsThis
-                        && !local.IsReturn && !local.IsReturnBuffer && local.ParameterIndex<0)))
+                        && !local.IsReturn && !local.IsReturnBuffer && local.ParameterIndex<0,
+                    local=>IsKnownVTableMethodInfo(method,local,definitions))
+                || IsMatchedSlowSlotPhi(instruction.Operands[^1],definitions,
+                    matchedLookups.Select(m=>m.Lookup.InvokeDataPhi),
+                    matchedLookups.Select(m=>m.Lookup.SlowCall.Operands[4]))))
             {
                 var trimmed = TrimIgnoredMethodInfo(instruction);
                 changed |= trimmed;
@@ -90,7 +113,8 @@ public static class InterfaceDispatchRecovery
         // Pruning a proven ignored operand makes its ordinary metadata phi
         // and +8 load dead. Use the existing all-use DCE proof before checking
         // lookup escape/deadness; do not exempt a still-live metadata consumer.
-        if (trimmedMetadata) DeadCodeEliminator.Run(method);
+        if (trimmedMetadata)
+            eliminatedAnchors.AddRange(OwnedDceLookupAnchor.Eliminate(cfg,matchedLookups));
 
         // A later proven dispatch can still carry stale raw argument-register
         // phis while we inspect an earlier lookup. Resolve ALL dispatches before
@@ -104,13 +128,20 @@ public static class InterfaceDispatchRecovery
                 trace ? gate=>System.Console.Error.WriteLine($"INTERFACE LOOKUP index={dispatch.Index} gate={gate}") : null);
 
         if (changed)
-            DeadCodeEliminator.Run(method);
-
+            eliminatedAnchors.AddRange(OwnedDceLookupAnchor.Eliminate(cfg,matchedLookups));
+        return new(cfg,matchedLookups,eliminatedAnchors);
     }
+
+    internal static bool IsCurrentResolvedLookup(ISILControlFlowGraph graph,Instruction dispatch,
+        Instruction phi,MethodAnalysisContext target)
+        => graph.Instructions.Contains(dispatch) && graph.Instructions.Contains(phi)
+            && dispatch.NativeVirtualDispatch && dispatch.OpCode is OpCode.Call or OpCode.CallVoid
+            && dispatch.Operands.Count>0 && ReferenceEquals(dispatch.Operands[0],target)
+            && phi is {OpCode:OpCode.Phi,Destination:LocalVariable};
 
     private const int InvokeDataShift = 4; // sizeof(VirtualInvokeData) == 16
 
-    private record struct Match(
+    internal record struct Match(
         MethodAnalysisContext Resolved,
         Instruction InvokeDataPhi,
         Block Merge,
@@ -270,6 +301,42 @@ public static class InterfaceDispatchRecovery
         return operand is TypeAnalysisContext or Immediate ? operand : null;
     }
 
+    // A later resolved interface lookup can leave its exact slow-path SLOT
+    // input in the same native register as an earlier lookup's MethodInfo.
+    // Only prune a known nongeneric call's ignored hidden operand, and only
+    // when the complete phi closure contains BOTH a full matched metadata
+    // load and the actual slot operand identity of a resolved lookup here.
+    // This never declares arbitrary integers/pointers to be MethodInfo.
+    internal static bool IsMatchedSlowSlotPhi(IOperand operand,
+        Dictionary<LocalVariable,Instruction> definitions,
+        IEnumerable<Instruction> matchedPhis,IEnumerable<IOperand> matchedSlots)
+    {
+        var phis=matchedPhis.ToArray();
+        var slots=matchedSlots.OfType<LocalVariable>()
+            .Where(definitions.ContainsKey).ToHashSet();
+        if(phis.Length==0 || slots.Count==0)return false;
+        var active=new HashSet<LocalVariable>();
+        var sawInfo=false;var sawSlot=false;var sawPhi=false;var budget=256;
+        bool Visit(IOperand value)
+        {
+            if(--budget<0 || value is not LocalVariable local)return false;
+            if(slots.Contains(local)){sawSlot=true;return true;}
+            if(!definitions.TryGetValue(local,out var definition))return false;
+            if(definition is {OpCode:OpCode.Move,NativeReadSize:8}
+                && IsMatchedInvokeDataInfo(local,definitions,phis))
+            {sawInfo=true;return true;}
+            if(!active.Add(local))return false;
+            try
+            {
+                if(definition is {OpCode:OpCode.Move,Operands:[_,var source]})return Visit(source);
+                if(definition.OpCode!=OpCode.Phi || definition.Operands.Count<3)return false;
+                sawPhi=true;return definition.Operands.Skip(1).All(Visit);
+            }
+            finally{active.Remove(local);}
+        }
+        return Visit(operand) && sawPhi && sawInfo && sawSlot;
+    }
+
     internal static bool TrimIgnoredMethodInfo(Instruction instruction)
     {
         if(instruction.OpCode is not (OpCode.Call or OpCode.CallVoid)
@@ -304,7 +371,8 @@ public static class InterfaceDispatchRecovery
 
     internal static bool IsMatchedLookupMetadataPhi(IOperand operand,
         Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homes,
-        IEnumerable<Instruction> matchedPhis, System.Func<LocalVariable,bool>? ignoredNativeIncoming=null)
+        IEnumerable<Instruction> matchedPhis, System.Func<LocalVariable,bool>? ignoredNativeIncoming=null,
+        System.Func<LocalVariable,bool>? knownMetadataLeaf=null)
     {
         // The slow interface path may set a caller's hidden MethodInfo register
         // to zero. Later ordinary joins retain that phi as a trailing hidden
@@ -320,6 +388,17 @@ public static class InterfaceDispatchRecovery
         bool Visit(IOperand value)
         {
             if (--budget < 0) return false;
+            // MetadataResolver can already have replaced the incoming load
+            // with its exact metadata-backed MethodInfo operand. Follow that
+            // proven value too; a plain type, address, injected method, or
+            // method from a different application is not such evidence.
+            if (value is RuntimeMethodInfoAnalysisContext info
+                && (info.RepresentedMethod.Definition != null
+                    || info.RepresentedMethod is ConcreteGenericMethodAnalysisContext concrete
+                        && concrete.BaseMethodContext.Definition != null
+                        && ReferenceEquals(info.AppContext, concrete.BaseMethodContext.AppContext))
+                && ReferenceEquals(info.AppContext, info.RepresentedMethod.AppContext))
+            { sawIncoming = true; return true; }
             if (value is Immediate { Value: 0 }) { sawZero = true; return true; }
             if (value is not LocalVariable local) return false;
             if (!definitions.TryGetValue(local, out var definition))
@@ -341,6 +420,11 @@ public static class InterfaceDispatchRecovery
             if (definition is { OpCode: OpCode.Move, NativeReadSize: 8 }
                 && IsMatchedInvokeDataInfo(local, definitions, matched))
             { sawMatchedInfo = true; return true; }
+            // A previous, independently resolved virtual call can leave its
+            // MethodInfo half in this register. Require that exact typed native
+            // slot/header read; arbitrary defined register values still reject.
+            if(knownMetadataLeaf?.Invoke(local)==true)
+            { sawIncoming=true; return true; }
             if (!path.Add(local)) return false;
             try
             {
@@ -353,6 +437,41 @@ public static class InterfaceDispatchRecovery
         }
         return Visit(operand) && (sawIgnoredIncoming ? sawMatchedInfo
             : sawIncoming && (sawMatchedInfo || sawZero && sawMerge));
+    }
+
+    internal static bool IsKnownVTableMethodInfo(MethodAnalysisContext method,LocalVariable value,
+        Dictionary<LocalVariable,Instruction> definitions)
+    {
+        if(method.AppContext.InstructionSet is not Cpp2IL.Core.InstructionSets.NewArmV8InstructionSet
+            || method.AppContext.UnityVersion.Major!=2018 || method.AppContext.UnityVersion.Minor!=4
+            || method.AppContext.Binary.PointerSizeBytes!=8)return false;
+        return IsKnownVTableMethodInfo(method,value,definitions,RuntimeMetadataLayout.For(method));
+    }
+
+    internal static bool IsKnownVTableMethodInfo(MethodAnalysisContext method,LocalVariable value,
+        Dictionary<LocalVariable,Instruction> definitions,RuntimeMetadataLayout layout)
+    {
+        if(layout.VTable!=0x128 || method.AppContext.Binary.PointerSizeBytes!=8
+            || method.ControlFlowGraph is not {} cfg
+            || !definitions.TryGetValue(value,out var load)
+            || load is not {OpCode:OpCode.Move,NativeReadSize:8,
+                Operands:[_,MemoryOperand {Base:LocalVariable {Type:RuntimeClassTypeAnalysisContext klassType} klass,
+                    Index:null,Scale:0} memory]}
+            || !definitions.TryGetValue(klass,out var header)
+            || header is not {OpCode:OpCode.Move,NativeReadSize:8,
+                Operands:[_,MemoryOperand {Base:LocalVariable receiver,Addend:0,Index:null,Scale:0}]}
+            || receiver.Type is not {IsValueType:false} receiverType
+            || receiverType is PointerTypeAnalysisContext or ByRefTypeAnalysisContext or RuntimeClassTypeAnalysisContext
+            || !TrivialConstructorRecovery.SameType(receiverType,klassType.RepresentedType)
+            || cfg.Instructions.Count(i=>ReferenceEquals(i.Destination,value))!=1
+            || cfg.Instructions.Count(i=>ReferenceEquals(i.Destination,klass))!=1
+            || !ForwardNullCheckRecovery.DefinitionDominates(cfg,header,load))return false;
+        var offset=memory.Addend-layout.VTable-8;
+        if(offset<0 || offset%16!=0 || offset/16>int.MaxValue)return false;
+        var target=MetadataResolver.ResolveVTableSlot(method.AppContext,receiverType,(int)(offset/16));
+        return target is {IsVirtual:true,IsStatic:false,GenericParameters.Count:0}
+            && !target.ReturnType.HasAnyGenericParameters()
+            && target.Parameters.All(p=>!p.ParameterType.HasAnyGenericParameters());
     }
 
     private static Instruction? ChaseCopies(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
@@ -666,13 +785,21 @@ public static class InterfaceDispatchRecovery
                 // consumers; any real use aborts before anything is modified.
                 if (use.OpCode==OpCode.Phi) { queue.Enqueue(use); continue; }
                 if (use is not { OpCode: OpCode.Move, Operands: [LocalVariable loaded, MemoryOperand] }
-                    || (useSites.TryGetValue(loaded, out var loadUses) && loadUses.Count > 0))
+                    || definitions.GetValueOrDefault(loaded)!=1
+                    || (useSites.TryGetValue(loaded, out var loadUses)
+                        && loadUses.Any(consumer=>consumer.OpCode!=OpCode.Phi)))
                 {
                     trace?.Invoke("phi-use:"+phiDest+":"+use);
                     if(use.Destination is LocalVariable result && useSites.TryGetValue(result,out var consumers))
                         foreach(var consumer in consumers)trace?.Invoke("loaded-use:"+result+":"+consumer);
                     return false;
                 }
+                // Stale native argument registers can carry a lookup load into
+                // later metadata phis. A load whose ONLY consumers are phis is
+                // not observable yet: prove their entire closure too. Never
+                // ignore a return, comparison, copy, call, store or second load.
+                if(useSites.TryGetValue(loaded,out var downstream))
+                    foreach(var consumer in downstream)queue.Enqueue(consumer);
                 proved.Add(use);
             }
         }
@@ -683,7 +810,7 @@ public static class InterfaceDispatchRecovery
     private static bool Uses(Instruction instruction, HashSet<LocalVariable> candidates)
         => UsedLocals(instruction).Any(candidates.Contains);
 
-    private static IEnumerable<LocalVariable> UsedLocals(Instruction instruction)
+    internal static IEnumerable<LocalVariable> UsedLocals(Instruction instruction)
     {
         for (var i = 0; i < instruction.Operands.Count; i++)
         {

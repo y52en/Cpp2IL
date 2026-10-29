@@ -38,16 +38,41 @@ public static class LateClassInitRecovery
             }
             catch(Exception){return checkedHelpers[address.Value]=false;}
         }
-        foreach(var guard in cfg.Blocks.ToArray())
-            if(TryRecover(cfg,guard,0x126,Known))changes++;
+        changes=RecoverGuards(cfg,0x126,Known);
         if(changes!=0){cfg.RemoveUnreachableBlocks();DeadCodeEliminator.Run(cfg);}
         return changes;
     }
 
     public static bool TryRecover(ISILControlFlowGraph cfg,Block guard,long offset,Func<Instruction,bool> known)
     {
-        var defs=cfg.Instructions.Where(i=>i.Destination is LocalVariable)
-            .GroupBy(i=>(LocalVariable)i.Destination!).Where(g=>g.Count()==1).ToDictionary(g=>g.Key,g=>g.Single());
+        if(!ConditionalGuard(guard))return false;
+        return TryRecover(cfg,guard,offset,known,Definitions(cfg));
+    }
+
+    private static Dictionary<LocalVariable,Instruction> Definitions(ISILControlFlowGraph cfg)=>cfg.Instructions
+        .Where(i=>i.Destination is LocalVariable).GroupBy(i=>(LocalVariable)i.Destination!)
+        .Where(g=>g.Count()==1).ToDictionary(g=>g.Key,g=>g.Single());
+
+    private static bool ConditionalGuard(Block guard)=>guard.Successors.Count==2
+        && guard.Instructions.LastOrDefault() is {OpCode:OpCode.ConditionalJump,Operands:[Block target,_]}
+        && guard.Successors.Contains(target);
+
+    internal static int RecoverGuards(ISILControlFlowGraph cfg,long offset,Func<Instruction,bool> known)
+    {
+        var changes=0;Dictionary<LocalVariable,Instruction>? definitions=null;
+        foreach(var guard in cfg.Blocks.ToArray())
+        {
+            if(!ConditionalGuard(guard))continue;
+            definitions??=Definitions(cfg);
+            if(!TryRecover(cfg,guard,offset,known,definitions))continue;
+            changes++;definitions=null; // Successful removal changes the live CFG and definition census.
+        }
+        return changes;
+    }
+
+    private static bool TryRecover(ISILControlFlowGraph cfg,Block guard,long offset,Func<Instruction,bool> known,
+        Dictionary<LocalVariable,Instruction> defs)
+    {
         if(guard.Successors.Count!=2 || guard.Instructions.LastOrDefault() is not
             {OpCode:OpCode.ConditionalJump,Operands:[Block target,var condition]} || !guard.Successors.Contains(target))return false;
         var invert=false;var seen=new HashSet<LocalVariable>();Instruction? predicate=null;

@@ -12,9 +12,14 @@ namespace Cpp2IL.Core.Analysis;
 public static class InlinedConstructorRecovery
 {
     public const string CacheKey = "PureFieldConstructorTemplates";
-    public sealed record Assignment(FieldAnalysisContext Field, int Parameter, IOperand? Constant = null);
+    public sealed record Assignment(FieldAnalysisContext Field, int Parameter, IOperand? Constant = null)
+    { public int NativeWidth {get;init;} }
+    public sealed record Argument(int Parameter,IOperand? Constant=null);
     public sealed record Template(MethodAnalysisContext Constructor, IReadOnlyList<Assignment> Assignments,
-        MethodAnalysisContext? BaseConstructor = null);
+        MethodAnalysisContext? BaseConstructor = null)
+    {
+        public IReadOnlyList<Argument>? BaseArguments {get;init;}
+    }
 
     private static List<TypeAnalysisContext>? Hierarchy(TypeAnalysisContext owner)
     {
@@ -50,7 +55,7 @@ public static class InlinedConstructorRecovery
     private static bool DirectBase(TypeAnalysisContext owner,MethodAnalysisContext target)
         => !owner.IsValueType && !owner.HasAnyGenericParameters() && owner.BaseType is {} parent
             && !parent.HasAnyGenericParameters() && target.Name==".ctor" && !target.IsStatic
-            && !target.IsVirtual && target.IsVoid && target.Parameters.Count==0
+            && !target.IsVirtual && target.IsVoid && target.Parameters.Count<=8 && target.GenericParameters.Count==0
             && (TrivialConstructorRecovery.SameType(parent,target.DeclaringType)
                 // Complete Ghidra1564: an optimized child native constructor
                 // calls Object.ctor and writes an inherited field directly.
@@ -65,7 +70,7 @@ public static class InlinedConstructorRecovery
         Trace(ctor, "constructor template input");
         if (ctor.Name != ".ctor" || ctor.IsStatic || !ctor.IsVoid || ctor.DeclaringType is not { IsValueType:false } owner
             || owner.BaseType == null || owner.HasAnyGenericParameters()
-            || ctor.ControlFlowGraph == null || ctor.Parameters.Count == 0) return null;
+            || ctor.ControlFlowGraph == null) return null;
         var parameters = ctor.ParameterLocals.Where(l => !l.IsThis && !l.IsMethodInfo).ToList();
         if (parameters.Count != ctor.Parameters.Count) return null;
         if (ctor.ControlFlowGraph.Blocks.Any(b => b.Successors.Count > 1)) return null;
@@ -85,6 +90,7 @@ public static class InlinedConstructorRecovery
         var result = new List<Assignment>();
         var baseCalls = 0;
         MethodAnalysisContext? baseConstructor = null;
+        var baseArguments=new List<Argument>();
         var objectBase=owner.BaseType.FullName=="System.Object";
         var returned = false;
         foreach (var instruction in ctor.ControlFlowGraph.Instructions)
@@ -93,10 +99,24 @@ public static class InlinedConstructorRecovery
             if(returned)return null;
             if (instruction.OpCode == OpCode.Return && instruction.Operands.Count == 0) { returned = true; continue; }
             if (instruction is { OpCode: OpCode.CallVoid, NativeVirtualDispatch:false,
-                Operands: [MethodAnalysisContext parent, LocalVariable { IsThis: true }] }
+                Operands: [MethodAnalysisContext parent, LocalVariable { IsThis: true },..] }
                 && DirectBase(owner,parent)
                 && (objectBase || ctor.ParameterLocals.Any(p=>p.IsThis && ReferenceEquals(p,instruction.Operands[1]))))
-            { if (++baseCalls > 1) return null; baseConstructor=parent; continue; }
+            {
+                if(++baseCalls>1 || instruction.Operands.Count!=parent.Parameters.Count+2)return null;
+                for(var n=0;n<parent.Parameters.Count;n++)
+                {
+                    var value=instruction.Operands[n+2];var baseParameter=value is LocalVariable baseLocal?parameters.IndexOf(baseLocal):-1;
+                    if(baseParameter>=0)
+                    {
+                        if(!TrivialConstructorRecovery.SameType(ctor.Parameters[baseParameter].ParameterType,parent.Parameters[n].ParameterType))return null;
+                        baseArguments.Add(new(baseParameter));
+                    }
+                    else if(ExactConstant(parent.Parameters[n].ParameterType,value))baseArguments.Add(new(-1,value));
+                    else return null;
+                }
+                baseConstructor=parent;continue;
+            }
             if (instruction is not { OpCode: OpCode.Move, Operands: [FieldReference field, var source] }
                 || !field.Local.IsThis || field.Parent!=null || !OwnsField(owner,field.Field)
                 || !ReferenceEquals(field.Field.DeclaringType,owner)
@@ -106,14 +126,15 @@ public static class InlinedConstructorRecovery
             if(!objectBase && (baseCalls!=1 || !ctor.ParameterLocals.Any(p=>p.IsThis && ReferenceEquals(p,field.Local))))return null;
             var parameter = source is LocalVariable local ? parameters.IndexOf(local) : -1;
             if (result.Any(a => a.Field == field.Field)) return null;
-            if (parameter >= 0) result.Add(new(field.Field, parameter));
+            if (parameter >= 0) result.Add(new(field.Field, parameter){NativeWidth=instruction.NativeWriteSize});
             else if (field.Parent == null && ExactConstant(field.Field.FieldType, source))
-                result.Add(new(field.Field, -1, source));
+                result.Add(new(field.Field, -1, source){NativeWidth=instruction.NativeWriteSize});
             else return null;
         }
         if (!returned || result.Count == 0 || !objectBase && baseCalls!=1
-            || Enumerable.Range(0,parameters.Count).Any(i => result.All(a => a.Parameter != i))) return null;
-        return new(ctor, result.ToArray(),baseConstructor);
+            || Enumerable.Range(0,parameters.Count).Any(i => result.All(a => a.Parameter != i)
+                && baseArguments.All(a=>a.Parameter!=i))) return null;
+        return new(ctor, result.ToArray(),baseConstructor){BaseArguments=baseArguments.ToArray()};
     }
 
     public static void Run(MethodAnalysisContext method)
@@ -137,13 +158,195 @@ public static class InlinedConstructorRecovery
             System.Console.Error.WriteLine(block + "Successors: " + string.Join(",",block.Successors.Select(s=>s.ID)));
     }
 
+    private static bool RootNoOp(Template template,TypeAnalysisContext owner)
+        => template.BaseConstructor is {Name:".ctor",IsStatic:false,Parameters.Count:0} parent
+            && ReferenceEquals(parent.DeclaringType,owner.AppContext.SystemTypes.SystemObjectType)
+            && parent.GetExtraData<TrivialConstructorRecovery.ObjectProof>(TrivialConstructorRecovery.ObjectProofKey)
+                is {IsNoOp:true};
+
+    private static bool ScalarSetupClass(TypeAnalysisContext owner)
+        => Hierarchy(owner) is {} hierarchy && hierarchy.All(type=>
+            (type.Attributes&System.Reflection.TypeAttributes.LayoutMask)!=System.Reflection.TypeAttributes.ExplicitLayout
+            && !type.Methods.Any(m=>m.Name==".cctor"
+                || m.Name=="Finalize" && !ReferenceEquals(type,owner.AppContext.SystemTypes.SystemObjectType)));
+
+    // A constructor whose complete native template only writes zero scalar
+    // values leaves a newly allocated, zero-filled object unchanged. This is
+    // useful when the original field initialization spans branches: keep EVERY
+    // original store and substitute only the proven empty Object-base call.
+    // Never use this for reference writes, finalizers, class initializers,
+    // volatile/custom-modified fields, overlaps, nonzero constants or effects.
+    internal static IOperand[]? ZeroStateArguments(Template template,TypeAnalysisContext owner)
+    {
+        var ctor=template.Constructor;
+        if(!ReferenceEquals(ctor.DeclaringType,owner) || owner.IsValueType || owner.HasAnyGenericParameters()
+            || ctor.Name!=".ctor" || ctor.IsStatic || ctor.IsVirtual || !ctor.IsVoid
+            || ctor.Parameters.Count is 0 or >8 || ctor.GenericParameters.Count!=0
+            || !RootNoOp(template,owner) || !ScalarSetupClass(owner)
+            || template.Assignments.Count==0 || (template.BaseArguments?.Count??0)!=0)return null;
+        IOperand? Zero(TypeAnalysisContext type)
+        {
+            var scalar=type.IsEnumType?type.EnumUnderlyingType:type;
+            var types=owner.AppContext.SystemTypes;
+            if(ReferenceEquals(scalar,types.SystemSingleType))return new FloatLiteral(0f);
+            if(ReferenceEquals(scalar,types.SystemDoubleType))return new DoubleLiteral(0d);
+            TypeAnalysisContext[] integral=[types.SystemBooleanType,types.SystemByteType,types.SystemSByteType,
+                types.SystemCharType,types.SystemInt16Type,types.SystemUInt16Type,
+                types.SystemInt32Type,types.SystemUInt32Type,types.SystemInt64Type,types.SystemUInt64Type];
+            return type.IsValueType && integral.Any(t=>ReferenceEquals(t,scalar))?new Immediate(0):null;
+        }
+        var arguments=new List<IOperand>();
+        foreach(var parameter in ctor.Parameters)
+        {
+            if(Zero(parameter.ParameterType) is not {} zero)return null;
+            arguments.Add(zero);
+        }
+        var fields=new HashSet<FieldAnalysisContext>();var ranges=new List<(long Start,long End)>();
+        foreach(var assignment in template.Assignments)
+        {
+            var field=assignment.Field;var width=PlainScalarWidth(field,owner.AppContext.Binary.PointerSizeBytes);
+            if(!OwnsField(owner,field) || !fields.Add(field) || field.Offset<16 || width<=0
+                || assignment.NativeWidth!=width)return null;
+            var start=(long)field.Offset;var end=start+width;
+            if(ranges.Any(r=>start<r.End && r.Start<end))return null;
+            ranges.Add((start,end));
+            if(assignment.Constant is {} constant)
+            {
+                if(Zero(field.FieldType) is not {} zero || !SameValue(constant,zero))return null;
+            }
+            else if(assignment.Parameter<0 || assignment.Parameter>=arguments.Count)return null;
+        }
+        return arguments.ToArray();
+    }
+
+    private static int PlainScalarWidth(FieldAnalysisContext field,int pointerSize)
+    {
+        var raw=field.BackingData?.Field.RawFieldType;
+        if(raw!=null && (raw.NumMods!=0 || raw.Byref!=0 || raw.Pinned!=0))return 0;
+        var scalar=field.FieldType.IsEnumType?field.FieldType.EnumUnderlyingType:field.FieldType;
+        var types=field.AppContext.SystemTypes;
+        TypeAnalysisContext[] supported=[types.SystemBooleanType,types.SystemByteType,types.SystemSByteType,
+            types.SystemCharType,types.SystemInt16Type,types.SystemUInt16Type,types.SystemInt32Type,types.SystemUInt32Type,
+            types.SystemInt64Type,types.SystemUInt64Type,types.SystemSingleType,types.SystemDoubleType];
+        return field.FieldType.IsValueType && supported.Any(type=>ReferenceEquals(type,scalar))
+            ? FieldWidth(field,pointerSize):0;
+    }
+
+    private static bool ScalarStores(Template template,TypeAnalysisContext owner,
+        List<(Instruction Instruction,FieldAnalysisContext Field)> stores)
+    {
+        if(!RootNoOp(template,owner) || !ScalarSetupClass(owner)
+            || stores.Count!=template.Assignments.Count)return false;
+        var ranges=new List<(long Start,long End)>();
+        foreach(var assignment in template.Assignments)
+        {
+            var field=assignment.Field;var width=PlainScalarWidth(field,owner.AppContext.Binary.PointerSizeBytes);
+            var actual=stores.SingleOrDefault(s=>ReferenceEquals(s.Field,field)).Instruction;
+            if(width<=0 || field.Offset<16 || assignment.NativeWidth!=width || actual==null
+                || actual.NativeWriteSize!=width
+                || actual.Operands[0] is FieldReference reference && reference.Offset!=field.Offset)return false;
+            var start=(long)field.Offset;var end=start+width;
+            if(ranges.Any(r=>start<r.End && r.Start<end))return false;
+            ranges.Add((start,end));
+        }
+        return true;
+    }
+
+    private static bool UsesLocal(IOperand? operand,LocalVariable local,int depth=0)
+    {
+        if(depth>8)return true;
+        if(ReferenceEquals(operand,local))return true;
+        return operand switch
+        {
+            AddressOf address=>UsesLocal(address.Target,local,depth+1),
+            MemoryOperand memory=>UsesLocal(memory.Base,local,depth+1)||UsesLocal(memory.Index,local,depth+1),
+            FieldReference field=>ReferenceEquals(field.Local,local)||UsesLocal(field.Parent,local,depth+1),
+            _=>false,
+        };
+    }
+
+    private static Block? LinearSetupBlock(MethodAnalysisContext method,Block allocationBlock,Instruction instruction)
+    {
+        var block=allocationBlock;var seen=new HashSet<Block>();
+        while(seen.Add(block))
+        {
+            if(block.Instructions.Contains(instruction))return block;
+            if(block.Successors.Count!=1 || block.Successors[0].Predecessors.Count!=1)return null;
+            block=block.Successors[0];
+        }
+        return null;
+    }
+
+    private static int IntegralSetupWidth(TypeAnalysisContext? type,SystemTypesContext types)
+    {
+        if(type?.IsEnumType==true)type=type.EnumUnderlyingType;
+        if(ReferenceEquals(type,types.SystemInt32Type)||ReferenceEquals(type,types.SystemUInt32Type))return 4;
+        if(ReferenceEquals(type,types.SystemInt64Type)||ReferenceEquals(type,types.SystemUInt64Type))return 8;
+        return 0;
+    }
+
+    private static bool SetupScalarValue(Instruction instruction,MethodAnalysisContext method,
+        List<Instruction> instructions,int allocationIndex,Block allocationBlock,List<Instruction> pending,
+        ref DominatorInfo? dominance,ISet<LocalVariable> aliases)
+    {
+        if(instruction.Destination is not LocalVariable destination || instruction.ImplicitDefinition!=null
+            || LinearSetupBlock(method,allocationBlock,instruction)==null
+            || destination.IsThis || destination.IsMethodInfo || destination.IsReturnBuffer
+            || method.ParameterLocals.Contains(destination) || aliases.Contains(destination))return false;
+        var types=method.AppContext.SystemTypes;
+        IOperand[] inputs;
+        if(instruction is {OpCode:OpCode.NumericConvert,
+            Operands:[_,TypeAnalysisContext target,TypeAnalysisContext source,LocalVariable input]})
+        {
+            if(!TrivialConstructorRecovery.SameType(destination.Type,target)
+                || !TrivialConstructorRecovery.SameType(input.Type,source)
+                || !(ReferenceEquals(target,types.SystemSingleType)&&ReferenceEquals(source,types.SystemDoubleType)
+                    || ReferenceEquals(target,types.SystemDoubleType)&&ReferenceEquals(source,types.SystemSingleType)))return false;
+            inputs=[input];
+        }
+        else if(instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply
+            && instruction.Operands.Count==3 && instruction.NativeArithmeticSize is 4 or 8
+            && instruction.NativeMultiplyInputSize is 0
+            && IntegralSetupWidth(destination.Type,types)==instruction.NativeArithmeticSize
+            && IlGenerator.NativeIntegerArithmeticType(instruction,method)!=null)
+        {
+            inputs=instruction.Operands.Skip(1).ToArray();
+            if(inputs.Any(value=>value is not Immediate
+                && (value is not LocalVariable local || IntegralSetupWidth(local.Type,types)!=instruction.NativeArithmeticSize)))return false;
+        }
+        else return false;
+        if(instructions.Count(i=>ReferenceEquals(i.Destination,destination))!=1
+            || instructions.Take(allocationIndex+1).Any(i=>i.Sources.Any(o=>UsesLocal(o,destination)))
+            || instructions.Any(i=>i.Operands.Any(o=>o is AddressOf or MemoryOperand or FieldReference
+                && UsesLocal(o,destination))))return false;
+        foreach(var value in inputs)
+        {
+            if(value is Immediate)continue;
+            if(value is not LocalVariable local || ReferenceEquals(local,destination)
+                || local.IsThis || local.IsMethodInfo || local.IsReturnBuffer || aliases.Contains(local))return false;
+            if(!pending.Any(i=>ReferenceEquals(i.Destination,local))
+                && !AvailableBeforeAllocation(local,method,instructions,allocationIndex,allocationBlock,ref dominance,aliases))return false;
+        }
+        return true;
+    }
+
     public static bool Recover(MethodAnalysisContext method, Instruction allocation, IReadOnlyList<Template> templates)
+        => RecoverCore(method,allocation,templates,method.AppContext.UnityVersion.Major==2018
+            && method.AppContext.UnityVersion.Minor==4 && method.AppContext.Binary.PointerSizeBytes==8
+            && method.AppContext.InstructionSet is Cpp2IL.Core.InstructionSets.NewArmV8InstructionSet);
+
+    internal static bool RecoverScalarSetup(MethodAnalysisContext method, Instruction allocation, IReadOnlyList<Template> templates)
+        => RecoverCore(method,allocation,templates,true);
+
+    private static bool RecoverCore(MethodAnalysisContext method, Instruction allocation, IReadOnlyList<Template> templates,
+        bool scalarSetup)
     {
         if (allocation is not { OpCode: OpCode.Newobj, Operands: [LocalVariable obj, TypeAnalysisContext type] }
             || type.IsValueType || type.BaseType==null || type.HasAnyGenericParameters()) return false;
         var objectBase=type.BaseType.FullName=="System.Object";
         var proven=templates.Where(t=>ReferenceEquals(t.Constructor.DeclaringType,type)
-            && (t.BaseConstructor!=null ? DirectBase(type,t.BaseConstructor) : objectBase)).ToArray();
+            && (t.BaseConstructor!=null ? DirectBase(type,t.BaseConstructor)
+                && (t.BaseArguments?.Count??0)==t.BaseConstructor.Parameters.Count : objectBase)).ToArray();
         if(proven.Length==0)return false;
         var instructions = method.ControlFlowGraph!.Instructions;
         var index = instructions.IndexOf(allocation);
@@ -160,19 +363,29 @@ public static class InlinedConstructorRecovery
         DominatorInfo? dominance = null;
         var aliases = new HashSet<LocalVariable> {obj};
         Instruction? baseCall = null;
+        var conversions=new List<Instruction>();
         var stores = new List<(Instruction Instruction, FieldAnalysisContext Field)>();
         var matches = new List<(Template Template, IOperand[] Args)>();
         foreach (var instruction in scan)
         {
             if (instruction.OpCode is OpCode.Nop or OpCode.Jump) continue;
+            if (scalarSetup && baseCall==null && stores.Count==0 && conversions.Count<8
+                && proven.Any(t=>RootNoOp(t,type)) && ScalarSetupClass(type)
+                && SetupScalarValue(instruction,method,instructions,index,allocationBlock,conversions,ref dominance,aliases))
+            { conversions.Add(instruction);continue; }
             if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable alias, LocalVariable source] } && aliases.Contains(source))
             { aliases.Add(alias); continue; }
             if (instruction is { OpCode: OpCode.CallVoid, NativeVirtualDispatch:false,
-                    Operands: [MethodAnalysisContext parent, LocalVariable receiver] }
+                    Operands: [MethodAnalysisContext parent, LocalVariable receiver,..] }
+                && instruction.Operands.Count==parent.Parameters.Count+2
                 && DirectBase(type,parent)
                 && proven.Any(t=>t.BaseConstructor!=null ? ReferenceEquals(t.BaseConstructor,parent) : objectBase)
                 && aliases.Contains(receiver) && baseCall == null && stores.Count == 0)
-            { baseCall = instruction; continue; }
+            {
+                if(instruction.Operands.Skip(2).Any(value=>!objectBase && value is FieldReference
+                    || !AvailableBeforeAllocation(value,method,instructions,index,allocationBlock,ref dominance,aliases)))break;
+                baseCall = instruction; continue;
+            }
             if (baseCall == null || instruction is not { OpCode: OpCode.Move, Operands: [_, var value] }
                 || StoreField(instruction,type,aliases,method.AppContext.Binary.PointerSizeBytes) is not {} field
                 || stores.Any(s => s.Field == field)
@@ -180,16 +393,31 @@ public static class InlinedConstructorRecovery
                 // Never move a field read across that call: only already
                 // materialized locals/literals can become child arguments.
                 || !objectBase && value is FieldReference
-                || !AvailableBeforeAllocation(value, method, instructions, index, allocationBlock, ref dominance, aliases)) break;
+                || !AvailableBeforeAllocation(value, method, instructions, index, allocationBlock, ref dominance, aliases)
+                    && !conversions.Any(c=>ReferenceEquals(c.Destination,value))) break;
             stores.Add((instruction,field));
             matches.Clear();
             foreach (var template in proven.Where(t => t.Assignments.Count == stores.Count
                 && (t.BaseConstructor==null || ReferenceEquals(t.BaseConstructor,baseCall.Operands[0]))))
             {
+                var commuting=scalarSetup && ScalarStores(template,type,stores);
+                if(conversions.Count>0 && !commuting)continue;
                 if(!objectBase && !template.Assignments.Select(a=>a.Field)
-                    .SequenceEqual(stores.Select(s=>s.Field)))continue;
+                    .SequenceEqual(stores.Select(s=>s.Field)) && !commuting)continue;
                 var args = new IOperand[template.Constructor.Parameters.Count];
                 var valid = true;
+                var bindings=template.BaseArguments??[];
+                for(var n=0;n<bindings.Count;n++)
+                {
+                    var binding=bindings[n];var actual=baseCall.Operands[n+2];
+                    if(binding.Constant is {} constant)
+                    {if(binding.Parameter!=-1 || !SameValue(constant,actual)){valid=false;break;}continue;}
+                    if(binding.Parameter<0 || binding.Parameter>=args.Length
+                        || args[binding.Parameter] is {} previous && !SameValue(previous,actual))
+                    {valid=false;break;}
+                    args[binding.Parameter]=actual;
+                }
+                if(!valid)continue;
                 foreach (var assignment in template.Assignments)
                 {
                     var store = stores.SingleOrDefault(s => s.Field == assignment.Field).Instruction;
@@ -210,6 +438,15 @@ public static class InlinedConstructorRecovery
         }
         if (baseCall == null || matches.Count != 1) return false;
         var match = matches[0];
+        // Commit the whole match at once. Failed/ambiguous candidates never
+        // move definitions or make future locals available to IL newobj.
+        var insertion=allocationBlock.Instructions.IndexOf(allocation);
+        foreach(var conversion in conversions)
+        {
+            var originalBlock=method.ControlFlowGraph!.Blocks.Single(b=>b.Instructions.Contains(conversion));
+            originalBlock.Instructions.Remove(conversion);
+            allocationBlock.Instructions.Insert(insertion++,conversion);
+        }
         baseCall.SetOperands(new List<IOperand> {match.Template.Constructor,obj}.Concat(match.Args).ToList());
         foreach (var (store,_) in stores) { store.OpCode = OpCode.Nop; store.SetOperands(); }
         return true;

@@ -50,15 +50,10 @@ public static class MethodInfoTailRecovery
                 continue;
             // Exact return identity makes the tail result ABI identical, including open T.
             // Never invent a conversion, discarded return value, or hidden-buffer remapping.
-            if (tail && method.ReturnType != target.ReturnType || resolver.ReturnsViaHiddenBuffer(target)
+            if (tail && !TrivialConstructorRecovery.SameType(method.ReturnType, target.ReturnType) || resolver.ReturnsViaHiddenBuffer(target)
                 || target.Parameters.Any(p => p.ParameterType is GenericParameterTypeAnalysisContext
                     || p.ParameterType.IsValueType && !BaseCallingConventionResolver.IsFloatingPoint(p.ParameterType)
-                    && p.ParameterType.Type is not (Il2CppTypeEnum.IL2CPP_TYPE_BOOLEAN
-                        or Il2CppTypeEnum.IL2CPP_TYPE_CHAR
-                        or Il2CppTypeEnum.IL2CPP_TYPE_I1 or Il2CppTypeEnum.IL2CPP_TYPE_U1
-                        or Il2CppTypeEnum.IL2CPP_TYPE_I2 or Il2CppTypeEnum.IL2CPP_TYPE_U2
-                        or Il2CppTypeEnum.IL2CPP_TYPE_I4 or Il2CppTypeEnum.IL2CPP_TYPE_U4
-                        or Il2CppTypeEnum.IL2CPP_TYPE_I8 or Il2CppTypeEnum.IL2CPP_TYPE_U8)))
+                    && !IsSupportedWordValue(p.ParameterType)))
                 continue;
             // Unknown indirect calls define X0 only in upstream ISIL. A float,
             // HFA, aggregate or open-T result requires SSA repair of the actual
@@ -66,12 +61,7 @@ public static class MethodInfoTailRecovery
             var oldResult = jump.Destination as LocalVariable;
             if (!tail && (!target.IsVoid && (target.ReturnType is GenericParameterTypeAnalysisContext genericReturn && !HasReferenceOnlyConstraint(genericReturn)
                     || resolver.ReturnRegister(target).Name != "X0"
-                    || target.ReturnType.IsValueType && target.ReturnType.Type is not (
-                        Il2CppTypeEnum.IL2CPP_TYPE_BOOLEAN or Il2CppTypeEnum.IL2CPP_TYPE_CHAR
-                        or Il2CppTypeEnum.IL2CPP_TYPE_I1 or Il2CppTypeEnum.IL2CPP_TYPE_U1
-                        or Il2CppTypeEnum.IL2CPP_TYPE_I2 or Il2CppTypeEnum.IL2CPP_TYPE_U2
-                        or Il2CppTypeEnum.IL2CPP_TYPE_I4 or Il2CppTypeEnum.IL2CPP_TYPE_U4
-                        or Il2CppTypeEnum.IL2CPP_TYPE_I8 or Il2CppTypeEnum.IL2CPP_TYPE_U8)
+                    || target.ReturnType.IsValueType && !IsSupportedWordValue(target.ReturnType)
                     || oldResult?.Register.Name != "X0")
                 || target.IsVoid && oldResult != null && graph.Instructions.Any(i => i.Sources.Contains(oldResult))))
                 continue;
@@ -85,7 +75,11 @@ public static class MethodInfoTailRecovery
                     || register.Name[0] is not ('X' or 'V')) { valid = false; break; }
                 var operand = jump.Operands[2 + register.Name[1] - '0' + (register.Name[0] == 'V' ? 8 : 0)];
                 // Folding may replace a physical argument by its constant/MethodInfo.
-                if (operand is LocalVariable lv && lv.Register.Name == register.Name
+                // Copy propagation changes a value's register identity, not
+                // its argument slot. Permit that only when the lifter proved
+                // the raw ordered snapshot and all structural edits retained it.
+                if (operand is LocalVariable lv && (lv.Register.Name == register.Name
+                        || jump.HasArm64IndirectArgumentSnapshot)
                     || register.Name[0] == 'X' && operand is Immediate
                     || register.Name[0] == 'V' && operand is FloatLiteral or DoubleLiteral
                     || Info(operand) is { } hidden && ReferenceEquals(hidden.RepresentedMethod, target))
@@ -117,6 +111,30 @@ public static class MethodInfoTailRecovery
           }
         }
         return changed;
+    }
+
+    internal static bool IsSupportedWordValue(TypeAnalysisContext type)
+    {
+        if (type.IsEnumType)
+        {
+            // Only metadata-proven CLI integer enum storage. Never substitute
+            // a guessed int for an enum, recurse through malformed enum types,
+            // or treat an arbitrary small struct as a scalar.
+            return type.EnumUnderlyingType is { } underlying
+                && !ReferenceEquals(type, underlying) && !underlying.IsEnumType
+                && underlying.Type is Il2CppTypeEnum.IL2CPP_TYPE_I1 or Il2CppTypeEnum.IL2CPP_TYPE_U1
+                    or Il2CppTypeEnum.IL2CPP_TYPE_I2 or Il2CppTypeEnum.IL2CPP_TYPE_U2
+                    or Il2CppTypeEnum.IL2CPP_TYPE_I4 or Il2CppTypeEnum.IL2CPP_TYPE_U4
+                    or Il2CppTypeEnum.IL2CPP_TYPE_I8 or Il2CppTypeEnum.IL2CPP_TYPE_U8;
+        }
+        return ReferenceEquals(type, type.AppContext.SystemTypes.SystemIntPtrType)
+            || ReferenceEquals(type, type.AppContext.SystemTypes.SystemUIntPtrType)
+            || type.Type is Il2CppTypeEnum.IL2CPP_TYPE_BOOLEAN or Il2CppTypeEnum.IL2CPP_TYPE_CHAR
+                or Il2CppTypeEnum.IL2CPP_TYPE_I1 or Il2CppTypeEnum.IL2CPP_TYPE_U1
+                or Il2CppTypeEnum.IL2CPP_TYPE_I2 or Il2CppTypeEnum.IL2CPP_TYPE_U2
+                or Il2CppTypeEnum.IL2CPP_TYPE_I4 or Il2CppTypeEnum.IL2CPP_TYPE_U4
+                or Il2CppTypeEnum.IL2CPP_TYPE_I8 or Il2CppTypeEnum.IL2CPP_TYPE_U8
+                or Il2CppTypeEnum.IL2CPP_TYPE_I or Il2CppTypeEnum.IL2CPP_TYPE_U;
     }
 
     internal static bool HasReferenceOnlyConstraint(GenericParameterTypeAnalysisContext parameter)

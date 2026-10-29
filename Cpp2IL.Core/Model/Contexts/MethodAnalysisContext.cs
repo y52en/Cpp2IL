@@ -427,6 +427,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Delete any il2cpp_codegen_initialize_runtime_metadata/il2cpp_codegen_initialize_method
         MetadataInitGuardRemover.Run(this);
+        MetadataInitForkRecovery.Run(ControlFlowGraph!);
 
         // Delete inlined GC write barriers
         WriteBarrierRecovery.Run(this);
@@ -439,10 +440,21 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         AllocatedObjectArrayHelperRecovery.Run(this);
         ForwardNullCheckRecovery.Run(this);
         if(RuntimeHelperArgumentPaddingRecovery.Run(this)>0)DeadCodeEliminator.Run(this);
-        InterfaceDispatchRecovery.Run(this);
+        // Preserve early dispatch binding before stale raw return registers
+        // can acquire a managed type from a later use of the same native bank.
+        var interfaceDispatchState=InterfaceDispatchRecovery.RunWithState(this);
+        LocalVariables.ResolveTypesAndFields(this);
 
+        // Interface cleanup also needs the managed receiver/vtable identities:
+        // a previous virtual call's MethodInfo can survive into its merge phis.
+        InterfaceDispatchRecovery.RunWithState(this,interfaceDispatchState);
         LocalVariables.ResolveTypesAndFields(this);
         TraceAnalysis("typed");
+
+        // Optional full-FDE masked accessor evidence is receiver-sensitive;
+        // never register these equivalent functions as global address aliases.
+        NativeMaskedAccessorRecovery.Run(this);
+        NativeIntegerAccessorRecovery.Run(this);
 
         // Managed signatures now type input arguments and resolved call results.
         // Revisit only the hash-proven outlined helpers while definitions are
@@ -513,6 +525,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Fix float literals
         ReadOnlyScalarRecovery.Run(this);
+        // Split the complete native write before converting its low lane into
+        // a floating literal. Otherwise a float-first packed store loses the
+        // upper fields and no longer matches the bit-preserving splitter.
+        PackedScalarConstantStoreRecovery.Run(this);
         FloatLiteralRecovery.Run(this);
         PackedConstantFieldStoreRecovery.Run(this);
 
@@ -520,6 +536,17 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ArrayRecovery.Run(this);
 
         LocalVariables.TypeAddressedLocals(this);
+
+        NativeWord32LoopRecovery.Run(this);
+
+        NativeAggregateReturnRecovery.Run(this);
+        NativeLocalZeroInitializationRecovery.Run(this);
+        NativeByRefAggregateCopyRecovery.Run(this);
+
+        // Copy/stack recovery can expose &DateTime (or another exact value
+        // receiver) only now. Keep the identical FDE/type/accessor proof.
+        NativeMaskedAccessorRecovery.Run(this);
+        NativeIntegerAccessorRecovery.Run(this);
 
         ConstantBranchFolder.Run(this);
 
@@ -538,19 +565,23 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // locals and before inlined constructor matching consumes those reads.
         StackFieldRecovery.Run(this);
         StackFieldZeroRecovery.Run(this);
+        NativeIndirectValueArgumentRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
         // Native argument padding and unused flags must be gone before proving
         // that the cast lookup/exception path has no escaping definitions.
         LateClassInitRecovery.Run(this);
+        EquivalentEdgeCopyRecovery.Run(this);
         InlineClassCastRecovery.Run(this);
         RuntimeCheckedCastRecovery.Run(this);
         NullBypassRuntimeCastRecovery.Run(this);
         SealedClassCastRecovery.Run(this);
         InlineClassTestRecovery.Run(this);
         SharedClassTestRecovery.Run(this);
+        NullEdgeValueRecovery.Run(this);
         MetadataResolver.ResolveLateFieldVirtualCalls(this);
         CovariantArrayStoreRecovery.Run(this);
+        AllocatedArrayElementClassRecovery.Run(this);
         EmptyRuntimeGuardRecovery.Run(this);
         ArrayRecovery.RecoverLateSplitLoads(this);
         if (SsaFieldAddressRecovery.Run(this) > 0)

@@ -664,6 +664,12 @@ public static class MetadataResolver
                 //Already resolved
                 continue;
 
+            if (NativeReceiverCounterpartRecovery.TryResolve(method,instruction))
+            {
+                changed = true;
+                continue;
+            }
+
             if (NativeNullableAccessorRecovery.TryResolve(method, instruction))
             {
                 changed = true;
@@ -683,8 +689,12 @@ public static class MetadataResolver
 
             if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates))
             {
-                // Some shared generic bodies aren't in the address map at all (todo investigate?).
-                // Il2cpp still passes the concrete MethodInfo as the hidden final parameter, so we can use a methodof there if we have one.
+                // A MethodInfo surviving in an unused argument register is
+                // not a native callee identity. Require this metadata method's
+                // own actual native entry (or its architecture-proven unboxed
+                // entry); never turn an unknown runtime helper into a ctor.
+                if (!UnmappedNativeEntryMatches(representedMethod,target.UnsignedValue))
+                    continue;
                 // However, make sure it isn't our OWN hidden MethodInfo arg, because that would turn all unknown calls into recursion
                 if (ReferenceEquals(representedMethod, method))
                     continue;
@@ -695,7 +705,8 @@ public static class MetadataResolver
                     + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
 
                 if (hiddenParamIndex >= instruction.Operands.Count
-                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
+                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) is not { } passedInfo
+                    || !ReferenceEquals(passedInfo.RepresentedMethod,representedMethod))
                     continue;
 
                 instruction.SetOperand(0, representedMethod);
@@ -718,6 +729,43 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    internal static bool UnmappedNativeEntryMatches(MethodAnalysisContext method,ulong entry)
+    {
+        if(entry==0)return false;
+        try
+        {
+            var architecture=method.AppContext.InstructionSet;
+            var unboxed=architecture.GetUnboxedMethodTarget(method);
+            var actual=unboxed!=0?unboxed:architecture.GetPointerForMethod(method);
+            if(actual!=0)return actual==entry || NativeRegisteredReceiverLeafProofs.Matches(method,entry);
+            // RGCTX inflation can create a metadata-identical synthetic closed
+            // context without carrying its registered native MethodSpec. It is
+            // still not evidence by itself: require an independently registered
+            // concrete context for the exact definition and all type arguments,
+            // with its own architecture-proven entry equal to this call target.
+            if(method is not ConcreteGenericMethodAnalysisContext concrete)return false;
+            foreach(var registered in RegisteredMethodIdentityIndex.Candidates(method))
+            {
+                if(registered.MethodRef==null
+                    || !ReferenceEquals(registered.BaseMethodContext,concrete.BaseMethodContext)
+                    || registered.IsStatic!=concrete.IsStatic
+                    || registered.TypeGenericParameters.Count!=concrete.TypeGenericParameters.Count
+                    || registered.MethodGenericParameters.Count!=concrete.MethodGenericParameters.Count
+                    || !registered.TypeGenericParameters.Zip(concrete.TypeGenericParameters,TrivialConstructorRecovery.SameType).All(equal=>equal)
+                    || !registered.MethodGenericParameters.Zip(concrete.MethodGenericParameters,TrivialConstructorRecovery.SameType).All(equal=>equal)
+                    || !TrivialConstructorRecovery.SameType(registered.ReturnType,concrete.ReturnType)
+                    || registered.Parameters.Count!=concrete.Parameters.Count
+                    || !registered.Parameters.Zip(concrete.Parameters,(a,b)=>TrivialConstructorRecovery.SameType(a.ParameterType,b.ParameterType)).All(equal=>equal))
+                    continue;
+                var registeredUnboxed=architecture.GetUnboxedMethodTarget(registered);
+                var registeredEntry=registeredUnboxed!=0?registeredUnboxed:architecture.GetPointerForMethod(registered);
+                if(registeredEntry!=0 && (registeredEntry==entry || NativeRegisteredReceiverLeafProofs.Matches(registered,entry)))return true;
+            }
+            return false;
+        }
+        catch(Exception){return false;}
     }
 
     internal static bool RefineResolvedGenericCall(MethodAnalysisContext caller, Instruction call,
@@ -745,6 +793,11 @@ public static class MetadataResolver
             var unboxed = architecture.GetUnboxedMethodTarget(target);
             var actual = unboxed != 0 ? unboxed : architecture.GetPointerForMethod(target);
             if (actual != 0) return actual == entry;
+            // A metadata-only closed instance may still have its own exact
+            // registered native variant. Use the same definition/arguments/
+            // signature/native-entry proof as unresolved MethodInfo calls;
+            // value arguments do not authorize reference-sharing fallback.
+            if (UnmappedNativeEntryMatches(target, entry)) return true;
             // A stripped MethodSpec can have no separate native variant while
             // still supplying the exact closed metadata for a reference-shared
             // body. Require the SAME definition's proven native entry too;
@@ -821,7 +874,7 @@ public static class MetadataResolver
             {
                 // A tail branch's operand 1 is a stale native return register use,
                 // not a managed result definition. Never reuse it as the result.
-                if (!method.IsVoid && (resolved.IsVoid || method.ReturnType != resolved.ReturnType)
+                if (!method.IsVoid && (resolved.IsVoid || !TrivialConstructorRecovery.SameType(method.ReturnType, resolved.ReturnType))
                     || resolver == null
                     || resolver.ResolveForManaged(resolved).Any(o=>o is StackOffset)
                     || resolved.Parameters.Any(p=>Arm64HfaLayout.Fields(p.ParameterType)!=null))
@@ -1022,6 +1075,19 @@ public static class MetadataResolver
         // an abstract method has no implementation, try to resolve it
         for (var declarer = type; declarer != null; declarer = declarer.BaseType)
         {
+            // Inflated types deliberately do not populate Methods. Abstract
+            // slots have no implementation entry, so consult the exact open
+            // definition, then reuse the normal owner/arity/type-argument
+            // binding. Never infer a declaration by name or drop its arguments.
+            if (declarer is GenericInstanceTypeAnalysisContext genericDeclarer)
+            {
+                var declarations = genericDeclarer.GenericType.Methods
+                    .Where(m => m.Definition?.slot == slot).ToArray();
+                if (declarations.Length > 1) return null;
+                if (declarations.Length == 1)
+                    return BindVirtualContext(type, declarations[0]);
+                continue;
+            }
             if (declarer.Methods.FirstOrDefault(m => m.Definition?.slot == slot) is { } declaration)
                 return BindVirtualContext(type,declaration);
         }

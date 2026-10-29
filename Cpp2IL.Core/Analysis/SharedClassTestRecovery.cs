@@ -24,6 +24,7 @@ public static class SharedClassTestRecovery
     {
         if (method.ControlFlowGraph is not { } graph) return 0;
         var changes = 0;
+        var automaticLoads = new HashSet<Instruction>();
         foreach (var depth in graph.Blocks.ToArray())
         {
             if (!graph.Blocks.Contains(depth) || depth.Successors.Count != 2
@@ -58,8 +59,9 @@ public static class SharedClassTestRecovery
             var success = (equal.Definition.OpCode == OpCode.CheckEqual) != equal.Inverted
                 ? branch.Operands[0] as Block : ancestor.Successors.Single(b => !ReferenceEquals(b, branch.Operands[0]));
             if (success == null || ReferenceEquals(success, failure) || !ancestor.Successors.Contains(success)
-                || !PureAncestor(ancestor, resolver) || !PreservedEscapes(graph, depth, ancestor, resolver)) continue;
+                || !PureAncestor(ancestor, resolver, first.A!, target) || !PreservedEscapes(graph, depth, ancestor, resolver)) continue;
 
+            automaticLoads.UnionWith(resolver.AutomaticLoads);
             var result = new LocalVariable("shared_isinst_" + depth.ID, new(null, "shared_isinst_" + depth.ID), target);
             var flag = new LocalVariable("shared_isinst_null_" + depth.ID, new(null, "shared_isinst_null_" + depth.ID),
                 method.AppContext.SystemTypes.SystemBooleanType);
@@ -73,7 +75,7 @@ public static class SharedClassTestRecovery
             depth.Successors.Insert(0, success); success.Predecessors.Add(depth);
             graph.RemoveUnreachableBlocks(); depth.CalculateBlockType(); changes++;
         }
-        if (changes > 0) DeadCodeEliminator.Run(method);
+        if (changes > 0) Cleanup(graph, automaticLoads);
         return changes;
     }
 
@@ -89,7 +91,7 @@ public static class SharedClassTestRecovery
         => a != null && b != null && a.Kind == b.Kind && ReferenceEquals(a.Object, b.Object)
             && ReferenceEquals(a.Type, b.Type) && (a.A == null ? b.A == null : Same(a.A, b.A));
 
-    private static bool PureAncestor(Block block, Resolver resolver)
+    private static bool PureAncestor(Block block, Resolver resolver, Expr sourceClass, TypeAnalysisContext target)
     {
         foreach (var instruction in block.Instructions)
         {
@@ -104,7 +106,11 @@ public static class SharedClassTestRecovery
             }
             if (instruction.Operands.Any(o => o is FieldReference or AddressOf or ArrayAccess or ArrayLength)) return false;
         }
-        return true;
+        var loads = block.Instructions.Where(i => i is { OpCode: OpCode.Move, Operands: [_, MemoryOperand] }).ToArray();
+        if (loads.Length != 2) return false;
+        var values = loads.Select(i => resolver.Memory((MemoryOperand)i.Operands[1], i)).ToArray();
+        return values.Count(v => v is { Kind: "table" } && Same(v.A, sourceClass)) == 1
+            && values.Count(v => v is { Kind: "ancestor" } && Same(v.A, sourceClass) && ReferenceEquals(v.Type, target)) == 1;
     }
 
     private static bool Contains(IOperand value, LocalVariable local) => value switch
@@ -115,6 +121,39 @@ public static class SharedClassTestRecovery
         AddressOf a => Contains(a.Target, local), ArrayAccess a => ReferenceEquals(a.Array, local) || Contains(a.Index, local),
         ArrayLength a => ReferenceEquals(a.Array, local), _ => false
     };
+
+    // Do not run global legacy DCE here: unused UNKNOWN memory reads can
+    // throw. Only metadata loads actually visited in this matched proof may
+    // disappear. Keep all unrelated reads/calls/stores/implicit definitions.
+    private static void Cleanup(ISILControlFlowGraph graph, HashSet<Instruction> automaticLoads)
+    {
+        bool Used(LocalVariable local) => graph.Instructions.Any(i =>
+            i.Operands.Select((operand, index) => (operand, index)).Any(p =>
+                !(p.operand is LocalVariable && ReferenceEquals(p.operand, i.Destination)
+                    && p.index == (i.IsCall && i.OpCode == OpCode.Call ? 1 : 0)) && Contains(p.operand, local)));
+        bool Pure(Instruction i)
+        {
+            if (i.ImplicitDefinition != null) return false;
+            if (i.OpCode == OpCode.Move)
+                return i.Operands.Count == 2 && (automaticLoads.Contains(i)
+                    || i.Operands[1] is LocalVariable or Immediate or TypeAnalysisContext or FloatLiteral or DoubleLiteral or StringLiteral);
+            return i.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.ShiftLeft or OpCode.ShiftRight
+                or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+                or OpCode.CheckEqual or OpCode.CheckNotEqual or OpCode.CheckLess or OpCode.CheckGreater
+                or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual
+                && i.Operands.All(o => o is LocalVariable or Immediate);
+        }
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var instruction in graph.Instructions)
+            {
+                if (instruction.Destination is not LocalVariable local || !Pure(instruction) || Used(local)) continue;
+                instruction.OpCode = OpCode.Nop; instruction.SetOperands(); changed = true;
+            }
+        } while (changed);
+    }
 
     private static bool PreservedEscapes(ISILControlFlowGraph graph, Block depth, Block ancestor, Resolver resolver)
     {
@@ -137,6 +176,7 @@ public static class SharedClassTestRecovery
         private readonly ISILControlFlowGraph _graph = method.ControlFlowGraph!;
         private readonly HashSet<(LocalVariable, Instruction)> _active = [];
         private readonly Dictionary<(LocalVariable, Instruction), Expr?> _memo = [];
+        public HashSet<Instruction> AutomaticLoads { get; } = [];
         public sealed record Test(Instruction Definition, bool Inverted);
 
         private static bool Barrier(Instruction i) => i.IsCall || i.OpCode is OpCode.IndirectCall or OpCode.Newobj or OpCode.CastClass
@@ -234,14 +274,15 @@ public static class SharedClassTestRecovery
         {
             if (budget > 64 || memory.Index != null || memory.Scale != 0 || memory.Base == null) return null;
             var root = Value(memory.Base, use, budget + 1);
+            Expr Record(Expr value) { AutomaticLoads.Add(use); return value; }
             if (memory.Addend == 0 && use.NativeReadSize == 8 && root is { Kind: "reference", Object: { } obj })
-                return new("object-class", Object: obj);
+                return Record(new("object-class", Object: obj));
             if (memory.Addend == 0x120 && use.NativeReadSize == 1 && root is { Kind: "object-class" or "type" })
-                return new("depth", A: root);
+                return Record(new("depth", A: root));
             if (memory.Addend == 0xC8 && use.NativeReadSize == 8 && root is { Kind: "object-class" })
-                return new("table", A: root);
+                return Record(new("table", A: root));
             if (memory.Addend == -8 && use.NativeReadSize == 8 && root is { Kind: "slot-address", Type: { } target })
-                return new("ancestor", Type: target, A: root.A);
+                return Record(new("ancestor", Type: target, A: root.A));
             return null;
         }
 

@@ -127,14 +127,14 @@ public class Arm64ShiftedLogicalTests
         var method=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"ShiftedLogical",
             app.SystemTypes.SystemVoidType,MethodAttributes.Public|MethodAttributes.Static,[]);
         var native=Native(false,flags?3:2,false,1,1);
-        var lowered=Arm64ShiftedLogicalRecovery.Lower(native,app.SystemTypes)!;
+        var lowered=flags?Arm64ScalarTestFlags.Lower(native,app.SystemTypes)!:Arm64ShiftedLogicalRecovery.Lower(native,app.SystemTypes)!;
         var actual=new List<Instruction>();var addresses=new List<ulong>();
         typeof(NewArmV8InstructionSet).GetField("adrpOffsets",BindingFlags.NonPublic|BindingFlags.Static)!
             .SetValue(null,new Dictionary<string,ulong>());
         typeof(NewArmV8InstructionSet).GetMethod("ConvertInstructionStatement",BindingFlags.NonPublic|BindingFlags.Instance)!
             .Invoke(new NewArmV8InstructionSet(),[native,actual,addresses,method]);
         Assert.That(actual.Take(lowered.Count).Select(i=>i.OpCode),Is.EqualTo(lowered.Select(i=>i.OpCode)));
-        Assert.That(actual.Count>lowered.Count,Is.EqualTo(flags));
+        Assert.That(actual.Count,Is.EqualTo(lowered.Count));
         Assert.That(addresses.All(a=>a==0x1d167d4),Is.True);
     }
 }

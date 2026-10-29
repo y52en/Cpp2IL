@@ -34,10 +34,53 @@ public class SealedClassCastRecoveryTests
     [TestCase("shared-failure", false)]
     [TestCase("success-bypass", false)]
     [TestCase("different-throw", false)]
+    [TestCase("generic-valid", true)]
+    [TestCase("generic-inequality", true)]
+    [TestCase("generic-nonnull-branch", true)]
+    [TestCase("generic-unsealed", false)]
+    [TestCase("generic-value-target", false)]
+    [TestCase("generic-unknown-source", false)]
+    [TestCase("generic-unanchored-source", false)]
+    [TestCase("generic-reassigned-source", false)]
+    [TestCase("generic-wrong-helper", false)]
+    [TestCase("generic-wrong-width", false)]
+    [TestCase("generic-wrong-offset", false)]
+    [TestCase("generic-wrong-class", false)]
+    [TestCase("generic-wrong-target", false)]
+    [TestCase("generic-wrong-null-source", false)]
+    [TestCase("generic-wrong-null-polarity", false)]
+    [TestCase("generic-extra-guard-call", false)]
+    [TestCase("generic-extra-failure-call", false)]
+    [TestCase("generic-extra-transport-call", false)]
+    [TestCase("generic-extra-null-effect", false)]
+    [TestCase("generic-escaping-class", false)]
+    [TestCase("generic-escaping-predicate", false)]
+    [TestCase("generic-escaping-nested-message", false)]
+    [TestCase("generic-shared-failure", false)]
+    [TestCase("generic-success-bypass", false)]
+    [TestCase("generic-different-throw", false)]
+    [TestCase("generic-open-definition", false)]
+    [TestCase("generic-open-argument", false)]
+    [TestCase("generic-missing-argument", false)]
+    [TestCase("generic-extra-argument", false)]
+    [TestCase("generic-pointer-argument", false)]
+    [TestCase("generic-nested-open", false)]
+    [TestCase("generic-nested-closed", true)]
     public void OnlyCompleteSealedClassCastWithNullBypassIsRecovered(string shape, bool expected)
     {
+        var genericCase=shape.StartsWith("generic-");
+        var scenario=genericCase?shape.Substring("generic-".Length):shape;
         var app = TestGameLoader.LoadSimple2019Game(); var t = app.SystemTypes;
-        TypeAnalysisContext target = shape == "unsealed" ? t.SystemObjectType : shape == "value-target" ? t.SystemInt32Type : t.SystemStringType;
+        TypeAnalysisContext target = scenario == "unsealed" ? t.SystemObjectType : scenario == "value-target" ? t.SystemInt32Type : t.SystemStringType;
+        if(genericCase && scenario is not ("unsealed" or "value-target")) {
+            var generic=app.Assemblies.SelectMany(a=>a.Types).Single(x=>x.FullName=="System.Action`1");
+            var argument=scenario=="open-argument"?generic.GenericParameters[0]:scenario=="pointer-argument"?new PointerTypeAnalysisContext(t.SystemInt32Type):t.SystemStringType;
+            if(scenario is "nested-open" or "nested-closed") {
+                var list=app.Assemblies.SelectMany(a=>a.Types).Single(x=>x.FullName=="System.Collections.Generic.List`1");
+                argument=new GenericInstanceTypeAnalysisContext(list,[scenario=="nested-open"?generic.GenericParameters[0]:t.SystemStringType]);
+            }
+            target=scenario=="open-definition"?generic:new GenericInstanceTypeAnalysisContext(generic,scenario=="missing-argument"?[]:scenario=="extra-argument"?[argument,t.SystemObjectType]:[argument]);
+        }
         var exceptionType = app.Assemblies.SelectMany(a => a.Types).Single(x => x.FullName == "System.InvalidCastException");
         LocalVariable Local(string name, TypeAnalysisContext? type = null) => new(name, new(null, name), type);
         var source = Local("source", t.SystemObjectType); var other = Local("other", t.SystemObjectType);
@@ -64,30 +107,30 @@ public class SealedClassCastRecoveryTests
         success.Instructions = [new(11, OpCode.Return, returned)];
         var method = new InjectedMethodAnalysisContext(t.SystemObjectType, "Caller", target, MethodAttributes.Public | MethodAttributes.Static, [])
             { ControlFlowGraph = cfg, ParameterLocals = [source, other], Locals = [source, other, klass, flag, nullFlag, name, message, exception, returned] };
-        if (shape == "inequality") { guard.Instructions[1].OpCode = OpCode.CheckNotEqual; guard.Instructions[^1].SetOperand(0, failure); }
-        if (shape == "nonnull-branch") { before.Instructions[0].OpCode = OpCode.CheckNotEqual; before.Instructions[^1].SetOperand(0, guard); }
-        if (shape == "unknown-source") source.Type = null;
-        if (shape == "unanchored-source") method.ParameterLocals = [other];
-        if (shape == "reassigned-source") success.Instructions.Insert(0, new(12, OpCode.Move, source, other));
-        if (shape == "wrong-width") guard.Instructions[0].NativeReadSize = 4;
-        if (shape == "wrong-offset") failure.Instructions[0].SetOperand(1, new MemoryOperand(klass, addend: 0x48));
-        if (shape == "wrong-class") failure.Instructions[0].SetOperand(1, new MemoryOperand(other, addend: 0x40));
-        if (shape == "wrong-target") failure.Instructions[1].SetOperand(3, t.SystemObjectType);
-        if (shape == "wrong-null-source") before.Instructions[0].SetOperand(1, other);
-        if (shape == "wrong-null-polarity") before.Instructions[0].OpCode = OpCode.CheckNotEqual;
-        if (shape == "extra-guard-call") guard.Instructions.Insert(0, new(12, OpCode.CallVoid, new StringLiteral("callback")));
-        if (shape == "extra-failure-call") failure.Instructions.Insert(0, new(12, OpCode.CallVoid, new StringLiteral("callback")));
-        if (shape == "extra-transport-call") transport.Instructions.Insert(0, new(12, OpCode.CallVoid, new StringLiteral("cleanup")));
-        if (shape == "extra-null-effect") before.Instructions.Insert(1, new(12, OpCode.CallVoid, new StringLiteral("observe")));
-        if (shape == "escaping-class") success.Instructions.Insert(0, new(12, OpCode.Return, klass));
-        if (shape == "escaping-predicate") success.Instructions.Insert(0, new(12, OpCode.Return, flag));
-        if (shape == "escaping-nested-message") success.Instructions.Insert(0, new(12, OpCode.Move, other, new MemoryOperand(message)));
-        if (shape == "shared-failure") Edge(before, failure);
-        if (shape == "success-bypass") Edge(cfg.EntryBlock, success);
-        if (shape == "different-throw") transport.Instructions[0].SetOperand(0, other);
+        if (scenario == "inequality") { guard.Instructions[1].OpCode = OpCode.CheckNotEqual; guard.Instructions[^1].SetOperand(0, failure); }
+        if (scenario == "nonnull-branch") { before.Instructions[0].OpCode = OpCode.CheckNotEqual; before.Instructions[^1].SetOperand(0, guard); }
+        if (scenario == "unknown-source") source.Type = null;
+        if (scenario == "unanchored-source") method.ParameterLocals = [other];
+        if (scenario == "reassigned-source") success.Instructions.Insert(0, new(12, OpCode.Move, source, other));
+        if (scenario == "wrong-width") guard.Instructions[0].NativeReadSize = 4;
+        if (scenario == "wrong-offset") failure.Instructions[0].SetOperand(1, new MemoryOperand(klass, addend: 0x48));
+        if (scenario == "wrong-class") failure.Instructions[0].SetOperand(1, new MemoryOperand(other, addend: 0x40));
+        if (scenario == "wrong-target") failure.Instructions[1].SetOperand(3, t.SystemObjectType);
+        if (scenario == "wrong-null-source") before.Instructions[0].SetOperand(1, other);
+        if (scenario == "wrong-null-polarity") before.Instructions[0].OpCode = OpCode.CheckNotEqual;
+        if (scenario == "extra-guard-call") guard.Instructions.Insert(0, new(12, OpCode.CallVoid, new StringLiteral("callback")));
+        if (scenario == "extra-failure-call") failure.Instructions.Insert(0, new(12, OpCode.CallVoid, new StringLiteral("callback")));
+        if (scenario == "extra-transport-call") transport.Instructions.Insert(0, new(12, OpCode.CallVoid, new StringLiteral("cleanup")));
+        if (scenario == "extra-null-effect") before.Instructions.Insert(1, new(12, OpCode.CallVoid, new StringLiteral("observe")));
+        if (scenario == "escaping-class") success.Instructions.Insert(0, new(12, OpCode.Return, klass));
+        if (scenario == "escaping-predicate") success.Instructions.Insert(0, new(12, OpCode.Return, flag));
+        if (scenario == "escaping-nested-message") success.Instructions.Insert(0, new(12, OpCode.Move, other, new MemoryOperand(message)));
+        if (scenario == "shared-failure") Edge(before, failure);
+        if (scenario == "success-bypass") Edge(cfg.EntryBlock, success);
+        if (scenario == "different-throw") transport.Instructions[0].SetOperand(0, other);
         foreach (var block in cfg.Blocks) block.CalculateBlockType();
         var original = cfg.Instructions.ToArray();
-        Assert.That(SealedClassCastRecovery.Recover(method, guard, address => shape != "wrong-helper" && address == 0x1234), Is.EqualTo(expected));
+        Assert.That(SealedClassCastRecovery.Recover(method, guard, address => scenario != "wrong-helper" && address == 0x1234), Is.EqualTo(expected));
         if (!expected) Assert.That(cfg.Instructions, Is.EqualTo(original));
         else
         {

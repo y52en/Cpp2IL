@@ -16,6 +16,7 @@ public class InlineClassTestRecoveryTests
     [TestCase("not-depth-to-ancestor",true)]
     [TestCase("not-equal-to-failure",true)]
     [TestCase("nullable-success-join",true)]
+    [TestCase("split-failure-copies",true)]
     [TestCase("source-redefined",false)]
     [TestCase("source-unanchored",false)]
     [TestCase("source-in-guard",true)]
@@ -133,6 +134,20 @@ public class InlineClassTestRecoveryTests
         {
             method.ParameterLocals=[other];depth.Instructions.Insert(0,new(19,OpCode.Move,obj,other));
             guard.Instructions[0].SetOperand(1,other);application.SetOperand(1,other);fallback.SetOperand(1,other);
+        }
+        if(shape=="split-failure-copies")
+        {
+            var failureA=new Block{ID=26};var failureB=new Block{ID=27};
+            var output=Local("edge-result",t.SystemObjectType);
+            cfg.Blocks.Add(failureA);cfg.Blocks.Add(failureB);
+            cfg.RemoveEdge(depth,fail);cfg.RemoveEdge(ancestor,fail);
+            Edge(depth,failureA);Edge(ancestor,failureB);Edge(failureA,fail);Edge(failureB,fail);
+            depth.Instructions[^1].SetOperand(0,failureA);
+            // Equality branches to success; its implicit false edge is B.
+            failureA.Instructions=[new(-1,OpCode.Move,output,new Immediate(0)),new(30,OpCode.Jump,fail)];
+            failureB.Instructions=[new(-1,OpCode.Move,output,new Immediate(0)),new(31,OpCode.Jump,fail)];
+            Assert.That(EquivalentEdgeCopyRecovery.Run(method),Is.EqualTo(1));
+            Assert.That(cfg.Blocks.Contains(failureB),Is.False);
         }
         var original=cfg.Instructions.ToArray();
         Assert.That(InlineClassTestRecovery.Recover(method),Is.EqualTo(expected?1:0));

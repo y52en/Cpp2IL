@@ -30,6 +30,7 @@ public class HiddenStructReturnRecoveryTests
         Assert.That(HiddenStructReturnRecovery.Run(caller),Is.True);
         Assert.That(((Register)call.Destination!).Name,Is.EqualTo("stack_-A0"));
         Assert.That(call.ImplicitDefinition?.Name,Is.EqualTo("X0"));
+        Assert.That(call.NativeReturnStorageSize,Is.EqualTo(TypeSizes.UnboxedSize(type,8)));
     }
 
     [Test]

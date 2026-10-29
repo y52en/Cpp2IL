@@ -325,6 +325,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
+        var internalAddresses = insns.Select(instruction => instruction.Address).ToHashSet();
 
         var tables = new Dictionary<int, Arm64JumpTableRecovery.Table>();
         if (context.AppContext.Binary is LibCpp2IL.Elf.ElfFile elf)
@@ -334,6 +335,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             if (!tables.TryGetValue(i, out var table))
             {
+                if (Cpp2IL.Core.Analysis.Arm64InternalContinuationRecovery.For(context, insns[i], internalAddresses) is { } continuation)
+                {
+                    // Map BOTH the original branch address (incoming CFG
+                    // edges) and the detached thunk's real instruction PCs.
+                    var start = instructions.Count;
+                    foreach (var native in continuation)
+                        ConvertInstructionStatement(native, instructions, addresses, context);
+                    if (instructions.Count == start) throw new InvalidOperationException("internal continuation emitted no load/jump");
+                    addresses[start] = insns[i].Address;
+                    continue;
+                }
                 ConvertInstructionStatement(insns[i], instructions, addresses, context);
                 continue;
             }
@@ -541,12 +553,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     >= Arm64Register.X0 and <= Arm64Register.X31 => 8,
                     _ => 0,
                 };
-            Add(address, OpCode.CheckLess, flagN, temp1, Imm(0));
-            Add(address, OpCode.CheckEqual, flagZ, temp1, Imm(0));
+            borrow.NativeComparisonSize=flagDifference.NativeArithmeticSize;
+            Add(address, OpCode.CheckLess, flagN, temp1, Imm(0)).NativeComparisonSize=flagDifference.NativeArithmeticSize;
+            Add(address, OpCode.CheckEqual, flagZ, temp1, Imm(0)).NativeComparisonSize=flagDifference.NativeArithmeticSize;
             Add(address, OpCode.Xor, temp2, op0, op1);
             Add(address, OpCode.Xor, temp3, op0, temp1);
             Add(address, OpCode.And, temp4, temp2, temp3);
-            Add(address, OpCode.CheckLess, flagV, temp4, Imm(0));
+            Add(address, OpCode.CheckLess, flagV, temp4, Imm(0)).NativeComparisonSize=flagDifference.NativeArithmeticSize;
         }
 
         void EmitResultFlags(IOperand result)
@@ -632,11 +645,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.MOV:
             case Arm64Mnemonic.MOVZ:
             case Arm64Mnemonic.FMOV:
-            case Arm64Mnemonic.SXTB:
-            case Arm64Mnemonic.SXTH:
-            case Arm64Mnemonic.SXTW:
-            case Arm64Mnemonic.UXTB:
-            case Arm64Mnemonic.UXTH:
                 if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                 {
                     Add(address, OpCode.Nop);
@@ -655,6 +663,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     && instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X30
                     && instruction.Op1Reg is >= Arm64Register.X0 and <= Arm64Register.X30)
                     copied.NativeRegisterCopySize = 8;
+                break;
+            case Arm64Mnemonic.SXTB:
+            case Arm64Mnemonic.SXTH:
+            case Arm64Mnemonic.SXTW:
+            case Arm64Mnemonic.UXTB:
+            case Arm64Mnemonic.UXTH:
+                if(Cpp2IL.Core.Analysis.Arm64IntegerExtendRecovery.Lower(instruction,context.AppContext.SystemTypes) is {} integerExtensions)
+                    foreach(var lowered in integerExtensions)
+                        Add(address,lowered.OpCode,lowered.Operands.ToList()).NativeIntegerSourceView=lowered.NativeIntegerSourceView;
+                else Add(address,OpCode.Invalid,new StringLiteral("Unsupported integer extension: "+instruction));
                 break;
             // A numeric conversion is not a copy and must survive propagation.
             case Arm64Mnemonic.FCVT:
@@ -804,6 +822,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.ADDS:
             case Arm64Mnemonic.SUBS:
                 {
+                    if(instruction.Mnemonic==Arm64Mnemonic.ADDS)
+                    {
+                        if(Analysis.Arm64ScalarTestFlags.Lower(instruction,context.AppContext.SystemTypes) is {} nativeAdditionFlags)
+                            foreach(var operation in nativeAdditionFlags)
+                            {
+                                var lifted=Add(address,operation.OpCode,operation.Operands.ToList());
+                                lifted.NativeArithmeticSize=operation.NativeArithmeticSize;
+                                lifted.NativeComparisonSize=operation.NativeComparisonSize;
+                                lifted.NativeIntegerSourceView=operation.NativeIntegerSourceView;
+                                lifted.UnsignedComparison=operation.UnsignedComparison;
+                            }
+                        else Add(address,OpCode.Invalid,new StringLiteral("Unsupported ADDS flags: "+instruction));
+                        break;
+                    }
                     var isSubtract = instruction.Mnemonic is Arm64Mnemonic.SUB or Arm64Mnemonic.SUBS;
                     var setsFlags = instruction.Mnemonic is Arm64Mnemonic.ADDS or Arm64Mnemonic.SUBS;
 
@@ -886,21 +918,31 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     Add(address, comparison.OpCode, comparison.Operands.ToList());
                 break;
             case Arm64Mnemonic.CMN:
-                // cmp against the negated operand
-                if (instruction.Op1Kind == Arm64OperandKind.Immediate)
-                {
-                    EmitCompareFlags(ConvertOperand(instruction, 0), Imm(-instruction.Op1Imm));
-                }
-                else
-                {
-                    var negated = new Register(null, "TEMP");
-                    Add(address, OpCode.Negate, negated, ConvertOperand(instruction, 1));
-                    EmitCompareFlags(ConvertOperand(instruction, 0), negated);
-                }
-
+                if(Analysis.Arm64ScalarTestFlags.Lower(instruction,context.AppContext.SystemTypes) is {} additionFlags)
+                    foreach(var operation in additionFlags)
+                    {
+                        var lifted=Add(address,operation.OpCode,operation.Operands.ToList());
+                        lifted.NativeArithmeticSize=operation.NativeArithmeticSize;
+                        lifted.NativeComparisonSize=operation.NativeComparisonSize;
+                        lifted.NativeIntegerSourceView=operation.NativeIntegerSourceView;
+                        lifted.UnsignedComparison=operation.UnsignedComparison;
+                    }
+                else Add(address,OpCode.Invalid,new StringLiteral("Unsupported CMN flags: "+instruction));
                 break;
             case Arm64Mnemonic.TST:
                 {
+                    if(Analysis.Arm64ScalarTestFlags.Lower(instruction,context.AppContext.SystemTypes) is {} testedFlags)
+                    {
+                        foreach(var operation in testedFlags)
+                        {
+                            var lifted=Add(address,operation.OpCode,operation.Operands.ToList());
+                            lifted.NativeArithmeticSize=operation.NativeArithmeticSize;
+                            lifted.NativeComparisonSize=operation.NativeComparisonSize;
+                            lifted.NativeIntegerSourceView=operation.NativeIntegerSourceView;
+                            lifted.UnsignedComparison=operation.UnsignedComparison;
+                        }
+                        break;
+                    }
                     if(Analysis.Arm64ShiftedLogicalRecovery.Lower(instruction,context.AppContext.SystemTypes) is {} shifted)
                     {
                         foreach(var operation in shifted)Add(address,operation.OpCode,operation.Operands.ToList()).NativeArithmeticSize=operation.NativeArithmeticSize;
@@ -916,6 +958,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.ORR:
             case Arm64Mnemonic.EOR:
                 {
+                    if(instruction.Mnemonic==Arm64Mnemonic.ANDS)
+                    {
+                        if(Analysis.Arm64ScalarTestFlags.Lower(instruction,context.AppContext.SystemTypes) is {} nativeLogicalFlags)
+                            foreach(var operation in nativeLogicalFlags)
+                            {
+                                var lifted=Add(address,operation.OpCode,operation.Operands.ToList());
+                                lifted.NativeArithmeticSize=operation.NativeArithmeticSize;
+                                lifted.NativeComparisonSize=operation.NativeComparisonSize;
+                                lifted.NativeIntegerSourceView=operation.NativeIntegerSourceView;
+                                lifted.UnsignedComparison=operation.UnsignedComparison;
+                            }
+                        else Add(address,OpCode.Invalid,new StringLiteral("Unsupported ANDS flags: "+instruction));
+                        break;
+                    }
                     if(Analysis.Arm64ShiftedLogicalRecovery.Lower(instruction,context.AppContext.SystemTypes) is {} shifted)
                     {
                         foreach(var operation in shifted)Add(address,operation.OpCode,operation.Operands.ToList()).NativeArithmeticSize=operation.NativeArithmeticSize;
@@ -1101,6 +1157,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 {
                     var call = Add(address, OpCode.IndirectCall, ConvertOperand(instruction, 0), new Register(null, "X0") /* return value */);
                     call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, address));
+                    call.MarkArm64IndirectArgumentSnapshot();
                     break;
                 }
             case Arm64Mnemonic.BR:
@@ -1108,6 +1165,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     // tail call or jump table, either way it leaves the method
                     var jump = Add(address, OpCode.IndirectJump, ConvertOperand(instruction, 0), new Register(null, "X0") /* return value */);
                     jump.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, address));
+                    jump.MarkArm64IndirectArgumentSnapshot();
                     break;
                 }
             case Arm64Mnemonic.B:
@@ -1148,7 +1206,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var target = (ulong)((long)address + instruction.Op1Imm);
                     var temp = new Register(null, "TEMP");
 
-                    Add(address, OpCode.CheckEqual, temp, ConvertOperand(instruction, 0), Imm(0));
+                    Add(address, OpCode.CheckEqual, temp, ConvertOperand(instruction, 0), Imm(0)).NativeComparisonSize=instruction.Op0Reg switch
+                    {
+                        >= Arm64Register.W0 and <= Arm64Register.W31 => 4,
+                        >= Arm64Register.X0 and <= Arm64Register.X31 => 8,
+                        _ => 0,
+                    };
 
                     if (instruction.Mnemonic == Arm64Mnemonic.CBNZ)
                         Add(address, OpCode.Not, temp, temp);

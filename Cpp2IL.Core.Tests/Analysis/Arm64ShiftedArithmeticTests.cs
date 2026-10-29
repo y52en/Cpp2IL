@@ -40,12 +40,22 @@ public class Arm64ShiftedArithmeticTests
             .SetValue(null, new Dictionary<string,ulong>());
         typeof(NewArmV8InstructionSet).GetMethod("ConvertInstructionStatement", BindingFlags.NonPublic | BindingFlags.Instance)!
             .Invoke(new NewArmV8InstructionSet(), new object[]{native, emitted, addresses, method});
-        var shift = emitted[0];
+        var shift = emitted.Single(i=>i.OpCode==OpCode.ShiftLeft);
         Assert.That(shift.OpCode, Is.EqualTo(OpCode.ShiftLeft));
         Assert.That(((Immediate)shift.Operands[2]).Value, Is.EqualTo(4));
-        Assert.That(((Register)shift.Operands[1]).Name, Is.EqualTo("X9"));
-        Assert.That(emitted[1].OpCode, Is.EqualTo(opcode));
-        Assert.That(emitted[1].Operands[2], Is.EqualTo(shift.Destination));
+        if(high==0xab)
+        {
+            var rightView=emitted.Single(i=>i.OpCode==OpCode.NumericConvert && Equals(i.Destination,shift.Operands[1]));
+            Assert.That(((Register)rightView.Operands[3]).Name,Is.EqualTo("X9"));
+            var shiftedView=emitted.Single(i=>i.OpCode==OpCode.NumericConvert && Equals(i.Operands[3],shift.Destination));
+            Assert.That(emitted.Single(i=>i.OpCode==opcode).Operands[2],Is.EqualTo(shiftedView.Destination));
+        }
+        else
+        {
+            Assert.That(((Register)shift.Operands[1]).Name, Is.EqualTo("X9"));
+            Assert.That(emitted[1].OpCode, Is.EqualTo(opcode));
+            Assert.That(emitted[1].Operands[2], Is.EqualTo(shift.Destination));
+        }
         Assert.That(addresses.All(a=>a==0x1bfb524), Is.True);
         Assert.That(emitted.Count > 2, Is.EqualTo(flags));
         if (high == 0xeb)

@@ -55,6 +55,45 @@ public static class NullBypassRuntimeCastRecovery
             && x.GenericArguments.Zip(y.GenericArguments,(l,r)=>SameCastType(l,r,depth+1)).All(equal=>equal);
     }
 
+    // A lowered return phi may also receive a value from unrelated application
+    // branches. Preserve every such edge, copy and continuation instruction.
+    // Only exact synthetic reference copies immediately before proven incoming
+    // edges qualify. A write inside the continuation, a missing incoming value,
+    // an unknown type or an escaped cast result is not this pattern.
+    internal static bool ProvenContinuationCopies(Block success,Block guard,Block nullPath,
+        LocalVariable? merged,LocalVariable output,TypeAnalysisContext target,
+        Instruction[] writes,Instruction castCopy,Instruction zero)
+    {
+        var extra=success.Predecessors.Where(b=>!ReferenceEquals(b,guard) && !ReferenceEquals(b,nullPath)).ToArray();
+        if(extra.Length==0)return writes.Length==2;
+        if(merged==null || success.Predecessors.Distinct().Count()!=success.Predecessors.Count
+            || writes.Length!=extra.Length+2)return false;
+        foreach(var block in extra)
+        {
+            var body=block.Instructions.Where(i=>i.OpCode!=OpCode.Nop).ToArray();
+            if(block.Successors.Count==1 && ReferenceEquals(block.Successors[0],success))
+            {
+                if(body.LastOrDefault() is {OpCode:OpCode.Jump,Operands:[var jump]})
+                {if(!ReferenceEquals(jump,success))return false;body=body[..^1];}
+            }
+            else if(block.Successors.Count==2 && block.Successors.Distinct().Count()==2
+                && block.Successors.Contains(success)
+                && body.LastOrDefault() is {OpCode:OpCode.ConditionalJump,
+                    Operands:[Block branch,LocalVariable {Type:{FullName:"System.Boolean"}}]}
+                && block.Successors.Contains(branch))body=body[..^1];
+            else return false;
+            if(body.LastOrDefault() is not {Index:-1,OpCode:OpCode.Move,NativeWriteSize:0,
+                Operands:[var destination,var value]} copy || !ReferenceEquals(destination,output)
+                || !writes.Contains(copy) || ReferenceEquals(copy,castCopy) || ReferenceEquals(copy,zero))return false;
+            if(value is not Immediate {Value:0}
+                && (value is not LocalVariable {Type:{} type} local || ReferenceEquals(local,output)
+                    || !ReferenceType(type) || !SameCastType(type,target)))return false;
+            if(block.Instructions.Count(i=>ReferenceEquals(i.Destination,output))!=1)return false;
+        }
+        return writes.All(i=>ReferenceEquals(i,castCopy) || ReferenceEquals(i,zero)
+            || extra.Any(b=>b.Instructions.Contains(i)));
+    }
+
     internal static bool TryRecover(MethodAnalysisContext method,Block guard,Func<ulong,bool> helper)
     {
         var graph=method.ControlFlowGraph!;
@@ -93,9 +132,12 @@ public static class NullBypassRuntimeCastRecovery
                  Instruction {OpCode:OpCode.ConditionalJump,Operands:[Block nullPath,var nullCondition]}]
             || !ReferenceEquals(nullObject,source) || !ReferenceEquals(nullCondition,nullFlag)
             || nullFlag.Type?.FullName!="System.Boolean" || ReferenceEquals(nullPath,guard)
-            || !before.Successors.Contains(nullPath) || nullPath.Predecessors.Count!=1
-            || !ReferenceEquals(nullPath.Predecessors[0],before) || nullPath.Successors.Count!=1
-            || !ReferenceEquals(nullPath.Successors[0],success) || success.Predecessors.Count!=2
+            // The zero-result continuation may also be reached by an earlier
+            // application failure (e.g. missing/empty assets). Its entire
+            // body and ALL incoming edges remain unchanged by this rewrite.
+            || !before.Successors.Contains(nullPath) || !nullPath.Predecessors.Contains(before)
+            || nullPath.Successors.Count!=1
+            || !ReferenceEquals(nullPath.Successors[0],success) || success.Predecessors.Count<2
             || !success.Predecessors.Contains(guard) || !success.Predecessors.Contains(nullPath)
             || !InlineClassTestRecovery.StableSource(method,source,guard))return false;
         var nullBody=nullPath.Instructions.Where(i=>i.OpCode!=OpCode.Nop).ToArray();
@@ -106,7 +148,8 @@ public static class NullBypassRuntimeCastRecovery
         var resultWrites=graph.Instructions.Where(i=>ReferenceEquals(i.Destination,result)).ToArray();
         var outputWrites=graph.Instructions.Where(i=>ReferenceEquals(i.Destination,output)).ToArray();
         if(resultWrites.Length!=(merged==null?2:1) || !resultWrites.Contains(cast)
-            || outputWrites.Length!=2 || !outputWrites.Contains(mergeCopy??cast) || !outputWrites.Contains(zero)
+            || !outputWrites.Contains(mergeCopy??cast) || !outputWrites.Contains(zero)
+            || !ProvenContinuationCopies(success,guard,nullPath,merged,output,target,outputWrites,mergeCopy??cast,zero)
             || graph.Instructions.Count(i=>ReferenceEquals(i.Destination,nullFlag))!=1
             || graph.Instructions.Count(i=>ReferenceEquals(i.Destination,flag))!=1
             || graph.Instructions.Count(i=>ReferenceEquals(i.Destination,nonnull))!=1

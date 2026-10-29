@@ -99,6 +99,26 @@ public class Arm64ExtendedArithmeticTests
             .SetValue(null, new Dictionary<string, ulong>());
         typeof(NewArmV8InstructionSet).GetMethod("ConvertInstructionStatement", BindingFlags.NonPublic | BindingFlags.Instance)!
             .Invoke(new NewArmV8InstructionSet(), [native, emitted, addresses, method]);
+        if(high==0xab)
+        {
+            var narrow=emitted.Single(i=>i.OpCode==OpCode.NumericConvert && i.NativeIntegerSourceView);
+            Assert.That(((TypeAnalysisContext)narrow.Operands[1]).FullName,Is.EqualTo(signed?"System.Int32":"System.UInt32"));
+            Assert.That(((Register)narrow.Operands[3]).Name,Is.EqualTo("X9"));
+            var extension=emitted.Single(i=>i.OpCode==OpCode.NumericConvert && Equals(i.Operands[3],narrow.Destination));
+            Assert.That(((TypeAnalysisContext)extension.Operands[1]).FullName,Is.EqualTo(signed?"System.Int64":"System.UInt64"));
+            var rightView=emitted.Single(i=>i.OpCode==OpCode.NumericConvert && Equals(i.Operands[3],extension.Destination));
+            var shifted=emitted.Single(i=>i.OpCode==OpCode.ShiftLeft);
+            Assert.That(shifted.Operands[1],Is.EqualTo(rightView.Destination));
+            Assert.That(((Immediate)shifted.Operands[2]).Value,Is.EqualTo(shift));
+            var shiftedView=emitted.Single(i=>i.OpCode==OpCode.NumericConvert && Equals(i.Operands[3],shifted.Destination));
+            var sum=emitted.Single(i=>i.OpCode==OpCode.Add);
+            Assert.That(sum.Operands[2],Is.EqualTo(shiftedView.Destination));
+            Assert.That(sum.NativeArithmeticSize,Is.EqualTo(8));
+            Assert.That(emitted.Where(i=>i.NativeComparisonSize!=0).Select(i=>((Register)i.Destination!).Name),
+                Is.EquivalentTo(new[]{"N","Z","C","V"}));
+            Assert.That(addresses.All(address=>address==0x17b5040),Is.True);
+            return;
+        }
         Assert.That(emitted[0].OpCode, Is.EqualTo(OpCode.NumericConvert), "truncate the original W register, including stale high bits");
         Assert.That(((TypeAnalysisContext)emitted[0].Operands[1]).FullName, Is.EqualTo(signed ? "System.Int32" : "System.UInt32"));
         Assert.That(emitted[1].OpCode, Is.EqualTo(OpCode.NumericConvert));
