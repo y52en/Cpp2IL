@@ -2,6 +2,7 @@ using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
@@ -39,9 +40,12 @@ public static class SsaFieldAddressRecovery
                     { Base: LocalVariable pointer, Index: null, Scale: 0, Addend: >= 0 } memory
                     || !definitions.TryGetValue(pointer, out var address)
                     || address is not { OpCode: OpCode.Add, NativeArithmeticSize: 8,
-                        Operands: [_, LocalVariable { Type: { IsValueType: false } type } root, Immediate { Value: >= 0 } offset] }
-                    || type.Type is not (Il2CppTypeEnum.IL2CPP_TYPE_CLASS or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST or Il2CppTypeEnum.IL2CPP_TYPE_STRING)
+                        Operands: [_, LocalVariable { Type: { } type } root, Immediate { Value: >= 0 } offset] }
                     || offset.Value > int.MaxValue - memory.Addend) continue;
+                var byrefOwner = type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } element }
+                    && !element.HasAnyGenericParameters() ? element : null;
+                if (byrefOwner == null && (type.IsValueType || type.Type is not
+                    (Il2CppTypeEnum.IL2CPP_TYPE_CLASS or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST or Il2CppTypeEnum.IL2CPP_TYPE_STRING))) continue;
                 if (cfg.Instructions.Any(i => i.ImplicitDefinition != null
                     && (Equals(i.ImplicitDefinition, pointer.Register) || Equals(i.ImplicitDefinition, root.Register)))) continue;
                 var addressOwner = cfg.Blocks.Single(b => b.Instructions.Contains(address));
@@ -56,7 +60,21 @@ public static class SsaFieldAddressRecovery
                     var rootOwner = cfg.Blocks.Single(b => b.Instructions.Contains(rootWrites[0]));
                     if (!Before(rootWrites[0], rootOwner, address, addressOwner)) continue;
                 }
-                instruction.SetOperand(n, new MemoryOperand(root, addend: offset.Value + memory.Addend)); changed++;
+                var combinedOffset = offset.Value + memory.Addend;
+                if (byrefOwner != null)
+                {
+                    // The pointer phi has already been split by PhiMemoryLoadRecovery.
+                    // Replace each original dereference in place; do not hoist loads,
+                    // narrow a shared address local, or interpret an address as a value.
+                    // An exact, unique metadata field and complete native byte width
+                    // are mandatory. In particular no legacy offset-only fallback for
+                    // padding, overlapping fields, partial reference reads or open types.
+                    var field = NestedFieldAccess.Find(byrefOwner, root, combinedOffset, width, method);
+                    if (field == null) continue;
+                    instruction.SetOperand(n, field);
+                }
+                else instruction.SetOperand(n, new MemoryOperand(root, addend: combinedOffset));
+                changed++;
             }
         }
         return changed;

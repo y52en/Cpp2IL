@@ -23,6 +23,8 @@ public static class SsaSimplifier
         foreach(var instruction in cfg.Instructions)
             foreach(var operand in instruction.Operands)
                 if(operand is AddressOf {Target:LocalVariable storage})addressed.Add(storage);
+                else if(operand is AddressOf {Target:FieldReference fieldStorage}
+                    && fieldStorage.RequiresReceiver && fieldStorage.Local.Type?.IsValueType==true)addressed.Add(fieldStorage.Local);
         var definitionCounts = cfg.Instructions.Select(i => i.Destination).OfType<LocalVariable>()
             .GroupBy(l => l).ToDictionary(g => g.Key, g => g.Count());
 
@@ -146,6 +148,11 @@ public static class SsaSimplifier
                 case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement:
                     field.ReplaceLocal(fieldLocal, fieldReplacement);
                     break;
+                case AddressOf { Target: FieldReference addressField } when addressField.RequiresReceiver
+                    && resolved.TryGetValue(addressField.Local, out var receiverValue) && receiverValue is LocalVariable receiver:
+                    addressField.ReplaceLocal(addressField.Local, receiver);
+                    instruction.SetOperand(i, instruction.Operands[i]);
+                    break;
             }
         }
     }
@@ -180,6 +187,9 @@ public static class SsaSimplifier
                         case AddressOf { Target: LocalVariable addressed }:
                             reads.Add(addressed);
                             break;
+                        case AddressOf { Target: FieldReference fieldAddress } when fieldAddress.RequiresReceiver:
+                            reads.Add(fieldAddress.Local);
+                            break;
                         case AddressOf { Target: ArrayAccess element }:
                             reads.Add(element.Array);
                             if (element.Index is LocalVariable elementIndex) reads.Add(elementIndex);
@@ -206,6 +216,7 @@ public static class SsaSimplifier
             LocalVariable => true,
             MemoryOperand => false,
             FieldReference => false,
+            AddressOf { Target: FieldReference } => false,
             ArrayAccess or ArrayLength => false,
             // initobj defines mutable value-type storage. Its SSA local can
             // subsequently receive field writes (including HFA lane assembly)
@@ -248,6 +259,8 @@ public static class SsaSimplifier
                 result.Add(field.Local);
             foreach (var operand in instruction.Operands)
                 if (operand is AddressOf { Target: LocalVariable addressed }) result.Add(addressed);
+                else if (operand is AddressOf { Target: FieldReference fieldAddress }
+                    && fieldAddress.RequiresReceiver && IsStructStorage(fieldAddress.Local)) result.Add(fieldAddress.Local);
         }
         // The native ABI passes value-type this and hidden return buffers by
         // address, even though their pointee type annotates pointer registers.

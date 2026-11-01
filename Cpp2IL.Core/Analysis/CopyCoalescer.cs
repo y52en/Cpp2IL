@@ -102,6 +102,9 @@ public static class CopyCoalescer
             foreach (var operand in instruction.Operands)
                 if (operand is AddressOf { Target: LocalVariable addressed })
                     escapedSlotNumbers.Add(addressed.Register.Number);
+                else if (operand is AddressOf { Target: FieldReference fieldAddress }
+                    && fieldAddress.RequiresReceiver && fieldAddress.Local.Type?.IsValueType == true)
+                    escapedSlotNumbers.Add(fieldAddress.Local.Register.Number);
 
         if (escapedSlotNumbers.Count == 0)
             return [];
@@ -273,6 +276,9 @@ public static class CopyCoalescer
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
                     break;
+                case AddressOf { Target: FieldReference fieldAddress } when fieldAddress.RequiresReceiver:
+                    yield return fieldAddress.Local;
+                    break;
             }
         }
     }
@@ -310,6 +316,10 @@ public static class CopyCoalescer
                             break;
                         case AddressOf { Target: LocalVariable addressed } addressOf:
                             addressOf.Target = groups.Find(addressed);
+                            break;
+                        case AddressOf { Target: FieldReference addressField } when addressField.RequiresReceiver:
+                            addressField.ReplaceLocal(addressField.Local, groups.Find(addressField.Local));
+                            instruction.SetOperand(i, instruction.Operands[i]);
                             break;
                     }
                 }

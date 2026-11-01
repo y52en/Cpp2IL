@@ -21,6 +21,7 @@ public class Instruction : IOperand
 
             field = value;
             _arm64IndirectArgumentSnapshot = null;
+            _arm64DirectArgumentSnapshot = null;
             ResetSources();
         }
     }
@@ -33,6 +34,35 @@ public class Instruction : IOperand
     // Keep a storage witness too: externally aliased constructor lists cannot
     // silently reorder a previously certified snapshot.
     private IOperand[]? _arm64IndirectArgumentSnapshot;
+    private IOperand[]? _arm64DirectArgumentSnapshot;
+
+    // Direct unmanaged BL calls have the same ordered X0..X7/V0..V7
+    // storage contract. Record it in the lifter before SSA substitutes values.
+    internal bool HasArm64DirectArgumentSnapshot
+    {
+        get
+        {
+            if (OpCode != OpCode.Call || NativeDirectCallTarget == 0
+                || _operands.Count != 18 || _arm64DirectArgumentSnapshot is not { Length: 18 } witness
+                || _operands[0] is not Immediate target || target.UnsignedValue != NativeDirectCallTarget) return false;
+            for (var i = 0; i < 18; i++)
+                if (!ReferenceEquals(_operands[i], witness[i])) return false;
+            return true;
+        }
+    }
+
+    internal bool MarkArm64DirectArgumentSnapshot()
+    {
+        _arm64DirectArgumentSnapshot = null;
+        if (OpCode != OpCode.Call || NativeDirectCallTarget == 0 || _operands.Count != 18
+            || _operands[0] is not Immediate target || target.UnsignedValue != NativeDirectCallTarget
+            || _operands[1] is not Register { Name: "X0" }) return false;
+        for (var i = 0; i < 16; i++)
+            if (_operands[2 + i] is not Register r
+                || r.Name != (i < 8 ? "X" + i : "V" + (i - 8))) return false;
+        _arm64DirectArgumentSnapshot = _operands.ToArray();
+        return true;
+    }
 
     internal bool HasArm64IndirectArgumentSnapshot
     {
@@ -130,6 +160,7 @@ public class Instruction : IOperand
     public void SetOperands(params List<IOperand> operands)
     {
         _arm64IndirectArgumentSnapshot = null;
+        _arm64DirectArgumentSnapshot = null;
         _operands = operands;
         ResetSources();
     }
@@ -137,15 +168,19 @@ public class Instruction : IOperand
     public void SetOperand(int index, IOperand value)
     {
         var preserveSnapshot = HasArm64IndirectArgumentSnapshot;
+        var preserveDirectSnapshot = HasArm64DirectArgumentSnapshot;
         _operands[index] = value;
         if (preserveSnapshot) _arm64IndirectArgumentSnapshot![index] = value;
         else _arm64IndirectArgumentSnapshot = null;
+        if (preserveDirectSnapshot) _arm64DirectArgumentSnapshot![index] = value;
+        else _arm64DirectArgumentSnapshot = null;
         ResetSources();
     }
 
     public void AddOperands(IEnumerable<IOperand> operands)
     {
         _arm64IndirectArgumentSnapshot = null;
+        _arm64DirectArgumentSnapshot = null;
         _operands.AddRange(operands);
         ResetSources();
     }
@@ -153,6 +188,7 @@ public class Instruction : IOperand
     public void RemoveOperandAt(int index)
     {
         _arm64IndirectArgumentSnapshot = null;
+        _arm64DirectArgumentSnapshot = null;
         _operands.RemoveAt(index);
         ResetSources();
     }

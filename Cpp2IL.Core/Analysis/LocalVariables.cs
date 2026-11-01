@@ -172,6 +172,9 @@ public static class LocalVariables
                 usedLocals.Add(definedVar);
         }
 
+        foreach (var operand in cfg.Instructions.SelectMany(i => i.Operands))
+            if (operand is AddressOf { Target: FieldReference fieldAddress } && fieldAddress.RequiresReceiver)
+                usedLocals.Add(fieldAddress.Local);
         method.Locals.RemoveAll(x => !usedLocals.Contains(x));
     }
 

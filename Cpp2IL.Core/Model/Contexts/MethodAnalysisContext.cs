@@ -409,6 +409,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
         TraceAnalysis("ssa-locals");
+        NativeWord32IdentityRecovery.Run(this);
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
@@ -450,6 +451,14 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterfaceDispatchRecovery.RunWithState(this,interfaceDispatchState);
         LocalVariables.ResolveTypesAndFields(this);
         TraceAnalysis("typed");
+
+        if (Arm64AtomicCompareExchangeRecovery.Run(this) > 0)
+            LocalVariables.ResolveTypesAndFields(this);
+
+        // W0 is a scalar view of a metadata-proven small aggregate return;
+        // do not let a whole managed struct reach a native-width comparison.
+        if (Arm64AggregateReturnLowWordRecovery.Run(this) > 0)
+            LocalVariables.ResolveTypesAndFields(this);
 
         // Optional full-FDE masked accessor evidence is receiver-sensitive;
         // never register these equivalent functions as global address aliases.
@@ -496,6 +505,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         TypedStructZeroRecovery.Run(this);
 
         if (SsaFieldAddressRecovery.Run(this) > 0)
+            LocalVariables.ResolveTypesAndFields(this);
+        if (NativeScalarValueRecovery.Run(this) > 0)
             LocalVariables.ResolveTypesAndFields(this);
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
@@ -575,6 +586,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InlineClassCastRecovery.Run(this);
         RuntimeCheckedCastRecovery.Run(this);
         NullBypassRuntimeCastRecovery.Run(this);
+          DominatedRuntimeCastRecovery.Run(this);
         SealedClassCastRecovery.Run(this);
         InlineClassTestRecovery.Run(this);
         SharedClassTestRecovery.Run(this);
@@ -612,6 +624,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         PackedScalarConstantStoreRecovery.Run(this);
         NativePublicFieldAccessorRecovery.Run(this);
         NativeAggregateFieldAccessorRecovery.Run(this);
+        NativeSelectorCloneRecovery.Run(this);
+        LateScalarTypeRecovery.Run(this);
+        SignedConstantDivisionRecovery.Run(this);
         LocalVariables.RemoveUnused(this);
     }
 

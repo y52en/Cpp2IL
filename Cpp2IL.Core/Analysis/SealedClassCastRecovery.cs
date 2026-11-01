@@ -64,13 +64,19 @@ public static class SealedClassCastRecovery
         if (check.Skip(2).SkipLast(1).Any(i => !Copy(i))) return false;
         var before = guard.Predecessors[0];
         var prefix = before.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
-        if (before.Successors.Count != 2 || !before.Successors.Contains(guard) || !before.Successors.Contains(success)
-            || prefix.LastOrDefault() is not { OpCode: OpCode.ConditionalJump, Operands: [Block nullBranch, var nullCondition] }) return false;
+        if (before.Successors.Count != 2 || before.Successors.Distinct().Count() != 2 || !before.Successors.Contains(guard)
+            || prefix.LastOrDefault() is not { OpCode: OpCode.ConditionalJump, Operands: [Block nullBranch, var nullCondition] }
+            || !before.Successors.Contains(nullBranch)) return false;
+        // A cast preserves null. The null bypass need not be the non-null
+        // success: native callers may skip a subsequent member access on null.
+        // Keep the entire bypass and its effects; insert castclass immediately
+        // before the original null test, after its preceding effects.
+        var nullBypass = before.Successors.Single(b => !ReferenceEquals(b, guard));
         var nullChecks = prefix.Where(i => i is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
             Operands: [_, var value, Immediate { Value: 0 }] } && ReferenceEquals(value, source)).ToArray();
         if (nullChecks is not [Instruction nullCheck] || nullCheck.Operands[0] is not LocalVariable nullFlag
             || !ReferenceEquals(nullCondition, nullFlag)
-            || (nullCheck.OpCode == OpCode.CheckEqual ? !ReferenceEquals(nullBranch, success) : !ReferenceEquals(nullBranch, guard))) return false;
+            || (nullCheck.OpCode == OpCode.CheckEqual ? !ReferenceEquals(nullBranch, nullBypass) : !ReferenceEquals(nullBranch, guard))) return false;
         var nullIndex = Array.IndexOf(prefix, nullCheck);
         if (prefix.Skip(nullIndex + 1).SkipLast(1).Any(i => !Copy(i))
             || !InlineClassTestRecovery.StableSource(method, source, guard)

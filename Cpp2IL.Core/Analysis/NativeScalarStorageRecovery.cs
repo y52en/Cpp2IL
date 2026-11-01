@@ -70,6 +70,17 @@ public static class NativeScalarStorageRecovery
                     when instruction.Operands is [var target,var left,var right]:
                     var allowed=instruction.NativeFloatingPointSize switch {4=>R4,8=>R8,_=>
                         instruction.NativeArithmeticSize switch {4=>I4,8=>I8,_=>Integers}};
+                    // The physical AND is still 64-bit. But a constant with no
+                    // bits above bit31 and an independently known I4 result
+                    // permits I4 storage for its input component. The solver
+                    // still checks EVERY definition/use: a pointer, opaque use,
+                    // float or conflicting I8 consumer poisons that component.
+                    // Do not mistake this storage equation for native width,
+                    // and never apply it to a 62-bit DateTime payload mask.
+                    if(instruction.NativeFloatingPointSize==0 && instruction.NativeArithmeticSize==8
+                        && instruction.OpCode==OpCode.And && View(target).Fixed==I4
+                        && (left is Immediate {Value:>=0 and <=uint.MaxValue}
+                            || right is Immediate {Value:>=0 and <=uint.MaxValue}))allowed=I4;
                     Pair(target,left,allowed);Pair(target,right,allowed);Pair(left,right,allowed);break;
                 case OpCode.Divide when instruction.NativeFloatingPointSize is 4 or 8
                     && instruction.Operands is [var target,var left,var right]:

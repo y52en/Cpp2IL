@@ -5,7 +5,9 @@ using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
+using ElementType = AsmResolver.PE.DotNet.Metadata.Tables.ElementType;
 using Cpp2IL.Core.Graphs;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils.AsmResolver;
@@ -18,6 +20,40 @@ public static class IlGenerator
     private const string HelpersNamespace = "Cpp2ILInjected";
     private const string HelpersTypeName = "Cpp2ILHelpers";
     private const string NoteIssueMethodName = "NoteDecompilerIssue";
+
+    // Primitive array opcodes give the evaluation stack its CLI normalized
+    // type (for example Char/UInt16 -> int32), with the declared load/store
+    // width and signedness. Do not substitute enum/struct/generic/reference
+    // element tokens: their exact type contract must stay explicit.
+    internal static void EmitArrayElement(CilInstructionCollection instructions, TypeSignature type, bool store)
+    {
+        CilOpCode? primitive = type is CorLibTypeSignature core ? (store ? core.ElementType switch
+        {
+            ElementType.Boolean or ElementType.I1 or ElementType.U1 => CilOpCodes.Stelem_I1,
+            ElementType.Char or ElementType.I2 or ElementType.U2 => CilOpCodes.Stelem_I2,
+            ElementType.I4 or ElementType.U4 => CilOpCodes.Stelem_I4,
+            ElementType.I8 or ElementType.U8 => CilOpCodes.Stelem_I8,
+            ElementType.I or ElementType.U => CilOpCodes.Stelem_I,
+            ElementType.R4 => CilOpCodes.Stelem_R4,
+            ElementType.R8 => CilOpCodes.Stelem_R8,
+            _ => (CilOpCode?)null
+        } : core.ElementType switch
+        {
+            ElementType.I1 => CilOpCodes.Ldelem_I1,
+            ElementType.Boolean or ElementType.U1 => CilOpCodes.Ldelem_U1,
+            ElementType.I2 => CilOpCodes.Ldelem_I2,
+            ElementType.Char or ElementType.U2 => CilOpCodes.Ldelem_U2,
+            ElementType.I4 => CilOpCodes.Ldelem_I4,
+            ElementType.U4 => CilOpCodes.Ldelem_U4,
+            ElementType.I8 or ElementType.U8 => CilOpCodes.Ldelem_I8,
+            ElementType.I or ElementType.U => CilOpCodes.Ldelem_I,
+            ElementType.R4 => CilOpCodes.Ldelem_R4,
+            ElementType.R8 => CilOpCodes.Ldelem_R8,
+            _ => (CilOpCode?)null
+        }) : null;
+        if (primitive.HasValue) instructions.Add(primitive.Value);
+        else instructions.Add(store ? CilOpCodes.Stelem : CilOpCodes.Ldelem, type.ToTypeDefOrRef());
+    }
 
     public static void InjectHelpersType(ApplicationAnalysisContext appContext)
     {
@@ -62,7 +98,7 @@ public static class IlGenerator
         var body = new CilMethodBody()
         {
             InitializeLocals = true, // Without this ILSpy does: CompilerServices.Unsafe.SkipInit(out object obj);
-            ComputeMaxStackOnBuild = false // There's stack imbalance somewhere, but this works for now
+            ComputeMaxStackOnBuild = false // Checked after all branch fixups; incomplete bodies remain explicit diagnostics.
         };
 
         definition.CilMethodBody = body;
@@ -96,6 +132,9 @@ public static class IlGenerator
 
             if (operand is AddressOf { Target: LocalVariable addressed })
                 local = addressed;
+
+            if (operand is AddressOf { Target: FieldReference addressedField } && addressedField.RequiresReceiver)
+                local = addressedField.Local;
 
             if (local != null && !context.Locals.Contains(local))
                 context.Locals.Add(local);
@@ -237,6 +276,31 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
+
+        // DLL_IL_RECOVERY must emit a valid header for balanced recovered CIL.
+        // Keep incomplete bodies diagnostic rather than suppressing their error
+        // or preventing unrelated methods from being recovered.
+        if (!TryFinalizeMaxStack(body))
+        {
+            const string warning = "CIL evaluation stack is unbalanced; body is not compile-verified.";
+            context.AddWarning(warning);
+            instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
+            instructions.Add(CilOpCodes.Call, writeLine);
+        }
+    }
+
+    internal static bool TryFinalizeMaxStack(CilMethodBody body)
+    {
+        try
+        {
+            var maximum = body.ComputeMaxStack();
+            body.MaxStack = maximum;
+            return true;
+        }
+        catch (StackImbalanceException)
+        {
+            return false;
+        }
     }
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
@@ -338,6 +402,18 @@ public static class IlGenerator
                 break;
 
             case OpCode.Move:
+                // Initialize the actual local, not a scratch struct followed
+                // by a copy. Both are CLI initobj at this exact program point;
+                // keep .locals init and all nonlocal destination handling.
+                if (instruction.Operands is [LocalVariable initializedLocal, DefaultStructValue defaultValue]
+                    && ReferenceEquals(initializedLocal.Type, defaultValue.Type) && defaultValue.Type.IsValueType
+                    && !initializedLocal.IsThis && ParameterFor(initializedLocal, method) == null
+                    && locals.TryGetValue(initializedLocal, out var initializedStorage))
+                {
+                    instructions.Add(CilOpCodes.Ldloca, initializedStorage);
+                    instructions.Add(CilOpCodes.Initobj, defaultValue.Type.ToTypeSignature().ToTypeDefOrRef());
+                    break;
+                }
                 if (instruction.Operands[1] is MemoryOperand { Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } referent } }, Index: null, Scale: 0, Addend: 0 }
                     && instruction.NativeReadSize > 0
                     && instruction.NativeReadSize != (referent.IsValueType ? TypeSizes.UnboxedSize(referent, context.AppContext.Binary.PointerSizeBytes) : context.AppContext.Binary.PointerSizeBytes))
@@ -359,7 +435,7 @@ public static class IlGenerator
                     LoadLocal(target.Array, method, locals);
                     LoadArrayIndex(target.Index, method, locals, writeLine);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stored);
-                    instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
+                    EmitArrayElement(instructions, stored.ToTypeSignature(), true);
                     break;
                 }
 
@@ -658,6 +734,16 @@ public static class IlGenerator
                 if (instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
                     && TryEmitExactTypeComparison(instruction, method, locals, writeLine))
                     break;
+
+                if (instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
+                    && TryEmitScalarStructComparison(instruction, method, locals, writeLine))
+                    break;
+
+                if (instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual or OpCode.CheckLess
+                    or OpCode.CheckGreater or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual
+                    && instruction.Operands.Skip(1).Any(o => DestinationType(o) is { IsValueType: true } t
+                        && !TypeSizes.IsScalarValueType(t) && !t.HasAnyGenericParameters()))
+                    throw new DecompilerException("Unresolved native aggregate comparison; scalar payload/getter proof required");
 
                 // Float arithmetic on a promoted integer operand needs an explicit conversion, so both
                 // operands are coerced to the (float) result type. A no-op when they already match.
@@ -1015,6 +1101,15 @@ public static class IlGenerator
             case AddressOf { Target: LocalVariable addressed }:
                 instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
+            case AddressOf { Target: FieldReference addressedField }:
+                if (addressedField.Field.IsStatic)
+                    instructions.Add(CilOpCodes.Ldsflda, addressedField.Field.ToFieldDescriptor());
+                else
+                {
+                    LoadFieldReceiver(addressedField, method, locals);
+                    instructions.Add(CilOpCodes.Ldflda, addressedField.Field.ToFieldDescriptor());
+                }
+                break;
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadLocal(elementAddress.Array, method, locals);
                 LoadArrayIndex(elementAddress.Index, method, locals, writeLine);
@@ -1024,8 +1119,8 @@ public static class IlGenerator
             case ArrayAccess arrayAccess:
                 LoadLocal(arrayAccess.Array, method, locals);
                 LoadArrayIndex(arrayAccess.Index, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldelem,
-                    ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
+                EmitArrayElement(instructions,
+                    ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature(), false);
                 break;
             case FieldReference field:
                 if (field.Field.IsStatic)
@@ -1154,6 +1249,34 @@ public static class IlGenerator
         return true;
     }
     
+    private static bool TryEmitScalarStructComparison(Instruction instruction, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (instruction.Operands.Count != 3 || DestinationType(instruction.Operands[1]) is not { IsValueType: true } left
+            || DestinationType(instruction.Operands[2]) is not { IsValueType: true } right
+            || !TrivialConstructorRecovery.SameType(left, right)
+            || NativeScalarStructComparison.Find(left, instruction.NativeComparisonSize) is not { } getter) return false;
+        var code = method.CilMethodBody!.Instructions;
+        foreach (var operand in instruction.Operands.Skip(1))
+        {
+            // A fresh, addressable CURRENT value preserves operand evaluation
+            // order and needs no private field access or unsafe reinterpretation.
+            var scratch = new CilLocalVariable(left.ToTypeSignature());
+            method.CilMethodBody.LocalVariables.Add(scratch);
+            LoadOperand(operand, method, locals, writeLine);
+            code.Add(CilOpCodes.Stloc, scratch);
+            code.Add(CilOpCodes.Ldloca, scratch);
+            code.Add(CilOpCodes.Call, getter.ToMethodDescriptor());
+        }
+        code.Add(CilOpCodes.Ceq);
+        if (instruction.OpCode == OpCode.CheckNotEqual)
+        {
+            code.Add(CilOpCodes.Ldc_I4_0); code.Add(CilOpCodes.Ceq);
+        }
+        StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+        return true;
+    }
+
     private static bool IsKlassPointerLoad(IOperand operand, out LocalVariable local)
     {
         if (operand is MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type.IsValueType: false } baseLocal })
@@ -1255,8 +1378,13 @@ public static class IlGenerator
             else LoadLocal(root,method,locals);
             return;
         }
-        LoadFieldReceiver(field.Parent,root,method,locals);
-        method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldflda,field.Parent.Field.ToFieldDescriptor());
+        if(field.Parent.Field.IsStatic)
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsflda,field.Parent.Field.ToFieldDescriptor());
+        else
+        {
+            LoadFieldReceiver(field.Parent,root,method,locals);
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldflda,field.Parent.Field.ToFieldDescriptor());
+        }
     }
 
     private static void StoreToOperand(IOperand operand, MethodDefinition method,
@@ -1300,7 +1428,7 @@ public static class IlGenerator
                 LoadLocal(arrayAccess.Array, method, locals);
                 LoadArrayIndex(arrayAccess.Index, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldloc, elementScratch);
-                instructions.Add(CilOpCodes.Stelem, elementType.ToTypeSignature().ToTypeDefOrRef());
+                EmitArrayElement(instructions, elementType.ToTypeSignature(), true);
                 break;
 
             case MemoryOperand memory:

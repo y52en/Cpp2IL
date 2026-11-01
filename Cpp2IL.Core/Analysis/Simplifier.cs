@@ -103,6 +103,7 @@ public static class Simplifier
                         // checks, and moves exceptions across observable work.
                         // Preserve the snapshot; ordinary local copies still fold.
                         if (instruction.Operands[1] is MemoryOperand or FieldReference or ArrayAccess or ArrayLength
+                            or AddressOf { Target: FieldReference }
                             && !SingleImmediateLoadUse(block,i,local))
                             continue;
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
@@ -256,6 +257,9 @@ public static class Simplifier
                 foreach (var operand in instruction.Operands)
                     if (operand is AddressOf { Target: LocalVariable addressed })
                         counts[addressed] = 2;
+                    else if (operand is AddressOf { Target: FieldReference fieldAddress }
+                        && fieldAddress.RequiresReceiver && fieldAddress.Local.Type?.IsValueType == true)
+                        counts[fieldAddress.Local] = 2;
             }
 
             return counts;
@@ -339,6 +343,14 @@ public static class Simplifier
                         {
                             field.ReplaceLocal(local, fieldReplacement);
                         }
+                        else if (operand is AddressOf { Target: FieldReference addressField }
+                            && addressField.RequiresReceiver && replacement is LocalVariable addressReceiver
+                            && ReferenceEquals(addressField.Local, local))
+                        {
+                            addressField.ReplaceLocal(local, addressReceiver);
+                            instruction.SetOperand(j, operand);
+                            UpdateSourceCache(currentBlock, instruction);
+                        }
                     }
                 }
 
@@ -391,6 +403,12 @@ public static class Simplifier
                     foreach (var operand in instruction.Operands)
                     {
                         if (operand is FieldReference field && field.Local == local)
+                        {
+                            usedByMemory = true;
+                            return true;
+                        }
+                        if (operand is AddressOf { Target: FieldReference addressField }
+                            && addressField.RequiresReceiver && ReferenceEquals(addressField.Local, local))
                         {
                             usedByMemory = true;
                             return true;

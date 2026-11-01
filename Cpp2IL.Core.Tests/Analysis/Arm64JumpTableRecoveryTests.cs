@@ -76,6 +76,54 @@ public class Arm64JumpTableRecoveryTests
         return data;
     }
 
+    [TestCase(0x39406268u, "LDRB")]
+    [TestCase(0x79403268u, "LDRH")]
+    [TestCase(0x38418268u, "LDURB")]
+    [TestCase(0x78418268u, "LDURH")]
+    [TestCase(0x39c06268u, "LDRSB")]
+    [TestCase(0x79c03268u, "LDRSH")]
+    [TestCase(0x38c18268u, "LDURSB")]
+    [TestCase(0x78c18268u, "LDURSH")]
+    public void NarrowWLoadsProveTheWholeXSelectorHasZeroUpperBits(uint seedWord, string mnemonic)
+    {
+        var bytes = (byte[])Native.Clone();
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, seedWord);
+        var body = Body(bytes);
+        Assert.That(body[0].Mnemonic.ToString(), Is.EqualTo(mnemonic));
+        Assert.That(body[0].Op0Reg, Is.EqualTo(Arm64Register.W8));
+        var table = Arm64JumpTableRecovery.Recognize(body, 1, (_, _) => Data());
+        Assert.That(table, Is.Not.Null);
+        Assert.That(table!.Targets, Is.EqualTo(Offsets.Select(o => unchecked((ulong)((long)Base + o)))));
+        Assert.That(table.Selector, Is.EqualTo(Arm64Register.X8));
+        Assert.That(table.GuardIndex, Is.EqualTo(1));
+    }
+
+    [TestCase(0x39006268u)] // STRB W8: reads W8, does not define it.
+    [TestCase(0x79003268u)] // STRH W8: same operand spelling, wrong direction.
+    public void NarrowStoresDoNotProveSelectorDefinition(uint seedWord)
+    {
+        var bytes = (byte[])Native.Clone();
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, seedWord);
+        Assert.That(Arm64JumpTableRecovery.Recognize(Body(bytes), 1, (_, _) => Data()), Is.Null);
+    }
+
+    [Test]
+    public void OriginalScheduleEnumHalfwordDispatchPreservesAllFourNativeEdges()
+    {
+        // Fixed scope row318, method RVA1C0E878, original dispatch at1C0E93C.
+        var bytes = Convert.FromHexString("a80a40791f0d0071a8030054894b00f029a11d912879a8b80801098b00011fd6");
+        var body = Disassembler.Disassemble(bytes, 0x1c0e93c, new(true, true, false)).ToList();
+        foreach (var target in new ulong[] { 0x1c0e95c, 0x1c0e9ac, 0x1c0e9b8 })
+            body.AddRange(Disassembler.Disassemble(Convert.FromHexString("1f2003d5"), target, new(true, true, false)));
+        var tables = Arm64JumpTableRecovery.RecognizeAll(body, (address, count) =>
+        {
+            Assert.That(address, Is.EqualTo(0x2581768UL)); Assert.That(count, Is.EqualTo(16));
+            return Convert.FromHexString("44d268fff4d168fff4d168fff4d168ff");
+        });
+        Assert.That(tables.Count, Is.EqualTo(1));
+        Assert.That(tables[0].Targets, Is.EqualTo(new ulong[] { 0x1c0e9ac, 0x1c0e95c, 0x1c0e95c, 0x1c0e95c }));
+    }
+
     [TestCase("closed",2)]
     [TestCase("unresolved-jump",0)]
     [TestCase("missing-second-data",0)]

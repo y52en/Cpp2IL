@@ -61,6 +61,43 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
             && address >= section.VirtualAddress && address - section.VirtualAddress <= section.Size
             && (ulong)width <= section.Size - (address - section.VirtualAddress);
 
+    private Dictionary<ulong,int>? _unwindFunctionLengths;
+    private readonly object _unwindFunctionLengthsLock = new();
+
+    public bool TryGetUnwindFunctionLength(ulong address, out int length)
+    {
+        lock (_unwindFunctionLengthsLock)
+        {
+        if (_unwindFunctionLengths == null)
+        {
+            _unwindFunctionLengths = new();
+            if (!is32Bit && _elfFileIdent?.Endianness == 1)
+            {
+                var sections = _elfSectionHeaderEntries.Where(s => s.Name == ".eh_frame"
+                    && s.Type == ElfSectionEntryType.SHT_PROGBITS
+                    && (s.Flags & ElfSectionHeaderFlags.SHF_ALLOC) != 0
+                    && (s.Flags & ElfSectionHeaderFlags.SHF_WRITE) == 0).ToArray();
+                if (sections.Length == 1 && sections[0].RawAddress <= (ulong)_raw.Length
+                    && sections[0].Size <= (ulong)_raw.Length - sections[0].RawAddress
+                    && sections[0].Size <= int.MaxValue)
+                    _unwindFunctionLengths = ElfEhFrameBounds.Read(_raw, (int)sections[0].RawAddress,
+                        (int)sections[0].Size, sections[0].VirtualAddress);
+            }
+        }
+        }
+        length = 0;
+        if (!_unwindFunctionLengths.TryGetValue(address, out var candidate) || candidate <= 0) return false;
+        var segments = _elfProgramHeaderEntries.Where(p => p.Type == ElfProgramEntryType.PT_LOAD
+            && (p.Flags & (ElfProgramHeaderFlags.PF_R | ElfProgramHeaderFlags.PF_X))
+                == (ElfProgramHeaderFlags.PF_R | ElfProgramHeaderFlags.PF_X)
+            && address >= p.VirtualAddress && address - p.VirtualAddress <= p.RawSize
+            && (ulong)candidate <= p.RawSize - (address - p.VirtualAddress)).ToArray();
+        if (segments.Length != 1) return false;
+        var raw = segments[0].RawAddress + address - segments[0].VirtualAddress;
+        if (raw > (ulong)_raw.Length || (ulong)candidate > (ulong)_raw.Length - raw) return false;
+        length = candidate; return true;
+    }
+
     public ElfFile(MemoryStream input) : base(input)
     {
         _raw = input.GetBuffer();

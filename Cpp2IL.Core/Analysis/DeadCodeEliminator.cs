@@ -66,6 +66,8 @@ public static class DeadCodeEliminator
         if(instruction.OpCode is OpCode.Divide or OpCode.Modulo)return true;
         if(instruction is not {OpCode:OpCode.Move,Operands:[_,var source]})return false;
         if(source is ArrayLength or ArrayAccess or AddressOf {Target:ArrayAccess})return true;
+        if(source is AddressOf {Target:FieldReference addressField}
+            && (addressField.Field.BackingData!=null || addressField.Field.DeclaringType is InjectedTypeAnalysisContext))return true;
         return source is FieldReference field
             && (field.Field.BackingData!=null || field.Field.DeclaringType is InjectedTypeAnalysisContext)
             && (field.Field.IsStatic || field.Local.Type is not (RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext));
@@ -154,6 +156,9 @@ public static class DeadCodeEliminator
                 // Handing out a slot's address is a read of it as far as we can tell, whatever the callee then does with it.
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
+                    break;
+                case AddressOf { Target: FieldReference fieldAddress } when fieldAddress.RequiresReceiver:
+                    yield return fieldAddress.Local;
                     break;
                 case AddressOf { Target: ArrayAccess addressedElement }:
                     foreach (var used in ArrayAccessLocals(addressedElement))

@@ -94,6 +94,7 @@ public static class CovariantArrayStoreRecovery
 
         var visited = new HashSet<Block>();
         IOperand? boundsIndex = null;
+        Instruction? boundsComparison = null;
         var current = success;
         var found = false;
         while (visited.Add(current) && visited.Count <= 6)
@@ -104,11 +105,13 @@ public static class CovariantArrayStoreRecovery
                 if (instruction is { OpCode: OpCode.Move, Operands: [ArrayAccess access, var stored] })
                 {
                     if (!ReferenceEquals(access.Array, array) || !SameReferenceValue(stored, value)
-                        || (boundsIndex != null && !SameIndex(access.Index, boundsIndex))) return false;
+                        || (boundsIndex != null && !SameIndex(access.Index, boundsIndex)
+                            && !Word32ArrayIndexProof.SameIndex(method,boundsComparison,boundsIndex,access.Index,instruction))) return false;
                     found = true; break;
                 }
                 if (!PureFlag(instruction) && instruction.OpCode != OpCode.Jump
-                    && !PureBoundsCalculation(instruction,array,cfg,current,defs)) return false;
+                    && !PureBoundsCalculation(instruction,array,cfg,current,defs)
+                    && !Word32ArrayIndexProof.PureConversion(method,instruction)) return false;
             }
             if (found) break;
             if (current.Successors.Count == 1) { current = current.Successors[0]; continue; }
@@ -138,7 +141,7 @@ public static class CovariantArrayStoreRecovery
             var pass = passOnTarget ? target : current.Successors.Single(b => !ReferenceEquals(b, target));
             var fail = current.Successors.Single(b => !ReferenceEquals(b, pass));
             if (!PlainThrow(cfg, fail, "System.IndexOutOfRangeException")) return false;
-            boundsIndex = index; current = pass;
+            boundsIndex = index; boundsComparison = comparison; current = pass;
         }
         if (!found) return false;
         call.OpCode = OpCode.Nop; call.SetOperands();

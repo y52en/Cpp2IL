@@ -237,7 +237,8 @@ public static class InlinedFieldMethodRecovery
                     {
                         if (instructions[index + n] is not { OpCode: OpCode.Move, Operands: [FieldReference actual, var value] }
                             || actual.Local != field.Local || actual.Parent != null
-                            || value is not (LocalVariable or Immediate or FloatLiteral or DoubleLiteral)) { valid = false; break; }
+                            || value is not (LocalVariable or Immediate or FloatLiteral or DoubleLiteral)
+                                && !(reorder && ScalarFieldArgument(template, value, instructions[index+n]))) { valid = false; break; }
                         var store=reorder?template.Stores.SingleOrDefault(s=>ReferenceEquals(s.Field,actual.Field)):template.Stores[n];
                         if(store==null || actual.Offset!=store.Field.Offset || actual.Field!=store.Field
                             || reorder && instructions[index+n].NativeWriteSize!=store.NativeWidth)
@@ -267,6 +268,10 @@ public static class InlinedFieldMethodRecovery
                     }
                     matches.Add((template, arguments, length));
                 }
+                if (matches.Count != 1 && allowScalarReordering && ConstantReset(matches) is {} reset)
+                {
+                    matches.Clear(); matches.Add(reset);
+                }
                 if (matches.Count != 1) continue;
                 var match = matches[0];
                 instructions[index].OpCode = OpCode.CallVoid;
@@ -276,6 +281,55 @@ public static class InlinedFieldMethodRecovery
             }
         }
         return count;
+    }
+
+    // A single scalar store can evaluate one same-receiver field argument at
+    // the exact original read/store point. Multiple stores may read values
+    // changed by earlier stores; never turn those reads into eager arguments.
+    private static bool ScalarFieldArgument(Template template, IOperand value, Instruction instruction)
+    {
+        if (template.Stores.Length != 1 || template.Tail != null || template.Method.Parameters.Count != 1
+            || value is not FieldReference { Parent: null } source
+            || instruction.Operands[0] is not FieldReference destination
+            || !ReferenceEquals(source.Local,destination.Local)
+            || !ReferenceEquals(source.Field.DeclaringType,template.Method.DeclaringType)
+            || !ReferenceEquals(source.Local.Type,source.Field.DeclaringType)
+            || source.Offset != source.Field.Offset || source.Offset < 16)return false;
+        var width=ScalarWidth(source.Field);
+        return width>0 && instruction.NativeWriteSize==width
+            && (instruction.NativeReadSize==0 || instruction.NativeReadSize==width)
+            && template.Stores[0].NativeWidth==width
+            && TrivialConstructorRecovery.SameType(source.Field.FieldType,template.Method.Parameters[0].ParameterType)
+            && TrivialConstructorRecovery.SameType(source.Field.FieldType,destination.Field.FieldType);
+    }
+
+    // A parameterized setter and one constant reset may encode the same
+    // complete native effect for these exact literal arguments. Prefer the
+    // uniquely specialized reset; never choose by name or guess between two
+    // resets. Unknown widths, references, lifecycle effects and tails reject.
+    private static (Template Template, IOperand[] Arguments, int Length)? ConstantReset(
+        List<(Template Template, IOperand[] Arguments, int Length)> matches)
+    {
+        if(matches.Count<2)return null;
+        var candidates=matches.Where(m=>m.Template.Method.Parameters.Count==0
+            && m.Template.Tail==null && m.Template.Stores.All(s=>s.Constant!=null)
+            && IndependentScalarStores(m.Template)).ToArray();
+        if(candidates.Length!=1)return null;
+        var reset=candidates[0];
+        foreach(var other in matches)
+        {
+            if(other.Length!=reset.Length || other.Template.Tail!=null
+                || !IndependentScalarStores(other.Template))return null;
+            foreach(var store in other.Template.Stores)
+            {
+                var expected=reset.Template.Stores.SingleOrDefault(s=>ReferenceEquals(s.Field,store.Field));
+                if(expected==null || expected.NativeWidth!=store.NativeWidth)return null;
+                var value=store.Constant ?? (store.Parameter>=0 && store.Parameter<other.Arguments.Length
+                    ?other.Arguments[store.Parameter]:null);
+                if(value==null || !Same(expected.Constant!,value))return null;
+            }
+        }
+        return reset;
     }
 
     static bool Same(IOperand a, IOperand b) => ReferenceEquals(a, b) || (a,b)switch {

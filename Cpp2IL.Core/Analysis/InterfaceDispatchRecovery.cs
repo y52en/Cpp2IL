@@ -183,7 +183,7 @@ public static class InterfaceDispatchRecovery
         if (slowCall is not { Operands: [Immediate, _, _, var interfaceArg, var slotArg, ..] })
             return Reject("slow-helper-call");
 
-        if (ResolveDispatchOperand(interfaceArg, definitions) is not TypeAnalysisContext declaringInterface)
+        if (ResolveDispatchInterface(interfaceArg, definitions) is not { } declaringInterface)
             return Reject("interface-metadata");
 
         if (declaringInterface is RuntimeMethodInfoAnalysisContext
@@ -277,6 +277,25 @@ public static class InterfaceDispatchRecovery
 
     private static Instruction? Definition(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
         => definitions.TryGetValue(local, out var definition) ? definition : null;
+
+    // RGCTX resolution produces an exact Il2CppClass metadata operand. Its
+    // represented interface is the lookup key, not the synthetic handle type.
+    // Never infer this from a local's Type alone or unwrap arbitrary handles.
+    internal static TypeAnalysisContext? ResolveDispatchInterface(IOperand operand,
+        Dictionary<LocalVariable, Instruction> definitions)
+    {
+        if (ResolveDispatchOperand(operand, definitions) is not TypeAnalysisContext type)
+            return null;
+        if (type is RuntimeClassTypeAnalysisContext handle)
+        {
+            if (!ReferenceEquals(handle.AppContext, handle.RepresentedType.AppContext))
+                return null;
+            type = handle.RepresentedType;
+        }
+        return type is not RuntimeMethodInfoAnalysisContext
+            && (type is GenericInstanceTypeAnalysisContext { GenericType.IsInterface: true } || type.IsInterface)
+                ? type : null;
+    }
 
     internal static IOperand? ResolveDispatchOperand(IOperand operand, Dictionary<LocalVariable, Instruction> definitions)
     {

@@ -203,6 +203,54 @@ public class IlGeneratorTests
         type.Methods.Add(method);IlGenerator.GenerateIl(caller,method);
         Assert.That(method.CilMethodBody!.Instructions.Any(i=>i.OpCode==CilOpCodes.Initobj),Is.True);
         Assert.That(method.CilMethodBody!.Instructions.Any(i=>i.OpCode==CilOpCodes.Ldc_I4_0),Is.False);
+        Assert.That(method.CilMethodBody.InitializeLocals, Is.True);
+        Assert.That(method.CilMethodBody.LocalVariables.Count, Is.EqualTo(1), "No scratch struct for a local initialization");
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void DirectLocalInitializationClearsExistingValueAndManagedReferences(bool withReference)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var context = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Test", "InitializedData", app.SystemTypes.SystemValueTypeType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.SequentialLayout);
+        var number = context.InjectFieldContext("Number", app.SystemTypes.SystemInt64Type, System.Reflection.FieldAttributes.Public);
+        var text = withReference ? context.InjectFieldContext("Text", app.SystemTypes.SystemStringType,
+            System.Reflection.FieldAttributes.Public) : null;
+        var local = new LocalVariable("value", new Register(null, "value"), context);
+        var body = new List<Instruction> { new(0, OpCode.Move, new FieldReference(number, local, 0), new Immediate(99)) };
+        if (text != null) body.Add(new(1, OpCode.Move, new FieldReference(text, local, 8), new StringLiteral("before")));
+        body.Add(new(2, OpCode.Move, local, new DefaultStructValue(context)));
+        body.Add(new(3, OpCode.Return, local));
+        var caller = new InjectedMethodAnalysisContext(context, "Reset", context,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+        { ControlFlowGraph = new(body), Locals = [local], ParameterLocals = [], AnalysisWarnings = [] };
+        var assembly = new AssemblyDefinition("LocalInit" + Guid.NewGuid().ToString("N"), new Version(1, 0));
+        var module = new ModuleDefinition("LocalInit.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        assembly.Modules.Add(module);
+        var definition = new TypeDefinition("Test", "InitializedData", TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            new TypeReference(module, module.CorLibTypeFactory.CorLibScope, "System", "ValueType"));
+        module.TopLevelTypes.Add(definition); context.PutExtraData("AsmResolverType", definition);
+        var numberDefinition = new FieldDefinition("Number", FieldAttributes.Public, new FieldSignature(module.CorLibTypeFactory.Int64));
+        definition.Fields.Add(numberDefinition); number.PutExtraData("AsmResolverField", numberDefinition);
+        if (text != null)
+        {
+            var textDefinition = new FieldDefinition("Text", FieldAttributes.Public, new FieldSignature(module.CorLibTypeFactory.String));
+            definition.Fields.Add(textDefinition); text.PutExtraData("AsmResolverField", textDefinition);
+        }
+        var method = new MethodDefinition("Reset", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(definition.ToTypeSignature(true)));
+        definition.Methods.Add(method); IlGenerator.GenerateIl(caller, method);
+        Assert.That(method.CilMethodBody!.InitializeLocals, Is.True);
+        Assert.That(method.CilMethodBody.LocalVariables.Count, Is.EqualTo(1));
+        Assert.That(method.CilMethodBody.Instructions.Count(i => i.OpCode == CilOpCodes.Initobj), Is.EqualTo(1));
+        using var stream = new System.IO.MemoryStream(); module.Write(stream);
+        var generated = System.Reflection.Assembly.Load(stream.ToArray());
+        var runtime = generated.GetType("Test.InitializedData")!;
+        var value = runtime.GetMethod("Reset")!.Invoke(null, null)!;
+        Assert.That(runtime.GetField("Number")!.GetValue(value), Is.EqualTo(0L));
+        if (withReference) Assert.That(runtime.GetField("Text")!.GetValue(value), Is.Null);
     }
 
     [Test]

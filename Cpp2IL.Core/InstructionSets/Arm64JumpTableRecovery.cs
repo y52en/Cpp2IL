@@ -96,6 +96,13 @@ public static class Arm64JumpTableRecovery
         var seed = body[start - 1];
         if (seed.Address + 4 != cmp.Address || seed.Op0Reg != cmp.Op0Reg
             || seed.Mnemonic is not (Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR or Arm64Mnemonic.MOV
+                // Byte/halfword loads into Wn also clear the upper half of
+                // Xn, even when sign-extending the loaded value to 32 bits.
+                // The existing unsigned HI guard rejects negative selectors.
+                // Preserve the native load itself;
+                // only the already-bounded immutable table dispatch changes.
+                or Arm64Mnemonic.LDRB or Arm64Mnemonic.LDRH or Arm64Mnemonic.LDURB or Arm64Mnemonic.LDURH
+                or Arm64Mnemonic.LDRSB or Arm64Mnemonic.LDRSH or Arm64Mnemonic.LDURSB or Arm64Mnemonic.LDURSH
                 or Arm64Mnemonic.MOVZ or Arm64Mnemonic.ADD or Arm64Mnemonic.SUB
                 or Arm64Mnemonic.AND or Arm64Mnemonic.ORR or Arm64Mnemonic.EOR)) return null;
         var nativeAddresses = body.Select(i => i.Address).ToHashSet();

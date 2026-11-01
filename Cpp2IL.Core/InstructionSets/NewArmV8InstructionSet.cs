@@ -161,6 +161,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         if(provenLength>0)
             return new BinarySlice(binary,checked((int)binary.MapVirtualAddressToRaw(pointer)),provenLength);
 
+        // ELF unwind records describe the entire native function, including
+        // unregistered unboxed entries. A next metadata pointer can lie tens of
+        // kilobytes beyond the real function and must not extend its body.
+        if (binary is LibCpp2IL.Elf.ElfFile elf && elf.TryGetUnwindFunctionLength(pointer, out var unwindLength)
+            && binary.TryMapVirtualAddressToRaw(pointer, out var unwindRaw)
+            && unwindRaw >= 0 && unwindRaw <= binary.RawLength - unwindLength)
+            return new BinarySlice(binary, checked((int)unwindRaw), unwindLength);
+
         if (context is not ConcreteGenericMethodAnalysisContext)
         {
             //Managed method or attr gen => grab raw byte range between a and b
@@ -465,13 +473,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     ? Add(address, OpCode.CallVoid, Imm(target))
                     : Add(address, OpCode.Call, Imm(target), CallingConventions.ReturnRegister(ctx));
 
+                // Record the actual lifted BL/tail target before SSA and
+                // metadata binding can replace the immediate call operand.
+                // Do not infer this provenance later from a managed method.
+                call.NativeDirectCallTarget = target;
                 call.AddOperands(CallingConventions.ResolveForManaged(ctx));
             }
             else
             {
                 // Not a managed method, so we don't know its signature, preserve all argument registers
                 var call = Add(address, OpCode.Call, Imm(target), new Register(null, "X0"));
+                call.NativeDirectCallTarget = target;
                 call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, target));
+                call.MarkArm64DirectArgumentSnapshot();
             }
         }
 
@@ -858,7 +872,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     var src1 = ConvertOperand(instruction, 1);
                     var src2 = ConvertOperand(instruction, 2);
-                    if (instruction.Op2Kind == Arm64OperandKind.Register
+                    if (Analysis.Arm64ShiftedArithmeticRecovery.LowerRight(instruction, context.AppContext.SystemTypes) is {} shiftedArithmetic)
+                    {
+                        foreach (var operation in shiftedArithmetic.Operations)
+                        {
+                            var lifted = Add(address, operation.OpCode, operation.Operands.ToList());
+                            lifted.NativeArithmeticSize = operation.NativeArithmeticSize;
+                            lifted.NativeIntegerSourceView = operation.NativeIntegerSourceView;
+                        }
+                        src2 = shiftedArithmetic.Operand;
+                    }
+                    else if (instruction.Op2Kind == Arm64OperandKind.Register
                         && instruction.FinalOpExtendType is Arm64ExtendType.UXTW or Arm64ExtendType.SXTW
                         && instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X30)
                     {
@@ -908,8 +932,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
             case Arm64Mnemonic.CMP:
-                EmitCompareFlags(ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
-                break;
+                {
+                    var right = ConvertOperand(instruction, 1);
+                    if (Analysis.Arm64ShiftedArithmeticRecovery.LowerRight(instruction, context.AppContext.SystemTypes) is {} shiftedComparison)
+                    {
+                        foreach (var operation in shiftedComparison.Operations)
+                        {
+                            var lifted = Add(address, operation.OpCode, operation.Operands.ToList());
+                            lifted.NativeArithmeticSize = operation.NativeArithmeticSize;
+                            lifted.NativeIntegerSourceView = operation.NativeIntegerSourceView;
+                        }
+                        right = shiftedComparison.Operand;
+                    }
+                    EmitCompareFlags(ConvertOperand(instruction, 0), right);
+                    break;
+                }
             case Arm64Mnemonic.FCMP:
             case Arm64Mnemonic.FCMPE:
                 foreach (var comparison in FloatingCompareFlags(ConvertOperand(instruction, 0),
@@ -986,7 +1023,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     };
 
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
-                    Add(address, opCode, dest, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    // Normalization maps both Wn and Xn to the same ISIL name.
+                    // Capture the original scalar width before that evidence is
+                    // lost. Shifted and flag-setting logical paths above already
+                    // carry their own complete contracts; this is their unshifted
+                    // register/immediate counterpart, not inferred managed typing.
+                    Add(address, opCode, dest, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2))
+                        .NativeArithmeticSize = instruction.Op0Reg switch
+                        {
+                            >= Arm64Register.X0 and <= Arm64Register.X30 => 8,
+                            >= Arm64Register.W0 and <= Arm64Register.W30 => 4,
+                            _ => 0,
+                        };
 
                     if (instruction.Mnemonic == Arm64Mnemonic.ANDS)
                         EmitResultFlags(dest);
