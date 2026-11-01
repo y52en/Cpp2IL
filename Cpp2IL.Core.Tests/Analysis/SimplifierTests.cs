@@ -10,6 +10,44 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class SimplifierTests
 {
+    [TestCase(4)]
+    [TestCase(8)]
+    [TestCase(16)]
+    public void ForwardedMemoryValueRetainsNativeReadWidthAtStore(int width)
+    {
+        var value=new LocalVariable("value",new Register(null,"V0"));
+        var load=new Instruction(0,OpCode.Move,value,new MemoryOperand(addend:0x1000)){NativeReadSize=width};
+        var store=new Instruction(1,OpCode.Move,new MemoryOperand(addend:0x2000),value){NativeWriteSize=width};
+        var method=CreateMethod(new([load,store,new(2,OpCode.Return)]),value);
+        Simplifier.Simplify(method);
+        Assert.That(store.Operands[1],Is.InstanceOf<MemoryOperand>());
+        Assert.That(store.NativeReadSize,Is.EqualTo(width));
+        Assert.That(store.NativeWriteSize,Is.EqualTo(width));
+    }
+
+    [TestCase(0,0)]
+    [TestCase(0,8)]
+    [TestCase(4,8)]
+    public void UnknownOrContradictoryLoadWidthIsNotInferredFromStore(int read,int conflicting)
+    {
+        var value=new LocalVariable("value",new Register(null,"V0"));
+        var load=new Instruction(0,OpCode.Move,value,new MemoryOperand(addend:0x1000)){NativeReadSize=read};
+        var store=new Instruction(1,OpCode.Move,new MemoryOperand(addend:0x2000),value)
+            {NativeWriteSize=4,NativeReadSize=conflicting};
+        var method=CreateMethod(new([load,store,new(2,OpCode.Return)]),value);
+        Simplifier.Simplify(method);
+        if (read==0 && conflicting==0)
+        {
+            Assert.That(store.Operands[1],Is.InstanceOf<MemoryOperand>());
+            Assert.That(store.NativeReadSize,Is.Zero);
+        }
+        else
+        {
+            Assert.That(store.Operands[1],Is.SameAs(value));
+            Assert.That(load.OpCode,Is.EqualTo(OpCode.Move));
+        }
+    }
+
     private static MethodAnalysisContext CreateMethod(ISILControlFlowGraph graph, params LocalVariable[] locals)
     {
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));

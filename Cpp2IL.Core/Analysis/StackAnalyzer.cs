@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
@@ -44,7 +45,13 @@ public class StackAnalyzer
             method.AddWarning($"Method ends with non empty stack ({outText}), the output could be wrong!");
         }
 
-        analyzer.ResolveFrameAliases(graph);
+        if (method.AppContext.InstructionSet is NewArmV8InstructionSet
+            && graph.Blocks.All(block => block.Predecessors.All(predecessor =>
+                analyzer._outGoingState[predecessor].Size == analyzer._inComingState[block].Size)))
+            Arm64FrameAliasRecovery.Recover(graph, analyzer._instructionState.ToDictionary(
+                pair => pair.Key, pair => pair.Value.Size));
+        else if (method.AppContext.InstructionSet is not NewArmV8InstructionSet)
+            analyzer.ResolveFrameAliases(graph);
         analyzer.CorrectOffsets(graph);
         ReplaceStackWithRegisters(method);
 

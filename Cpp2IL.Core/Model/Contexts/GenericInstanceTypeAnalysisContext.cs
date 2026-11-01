@@ -34,7 +34,27 @@ public class GenericInstanceTypeAnalysisContext : ReferencedTypeAnalysisContext
         set => GenericType.OverrideNamespace = value;
     }
 
-    public sealed override TypeAnalysisContext? DefaultBaseType { get; }
+    private volatile bool _baseTypeResolved;
+    private TypeAnalysisContext? _resolvedBaseType;
+
+    public sealed override TypeAnalysisContext? DefaultBaseType
+    {
+        get
+        {
+            // Resolve lazily: metadata contexts may recursively construct generic
+            // types. Neither constructor may erase or leave open Base<T> on D<T>.
+            if (!_baseTypeResolved)
+            {
+                if (GenericArguments.Count != GenericType.GenericParameters.Count)
+                    return null;
+                _resolvedBaseType = GenericType.BaseType is { } baseType
+                    ? GenericInstantiation.Instantiate(baseType, GenericArguments, [])
+                    : null;
+                _baseTypeResolved = true;
+            }
+            return _resolvedBaseType;
+        }
+    }
 
     public sealed override Il2CppTypeEnum Type => Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST;
 
@@ -69,7 +89,6 @@ public class GenericInstanceTypeAnalysisContext : ReferencedTypeAnalysisContext
     {
         GenericType = genericType;
         GenericArguments.AddRange(genericArguments);
-        DefaultBaseType = genericType.BaseType;
 
         SetDeclaringType();
     }

@@ -1,0 +1,182 @@
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using Cpp2IL.Core.Graphs;
+using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.InstructionSets;
+using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
+
+namespace Cpp2IL.Core.Analysis;
+
+public static class WholeStructInitializationRecovery
+{
+    public static bool Run(MethodAnalysisContext method)
+    {
+        if(method.AppContext.InstructionSet is not NewArmV8InstructionSet) return false;
+        var graph=method.ControlFlowGraph!;
+        MarkZeroExtents(graph);
+        var trace=System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_STRUCT_INIT_RVAS")?.Split(',')
+            .Any(r=>string.Equals(r.Trim(),method.UnderlyingPointer.ToString("X"),System.StringComparison.OrdinalIgnoreCase))==true;
+        if(trace)
+        {
+            System.Console.Error.WriteLine("Raw struct initialization: "+method.FullName);
+            foreach(var block in graph.Blocks)
+            {
+                System.Console.Error.WriteLine(block+"Predecessors: "+string.Join(",",block.Predecessors.Select(b=>b.ID)));
+                foreach(var i in block.Instructions)System.Console.Error.WriteLine("writeWidth="+i.NativeWriteSize+" "+i);
+            }
+        }
+        var targets=new List<(Register Storage,TypeAnalysisContext Type,Block Block,Instruction Call)>();
+        foreach(var block in graph.Blocks)
+        foreach(var call in block.Instructions)
+        {
+            if(!call.IsCall || call.Operands[0] is not Immediate address
+                || !method.AppContext.MethodsByAddress.TryGetValue(address.UnsignedValue,out var callees)
+                || callees.Count!=1) continue;
+            var callee=callees[0];
+            var first=call.OpCode==OpCode.CallVoid?1:2;
+            var resolver=method.AppContext.InstructionSet.CallingConventionResolver!;
+            var raw=resolver.HasRawArgumentLayout(call,method.AppContext);
+            var managed=raw?resolver.ResolveForManaged(callee):null;
+            void AddTarget(int index,TypeAnalysisContext type)
+            {
+                if(!type.IsValueType) return;
+                IOperand? operand=null;
+                if(raw)
+                {
+                    // Raw layouts have independent integer/floating registers;
+                    // metadata ordinal is not an index into that raw register list.
+                    if(index<managed!.Length && managed[index] is Register expected)
+                        operand=call.Operands.Skip(first).OfType<Register>().FirstOrDefault(r=>r.Name==expected.Name);
+                }
+                else if(first+index<call.Operands.Count) operand=call.Operands[first+index];
+                var storage=operand switch
+                {
+                    AddressOf {Target:Register direct}=>direct,
+                    Register pointer=>HiddenStructReturnRecovery.ResolveStackAddress(block,block.Instructions.IndexOf(call),pointer),
+                    _=>(Register?)null
+                };
+                if(storage is { } slot && Offset(slot,out _)) targets.Add((slot,type,block,call));
+            }
+            if(!callee.IsStatic && callee.DeclaringType is {IsValueType:true} receiver) AddTarget(0,receiver);
+            for(var p=0;p<callee.Parameters.Count;p++)
+                if(callee.Parameters[p].ParameterType is ByRefTypeAnalysisContext {ElementType:{IsValueType:true} referenced})
+                    AddTarget(p+(callee.IsStatic?0:1),referenced);
+        }
+        if(trace)foreach(var target in targets)System.Console.Error.WriteLine("Typed struct target: "+target.Storage+" "+target.Type.FullName);
+        DominatorInfo? dominance=null;
+        var changed=false;
+        foreach(var group in targets.GroupBy(t=>t.Storage.Name))
+        {
+            var types=group.Select(t=>t.Type).Distinct().ToArray();
+            if(types.Length!=1) continue; // reused storage with ambiguous type
+            var target=group.First();
+            var size=TypeSizes.UnboxedSize(target.Type,method.AppContext.Binary.PointerSizeBytes);
+            if(size<=0 || size>int.MaxValue) continue;
+            foreach(var block in graph.Blocks)
+            for(var start=0;start<block.Instructions.Count;start++)
+            {
+                if(block.Instructions[start].NativeWriteSize==0) continue;
+                if(!group.Any(t=>block==t.Block
+                    ? start<block.Instructions.IndexOf(t.Call)
+                    : (dominance??=new DominatorInfo(graph)).Dominates(block,t.Block))) continue;
+                changed |= RecoverGroup(block,start,target.Storage,target.Type,(int)size);
+            }
+        }
+        changed |= AddressedStackFieldStoreRecovery.Recover(graph,targets.Select(t=>(t.Storage,t.Type)))>0;
+        return changed;
+    }
+
+    // Keep byte coverage even if a shared generic return's managed type can
+    // only be resolved later from MethodInfo. DCE may remove unused sibling
+    // scalar slots before then. This annotates evidence, not a guessed type.
+    internal static void MarkZeroExtents(ISILControlFlowGraph graph)
+    {
+        foreach(var block in graph.Blocks)
+        {
+            var group=new List<(Instruction Store,int Offset,int Width)>();
+            void Flush()
+            {
+                foreach(var item in group)
+                {
+                    long cursor=item.Offset;
+                    while(true)
+                    {
+                        var next=group.Where(x=>x.Offset<=cursor && (long)x.Offset+x.Width>cursor)
+                            .Select(x=>(long)x.Offset+x.Width).DefaultIfEmpty(cursor).Max();
+                        if(next==cursor || next-item.Offset>256)break;
+                        cursor=next;
+                    }
+                    item.Store.NativeZeroSize=System.Math.Max(item.Store.NativeZeroSize,(int)(cursor-item.Offset));
+                }
+                group.Clear();
+            }
+            for(var index=0;index<block.Instructions.Count;index++)
+            {
+                var instruction=block.Instructions[index];
+                if(instruction is {OpCode:OpCode.Move,Operands:[Register slot,var value],NativeWriteSize:1 or 2 or 4 or 8 or 16}
+                    && Offset(slot,out var offset) && ZeroAt(block,index,value,instruction.NativeWriteSize))
+                    group.Add((instruction,offset,instruction.NativeWriteSize));
+                else Flush(); // No read, call, unknown write or control flow may be crossed.
+            }
+            Flush();
+        }
+    }
+
+    public static bool RecoverGroup(Block block,int start,Register storage,TypeAnalysisContext type,int size)
+    {
+        if(!type.IsValueType || size<=0 || !Offset(storage,out var basis)) return false;
+        var bytes=new HashSet<long>();var stores=new List<Instruction>();
+        for(var i=start;i<block.Instructions.Count;i++)
+        {
+            var instruction=block.Instructions[i];
+            if(instruction.OpCode==OpCode.Nop) continue;
+            if(instruction is not {OpCode:OpCode.Move,Operands:[Register slot,var value]}
+                || instruction.NativeWriteSize is not (1 or 2 or 4 or 8 or 16)
+                || !ZeroAt(block,start,value,instruction.NativeWriteSize)
+                || !Offset(slot,out var offset)) return false;
+            var delta=(long)offset-basis;
+            if(delta<0 || delta+instruction.NativeWriteSize>size) return false;
+            for(var b=0;b<instruction.NativeWriteSize;b++)
+                if(!bytes.Add(delta+b)) return false; // overlap is not proof of more bytes
+            stores.Add(instruction);
+            if(bytes.Count!=size) continue;
+            stores[0].SetOperands(storage,new DefaultStructValue(type));
+            stores[0].NativeWriteSize=0;
+            // The first chronological store can be only a 4-byte tail. Carry
+            // the FULL independently checked byte union, not that tail's old
+            // extent (and not any larger neighboring raw zero extent).
+            stores[0].NativeZeroSize=size;
+            foreach(var other in stores.Skip(1))
+            {other.OpCode=OpCode.Nop;other.SetOperands();other.NativeWriteSize=0;other.NativeZeroSize=0;}
+            return true;
+        }
+        return false;
+    }
+
+    private static bool ZeroAt(Block block,int before,IOperand value,int size)
+    {
+        if(value is Immediate {Value:0}) return true;
+        if(value is not Register source) return false;
+        for(var i=before-1;i>=0;i--)
+        {
+            var instruction=block.Instructions[i];
+            if(instruction.Destination is Register written && written.Name==source.Name)
+                return instruction is {OpCode:OpCode.Move,Operands:[_,Immediate {Value:0}]}
+                    && instruction.NativeZeroSize>=size;
+            if(instruction.IsCall || instruction.OpCode is OpCode.IndirectCall or OpCode.NotImplemented or OpCode.Invalid) return false;
+        }
+        return false;
+    }
+
+    private static bool Offset(Register register,out int offset)
+    {
+        offset=0;var name=register.Name;
+        if(!name.StartsWith("stack_",System.StringComparison.Ordinal)) return false;
+        var text=name.Substring(6);var negative=text.StartsWith("-",System.StringComparison.Ordinal);
+        if(negative) text=text.Substring(1);
+        if(!int.TryParse(text,NumberStyles.AllowHexSpecifier,CultureInfo.InvariantCulture,out var value)||value<0) return false;
+        offset=negative?-value:value;return true;
+    }
+}

@@ -14,7 +14,7 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
     private static readonly string[] FloatRegisters = ["V0", "V1", "V2", "V3", "V4", "V5", "V6", "V7"];
 
     public override Register ReturnRegister(MethodAnalysisContext ctx)
-        => new(null, IsFloatingPoint(ctx.ReturnType) ? "V0" : "X0");
+        => new(null, IsFloatingPoint(ctx.ReturnType) || Arm64HfaLayout.Fields(ctx.ReturnType)!=null ? "V0" : "X0");
 
     public override Register? HiddenReturnBufferRegister(MethodAnalysisContext ctx)
         => ReturnsViaHiddenBuffer(ctx) ? new Register(null, "X8") : null;
@@ -25,14 +25,20 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
             return false;
 
         var returnType = ctx.ReturnType;
-        if (!returnType.IsValueType || IsFloatingPoint(returnType))
+        if (!returnType.IsValueType || IsFloatingPoint(returnType) || Arm64HfaLayout.Fields(returnType)!=null)
             return false;
 
-        var size = TypeSizes.UnboxedSize(returnType, PtrSize);
+        var size = ReturnStorageSize(ctx);
         if (size == 0)
             return false; // unknown size (e.g. generic), assume a register return
 
         return size > 16;
+    }
+
+    public long ReturnStorageSize(MethodAnalysisContext method)
+    {
+        var size=TypeSizes.UnboxedSize(method.ReturnType,PtrSize);
+        return size>0?size:SharedGenericReturnLayout.TryGet(method)?.Size??0;
     }
 
     protected override (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app)
@@ -50,6 +56,21 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
         void AddParameter(ParameterAnalysisContext? par)
         {
+            if(par!=null && Arm64HfaLayout.Fields(par.ParameterType) is { } fields)
+            {
+                if(floating+fields.Length<=FloatRegisters.Length)
+                {
+                    args.Add(new Register(null,"hfa_arg_"+par.ParameterIndex));
+                    floating+=fields.Length;
+                }
+                else
+                {
+                    floating=FloatRegisters.Length;
+                    args.Add(new StackOffset(stack));
+                    stack+=(fields.Length*(fields[0].FieldType==ctx.AppContext.SystemTypes.SystemSingleType?4:8)+7)&~7;
+                }
+                return;
+            }
             if (par != null && IsFloatingPoint(par))
             {
                 if (floating < FloatRegisters.Length)

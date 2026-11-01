@@ -51,6 +51,8 @@ public static class KeyFunctionRecovery
                 RewriteRaiseException(instruction);
             else if (BoxFunctions.Contains(keyFunction))
                 RewriteBox(instruction);
+            else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst))
+                RewriteIsInst(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_reflection_get_type_object))
                 RewriteTypeObject(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.InternalCalls_Resolve))
@@ -81,8 +83,23 @@ public static class KeyFunctionRecovery
     private static void RewriteBox(Instruction instruction)
     {
         // function name, result, class, address of value.
-        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [_, var result, TypeAnalysisContext boxedType, var value, ..])
+        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [_, var result, var handle, var value, ..])
             return;
+
+        // The runtime argument is an Il2CppClass*, not a value of that
+        // pointer's synthetic IntPtr type. Box the represented managed type.
+        // This also applies to a proven generic type parameter: CIL box !0
+        // handles both value and reference instantiations correctly.
+        var boxedType = handle switch
+        {
+            RuntimeClassTypeAnalysisContext klass => klass.RepresentedType,
+            LocalVariable { Type: RuntimeClassTypeAnalysisContext klass } => klass.RepresentedType,
+            TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => type,
+            _ => null
+        };
+        if (boxedType == null || boxedType is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+            or RuntimeFieldInfoAnalysisContext or ByRefTypeAnalysisContext
+            || boxedType.FullName == "System.Void") return;
 
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, boxedType, value);
@@ -164,6 +181,27 @@ public static class KeyFunctionRecovery
         var byParameterCount = candidates.Where(m => m.Parameters.Count == count).ToList();
 
         return byParameterCount.Count == 1 ? byParameterCount[0] : null;
+    }
+
+    private static void RewriteIsInst(Instruction instruction)
+    {
+        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [_, var result, var value, var handle, ..])
+            return;
+
+        var type = handle switch
+        {
+            LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented } } => represented,
+            RuntimeClassTypeAnalysisContext { RepresentedType: var represented } => represented,
+            TypeAnalysisContext resolved and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => resolved,
+            _ => null
+        };
+        if (type == null)
+            return; // A runtime-computed class must not become a guessed static CIL token.
+
+        instruction.OpCode = OpCode.IsInst;
+        instruction.SetOperands(result, type, value);
+        if (result is LocalVariable destination)
+            destination.Type = type.IsValueType ? type.AppContext.SystemTypes.SystemObjectType : type;
     }
 
     private static void RewriteObjectNew(Instruction instruction)

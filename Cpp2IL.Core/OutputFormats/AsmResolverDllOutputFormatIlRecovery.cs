@@ -9,6 +9,7 @@ using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AssetRipper.CIL;
 using Cpp2IL.Core.Extensions;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
@@ -35,13 +36,62 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         return base.BuildAssemblies(context);
     }
 
+    protected override void PrepareMethodBodies(ApplicationAnalysisContext context)
+    {
+        var fieldMethodCount = InlinedFieldMethodRecovery.Prepare(context, method =>
+            SkipAssemblyRecovery(method.DeclaringType!.DeclaringAssembly.Name + ".dll", method.UnderlyingPointer,
+                Environment.GetEnvironmentVariable("CPP2IL_RECOVERY_INCLUDE_FRAMEWORKS") == "1"));
+        Logger.InfoNewline($"Prepared {fieldMethodCount} native-derived inline field method templates.");
+        var trivialCount = TrivialConstructorRecovery.Prepare(context, ctor =>
+            SkipAssemblyRecovery(ctor.DeclaringType!.DeclaringAssembly.Name + ".dll", ctor.UnderlyingPointer,
+                Environment.GetEnvironmentVariable("CPP2IL_RECOVERY_INCLUDE_FRAMEWORKS") == "1"));
+        Logger.InfoNewline($"Prepared {trivialCount} native-proven trivial constructor templates.");
+        // Build immutable templates before parallel emission, which mutates/releases
+        // method graphs. Never analyze a constructor concurrently from a caller.
+        var count = 0;
+        foreach (var type in context.Assemblies.SelectMany(a => a.Types))
+        {
+            var templates = new List<InlinedConstructorRecovery.Template>();
+            var structural = new List<StructuralConstructorRecovery.Template>();
+            var baseInitializers = new List<ParameterizedBaseInitializerRecovery.Template>();
+            if (type.IsValueType || type.BaseType==null || type.HasAnyGenericParameters()) continue;
+            foreach (var ctor in type.Methods.Where(m => m.Name == ".ctor" && !m.IsStatic
+                && m.UnderlyingPointer != 0 && m.Parameters.Count <= 8))
+            {
+                if (SkipAssemblyRecovery(type.DeclaringAssembly.Name + ".dll", ctor.UnderlyingPointer,
+                    Environment.GetEnvironmentVariable("CPP2IL_RECOVERY_INCLUDE_FRAMEWORKS") == "1")) continue;
+                try
+                {
+                    ctor.EnsureRawBytes();
+                    if (ctor.RawBytes.Length > 512) continue;
+                    ctor.Analyze();
+                    if (InlinedConstructorRecovery.Extract(ctor) is { } template) templates.Add(template);
+                    // Constant-only parameterless templates use the same complete
+                    // native base-call/store proof. Other template families keep
+                    // their existing nonempty-parameter input contract.
+                    if (ctor.Parameters.Count > 0)
+                    {
+                        if (StructuralConstructorRecovery.Extract(ctor) is { } shape) structural.Add(shape);
+                        if (ParameterizedBaseInitializerRecovery.Extract(ctor) is { } initializer) baseInitializers.Add(initializer);
+                    }
+                }
+                catch { /* Unproved constructors remain unmodified and diagnostic. */ }
+                finally { ctor.ReleaseAnalysisData(); }
+            }
+            type.PutExtraData(InlinedConstructorRecovery.CacheKey, templates.ToArray());
+            type.PutExtraData(StructuralConstructorRecovery.CacheKey, structural.ToArray());
+            type.PutExtraData(ParameterizedBaseInitializerRecovery.CacheKey, baseInitializers.ToArray());
+            count += templates.Count;
+        }
+        Logger.InfoNewline($"Prepared {count} pure field-initialization constructor templates.");
+    }
+
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
         var module = methodDefinition.DeclaringModule!;
         var moduleName = module.Name!.ToString();
-        var shouldSkip = moduleName.StartsWith("UnityEngine.") || moduleName.StartsWith("Unity.") ||
-                         moduleName.StartsWith("System.") || moduleName == "System" ||
-                         moduleName.StartsWith("mscorlib");
+        var shouldSkip = SkipAssemblyRecovery(moduleName, methodContext.UnderlyingPointer,
+            Environment.GetEnvironmentVariable("CPP2IL_RECOVERY_INCLUDE_FRAMEWORKS") == "1");
 
         if (!methodDefinition.IsManagedMethodWithBody())
             return;
@@ -60,9 +110,25 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             Interlocked.Increment(ref TotalMethodCount);
 
             methodContext.Analyze();
+            UnusedInstanceReceiverRecovery.Run(methodContext);
+
+            InlinedConstructorRecovery.Run(methodContext);
+            StructuralConstructorRecovery.Run(methodContext);
+            TrivialConstructorRecovery.Run(methodContext);
+            ForwardedConstructorRecovery.Run(methodContext);
+            MergedAllocationRecovery.Run(methodContext);
+            ArgumentForwardingConstructorRecovery.Run(methodContext);
+            ConstantFieldConstructorRecovery.Run(methodContext);
+            ParameterizedBaseInitializerRecovery.Run(methodContext);
+            EmptyObjectBaseConstructorRecovery.Run(methodContext);
+            ConstructorPrologueRecovery.Run(methodContext);
+            ZeroStateConstructorRecovery.Run(methodContext);
+            // Constructor reconstruction consumes allocation-adjacent stores;
+            // do not hide those stores behind setters before it has run.
+            InlinedFieldMethodRecovery.Run(methodContext);
 
             if (methodContext.ConvertedIsil.Count == 0)
-                FillMethodBodyWithStub(methodDefinition);
+                throw new DecompilerException("No native instructions were recovered.");
             else
                 IlGenerator.GenerateIl(methodContext, methodDefinition);
 
@@ -92,12 +158,21 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 .CreateTypeReference("System", "Exception")
                 .CreateMemberReference(".ctor", MethodSignature.CreateInstance(factory.Void, [factory.String]));
 
-            instructions.Add(CilOpCodes.Ldstr, detail);
+            instructions.Add(CilOpCodes.Ldstr, "Cpp2IL recovery failure: " + detail);
             instructions.Add(CilOpCodes.Newobj, exceptionCtor);
             instructions.Add(CilOpCodes.Throw);
         }
 
         methodContext.ReleaseAnalysisData();
+    }
+
+    // Explicit opt-in for native-backed framework methods only. A method
+    // without an original entry must remain a stub rather than fabricate IL.
+    internal static bool SkipAssemblyRecovery(string moduleName, ulong originalPointer, bool includeFrameworks)
+    {
+        var framework = moduleName.StartsWith("UnityEngine.") || moduleName.StartsWith("Unity.")
+            || moduleName.StartsWith("System.") || moduleName == "System" || moduleName.StartsWith("mscorlib");
+        return framework && !(includeFrameworks && originalPointer != 0);
     }
 
     public static void WriteControlFlowGraph(MethodAnalysisContext method, string outputPath)

@@ -125,5 +125,36 @@ public enum OpCode
     /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
-    Throw
+    Throw,
+
+    /// <summary>Tests op 3 against the type in op 2, storing the object or null in op 1.</summary>
+    IsInst,
+
+    /// <summary>Checks op 3 against reference type op 2, storing the same object in op 1.
+    /// Unlike IsInst, incompatibility throws InvalidCastException; null remains null.</summary>
+    CastClass,
+
+    /// <summary>Unchecked numeric conversion: destination, target type, source type, value.</summary>
+    NumericConvert,
+
+    /// <summary>Checked unboxing: destination managed byref, value type token, boxed object.</summary>
+    Unbox,
+
+    /// <summary>Checked unbox/cast to a managed value: destination, type token, boxed object.</summary>
+    UnboxAny,
+
+    /// <summary>Null-check a managed array at this site, with no bounds check or result.</summary>
+    ArrayNullCheck,
+
+    /// <summary>Logical integer right shift; zero fills, unlike arithmetic ShiftRight.</summary>
+    ShiftRightUnsigned,
+
+    /// <summary>Destination, proven virtual method, receiver. Preserves ldvirtftn dispatch/null semantics.</summary>
+    LoadVirtualFunction,
+
+    /// <summary>Destination delegate, constructor, proven virtual method, receiver. One atomic bound delegate creation.</summary>
+    NewVirtualDelegate,
+
+    /// <summary>Scalar IEEE absolute value: destination, source. Native floating width is mandatory.</summary>
+    Absolute
 }

@@ -131,6 +131,7 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         //Fill method bodies - this should always be done last
         start = DateTime.Now;
         Logger.Verbose($"Filling method bodies (in parallel)...", "DllOutput");
+        PrepareMethodBodies(context);
         FillAllMethodBodies(context);
 
         Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
@@ -139,6 +140,8 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     }
 
     protected abstract void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext);
+
+    protected virtual void PrepareMethodBodies(ApplicationAnalysisContext context) { }
     
     private void FillAllMethodBodies(ApplicationAnalysisContext context)
     {

@@ -62,10 +62,20 @@ public abstract class Cpp2IlInstructionSet
         => ([], []);
 
     /// <summary>
+    /// Necessary structural evidence for propagating an exception identity through
+    /// an unknown native wrapper. A descendant error path alone is not sufficient.
+    /// Unsupported instruction sets must not guess.
+    /// </summary>
+    public virtual bool HasExceptionWrapperShape(ApplicationAnalysisContext context, ulong address) => false;
+
+    /// <summary>
     /// For a simple thunk function, returns the jump target. Returns 0 if the function at <paramref name="thunkAddress"/>
     /// is not such a thunk, or if this instruction set does not implement thunk following.
     /// </summary>
     public virtual ulong GetThunkTarget(ApplicationAnalysisContext context, ulong thunkAddress) => 0;
+
+    /// <summary>Recognized boxed-value receiver adjustor; zero if not proven.</summary>
+    public virtual ulong GetUnboxedMethodTarget(MethodAnalysisContext method) => 0;
 
     /// <summary>
     /// For an internal call, returns the address of the runtime function it tail-calls into.

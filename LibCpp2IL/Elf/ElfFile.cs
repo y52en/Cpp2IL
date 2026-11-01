@@ -24,6 +24,80 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
     private long _globalOffset;
 
+    // Exact file-backed readonly numeric literals, never writable globals,
+    // relocation-derived addresses, code bytes, or zero-filled storage.
+    public bool TryReadReadOnlyScalar(ulong address, int width, out ulong bits)
+    {
+        bits = 0;
+        if (_elfFileIdent?.Endianness != 1 || width is not (4 or 8)
+            || address < 8 || address > ulong.MaxValue - (ulong)width) return false;
+        var sections = _elfSectionHeaderEntries.Where(s => IsReadOnlyScalarSection(s,address,width)).ToArray();
+        if (sections.Length != 1) return false;
+        var segments = _elfProgramHeaderEntries.Where(p => p.Type == ElfProgramEntryType.PT_LOAD
+            && address >= p.VirtualAddress && address - p.VirtualAddress <= p.RawSize
+            && (ulong)width <= p.RawSize - (address - p.VirtualAddress)).ToArray();
+        if (segments.Length != 1 || (segments[0].Flags & ElfProgramHeaderFlags.PF_W) != 0
+            || (segments[0].Flags & ElfProgramHeaderFlags.PF_R) == 0) return false;
+        // A relocation may start before the scalar and overlap its bytes.
+        for (var at = address - 7; at < address + (ulong)width; at++)
+            if (relocationTargets.Contains(at)) return false;
+        var section = sections[0];
+        var delta = address - section.VirtualAddress;
+        if (section.RawAddress > (ulong)_raw.Length || delta > (ulong)_raw.Length - section.RawAddress
+            || (ulong)width > (ulong)_raw.Length - section.RawAddress - delta) return false;
+        var raw = section.RawAddress + delta;
+        if (segments[0].RawAddress > ulong.MaxValue - (address - segments[0].VirtualAddress)
+            || segments[0].RawAddress + address - segments[0].VirtualAddress != raw) return false;
+        for (var n = 0; n < width; n++) bits |= (ulong)_raw[(int)raw + n] << (8*n);
+        return true;
+    }
+
+    public static bool IsReadOnlyScalarSection(ElfSectionHeaderEntry section,ulong address,int width)
+        => width is 4 or 8 && section.Type == ElfSectionEntryType.SHT_PROGBITS
+            && section.Name is ".rodata" or ".rodata.cst4" or ".rodata.cst8"
+            && (section.Flags & ElfSectionHeaderFlags.SHF_ALLOC) != 0
+            && (section.Flags & (ElfSectionHeaderFlags.SHF_WRITE | ElfSectionHeaderFlags.SHF_EXECINSTR
+                | ElfSectionHeaderFlags.SHF_TLS | ElfSectionHeaderFlags.SHF_STRINGS)) == 0
+            && address >= section.VirtualAddress && address - section.VirtualAddress <= section.Size
+            && (ulong)width <= section.Size - (address - section.VirtualAddress);
+
+    private Dictionary<ulong,int>? _unwindFunctionLengths;
+    private readonly object _unwindFunctionLengthsLock = new();
+
+    public bool TryGetUnwindFunctionLength(ulong address, out int length)
+    {
+        lock (_unwindFunctionLengthsLock)
+        {
+        if (_unwindFunctionLengths == null)
+        {
+            _unwindFunctionLengths = new();
+            if (!is32Bit && _elfFileIdent?.Endianness == 1)
+            {
+                var sections = _elfSectionHeaderEntries.Where(s => s.Name == ".eh_frame"
+                    && s.Type == ElfSectionEntryType.SHT_PROGBITS
+                    && (s.Flags & ElfSectionHeaderFlags.SHF_ALLOC) != 0
+                    && (s.Flags & ElfSectionHeaderFlags.SHF_WRITE) == 0).ToArray();
+                if (sections.Length == 1 && sections[0].RawAddress <= (ulong)_raw.Length
+                    && sections[0].Size <= (ulong)_raw.Length - sections[0].RawAddress
+                    && sections[0].Size <= int.MaxValue)
+                    _unwindFunctionLengths = ElfEhFrameBounds.Read(_raw, (int)sections[0].RawAddress,
+                        (int)sections[0].Size, sections[0].VirtualAddress);
+            }
+        }
+        }
+        length = 0;
+        if (!_unwindFunctionLengths.TryGetValue(address, out var candidate) || candidate <= 0) return false;
+        var segments = _elfProgramHeaderEntries.Where(p => p.Type == ElfProgramEntryType.PT_LOAD
+            && (p.Flags & (ElfProgramHeaderFlags.PF_R | ElfProgramHeaderFlags.PF_X))
+                == (ElfProgramHeaderFlags.PF_R | ElfProgramHeaderFlags.PF_X)
+            && address >= p.VirtualAddress && address - p.VirtualAddress <= p.RawSize
+            && (ulong)candidate <= p.RawSize - (address - p.VirtualAddress)).ToArray();
+        if (segments.Length != 1) return false;
+        var raw = segments[0].RawAddress + address - segments[0].VirtualAddress;
+        if (raw > (ulong)_raw.Length || (ulong)candidate > (ulong)_raw.Length - raw) return false;
+        length = candidate; return true;
+    }
+
     public ElfFile(MemoryStream input) : base(input)
     {
         _raw = input.GetBuffer();
@@ -570,6 +644,29 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
     public override ReadOnlySpan<byte> GetRawBinaryContent() => _raw;
 
+    // Bounded immutable table reads for control-flow recovery. Never use a
+    // writable mapping, zero-fill tail, ambiguous overlapping load, or host endian.
+    public byte[]? ReadOnlyMappedData(ulong address, int count)
+    {
+        if (_elfFileIdent?.Endianness != 1 || count is <= 0 or > 16384
+            || address > ulong.MaxValue - (ulong)count) return null;
+        var end = address + (ulong)count;
+        if (_elfProgramHeaderEntries.Any(p => p.Type == ElfProgramEntryType.PT_LOAD
+            && p.VirtualAddress > ulong.MaxValue - p.VirtualSize)) return null;
+        var loads = _elfProgramHeaderEntries.Where(p => p.Type == ElfProgramEntryType.PT_LOAD
+            && address < p.VirtualAddress + p.VirtualSize && end > p.VirtualAddress).ToList();
+        if (loads.Count != 1) return null;
+        var load = loads[0];
+        if ((load.Flags & ElfProgramHeaderFlags.PF_W) != 0
+            || (load.Flags & ElfProgramHeaderFlags.PF_R) == 0
+            || address < load.VirtualAddress || end - load.VirtualAddress > load.RawSize) return null;
+        var offset = address - load.VirtualAddress;
+        if (load.RawAddress > ulong.MaxValue - offset) return null;
+        var raw = load.RawAddress + offset;
+        return raw <= (ulong)_raw.Length && (ulong)count <= (ulong)_raw.Length - raw
+            ? _raw.AsSpan((int)raw, count).ToArray() : null;
+    }
+
     public override ulong GetVirtualAddressOfExportedFunctionByName(string toFind)
     {
         if (!_exportNameTable.TryGetValue(toFind, out var exportedSymbol))
@@ -599,6 +696,14 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
     }
 
     public override ulong GetVirtualAddressOfPrimaryExecutableSection() => _elfSectionHeaderEntries.FirstOrDefault(s => s.Name == ".text")?.VirtualAddress ?? 0;
+
+    // Only pointer-sized aligned entries within a real .got section qualify.
+    // Arbitrary writable globals must never be frozen to their file contents.
+    public bool IsGlobalOffsetTableEntry(ulong address) => _elfSectionHeaderEntries.Any(section =>
+        section.Name == ".got" && section.Size >= (ulong)PointerSizeBytes
+        && address >= section.VirtualAddress
+        && address - section.VirtualAddress <= section.Size - (ulong)PointerSizeBytes
+        && (address - section.VirtualAddress) % (ulong)PointerSizeBytes == 0);
 
     public override ReadOnlySpan<byte> GetEntirePrimaryExecutableSection()
     {

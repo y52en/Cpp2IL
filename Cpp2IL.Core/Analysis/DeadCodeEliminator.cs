@@ -37,6 +37,8 @@ public static class DeadCodeEliminator
                 {
                     if (!IsRemovable(instruction.OpCode))
                         continue;
+                    if (HasManagedReadOrArithmeticEffect(instruction))
+                        continue;
 
                     // Only definitions of a register local are candidates. Stores have a memory or
                     // field destination (Destination is not a local) and are never dead.
@@ -52,6 +54,64 @@ public static class DeadCodeEliminator
                 }
             }
         }
+        RemoveUnobservableCycles(cfg);
+    }
+
+    // An unused VALUE does not imply an unused OPERATION: managed reads may
+    // throw (or trigger a static initializer), and integer division can throw.
+    // Synthetic IL2CPP runtime metadata fields are not managed application
+    // fields; their separate positively identified guard cleanup still works.
+    internal static bool HasManagedReadOrArithmeticEffect(Instruction instruction)
+    {
+        if(instruction.OpCode is OpCode.Divide or OpCode.Modulo)return true;
+        if(instruction is not {OpCode:OpCode.Move,Operands:[_,var source]})return false;
+        if(source is ArrayLength or ArrayAccess or AddressOf {Target:ArrayAccess})return true;
+        if(source is AddressOf {Target:FieldReference addressField}
+            && (addressField.Field.BackingData!=null || addressField.Field.DeclaringType is InjectedTypeAnalysisContext))return true;
+        return source is FieldReference field
+            && (field.Field.BackingData!=null || field.Field.DeclaringType is InjectedTypeAnalysisContext)
+            && (field.Field.IsStatic || field.Local.Type is not (RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext));
+    }
+
+    // Reference counts alone keep an unused loop-carried Phi/copy cycle alive.
+    // Mark backwards from observable/possibly-throwing instructions instead.
+    // This second pass is deliberately narrower than the legacy removable set:
+    // memory/field reads, division, allocation and unknown operands remain roots.
+    private static void RemoveUnobservableCycles(ISILControlFlowGraph cfg)
+    {
+        var producers = new Dictionary<LocalVariable, List<Instruction>>();
+        var instructions = cfg.Instructions;
+        foreach (var instruction in instructions)
+            if (instruction.Destination is LocalVariable local)
+            {
+                if (!producers.TryGetValue(local, out var definitions)) producers[local] = definitions = [];
+                definitions.Add(instruction);
+            }
+        // Instruction deliberately uses object identity, not structural equality.
+        var live = new HashSet<Instruction>();
+        var pending = new Queue<Instruction>();
+        foreach (var instruction in instructions)
+            if (!IsCyclePure(instruction) && live.Add(instruction)) pending.Enqueue(instruction);
+        while (pending.Count > 0)
+            foreach (var local in UsedLocals(pending.Dequeue()))
+                if (producers.TryGetValue(local, out var definitions))
+                    foreach (var definition in definitions)
+                        if (live.Add(definition)) pending.Enqueue(definition);
+        foreach (var instruction in instructions)
+            if (IsCyclePure(instruction) && !live.Contains(instruction))
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+            }
+    }
+
+    private static bool IsCyclePure(Instruction instruction)
+    {
+        if (instruction.Destination is not LocalVariable || !IsRemovable(instruction.OpCode)
+            || instruction.OpCode is OpCode.Divide or OpCode.Modulo) return false;
+        foreach (var operand in instruction.Operands)
+            if (operand is not (LocalVariable or Immediate or FloatLiteral or DoubleLiteral or StringLiteral)) return false;
+        return true;
     }
 
     private static Dictionary<LocalVariable, int> CountUses(ISILControlFlowGraph cfg)
@@ -97,6 +157,9 @@ public static class DeadCodeEliminator
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
                     break;
+                case AddressOf { Target: FieldReference fieldAddress } when fieldAddress.RequiresReceiver:
+                    yield return fieldAddress.Local;
+                    break;
                 case AddressOf { Target: ArrayAccess addressedElement }:
                     foreach (var used in ArrayAccessLocals(addressedElement))
                         yield return used;
@@ -131,7 +194,7 @@ public static class DeadCodeEliminator
                 or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
                 or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor
-                or OpCode.Not or OpCode.Negate=> true,
+                or OpCode.Not or OpCode.Negate or OpCode.Absolute=> true,
             >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual => true,
             _ => false
         };

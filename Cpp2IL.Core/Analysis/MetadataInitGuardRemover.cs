@@ -18,17 +18,8 @@ public static class MetadataInitGuardRemover
     private const string ClassInitActual = "il2cpp_runtime_class_init_actual";
     private const string ClassInitCodegen = "il2cpp_codegen_runtime_class_init";
 
-    // Byte holding Il2CppClass's bitfield, of which bit 0 is initialized_and_no_error.
-    // TODO this is almost certainly not correct on every version... but which?
-    private const long InitialisedFlagOffset64 = 0x135;
-    private const long InitialisedFlagOffset32 = 0xBD;
-
-    // Offset of MethodInfo::rgctx_data
-    private const long MethodRgctxOffset64 = 0x38;
-    private const long MethodRgctxOffset32 = 0x1C;
-
     public static void Run(MethodAnalysisContext method)
-        => Run(method.ControlFlowGraph!, method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64);
+        => Run(method.ControlFlowGraph!, RuntimeMetadataLayout.For(method).InitializedFlag);
 
     // Rewrite any metadata init calls we didn't remove into movs.
     public static void RewriteUnguardedInits(MethodAnalysisContext method)
@@ -47,7 +38,7 @@ public static class MetadataInitGuardRemover
     public static void RunRgctx(MethodAnalysisContext method)
     {
         var cfg = method.ControlFlowGraph!;
-        var rgctxOffset = method.AppContext.Binary.is32Bit ? MethodRgctxOffset32 : MethodRgctxOffset64;
+        var rgctxOffset = RuntimeMetadataLayout.For(method).MethodRgctx;
 
         var removedAny = false;
 
@@ -93,17 +84,31 @@ public static class MetadataInitGuardRemover
         foreach (var guard in cfg.Blocks.ToList())
             removedAny |= TryRemoveGuard(cfg, guard, initialisedFlagOffset);
 
-        removedAny |= RemoveBareClassInitCalls(cfg);
+        // Keep the identity of positively resolved init calls after nopping them.
+        // Removing their arguments can make an otherwise blocking phi dead; a
+        // second region pass must not lose the proof or mistake arbitrary nops
+        // for initialization machinery.
+        var removedClassInits = RemoveBareClassInitCalls(cfg);
+        removedAny |= removedClassInits.Count != 0;
 
         if (removedAny)
             DeadCodeEliminator.Run(cfg);
+
+        if (removedClassInits.Count != 0)
+        {
+            var removedGuards = false;
+            foreach (var guard in cfg.Blocks.ToList())
+                removedGuards |= TryRemoveGuard(cfg, guard, initialisedFlagOffset, removedClassInits);
+            if (removedGuards)
+                DeadCodeEliminator.Run(cfg);
+        }
     }
 
     // wasm keeps the initialized-flag check inside the class-init function, so callers make bare unguarded
     // calls with no region to excise (just drop the call)
-    private static bool RemoveBareClassInitCalls(ISILControlFlowGraph cfg)
+    private static HashSet<Instruction> RemoveBareClassInitCalls(ISILControlFlowGraph cfg)
     {
-        var removedAny = false;
+        var removedCalls = new HashSet<Instruction>();
 
         foreach (var block in cfg.Blocks)
         {
@@ -113,16 +118,17 @@ public static class MetadataInitGuardRemover
                     || instruction.Operands[0] is not StringLiteral { Value: ClassInitExport or ClassInitActual or ClassInitCodegen })
                     continue;
 
+                removedCalls.Add(instruction);
                 instruction.OpCode = OpCode.Nop;
                 instruction.SetOperands();
-                removedAny = true;
             }
         }
 
-        return removedAny;
+        return removedCalls;
     }
 
-    private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset)
+    private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset,
+        HashSet<Instruction>? removedClassInits = null)
     {
         if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
@@ -131,33 +137,76 @@ public static class MetadataInitGuardRemover
         // see if we're checking Il2CppClass::initialized_and_no_error
         // that means this is runtime_init boilerplate and we can drop the block
         var initialisedFlagTest = guard.Instructions.Any(i => i.OpCode == OpCode.And
-            && i.Operands is [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable } flag, { } mask]
-            && flag.Addend == initialisedFlagOffset && IsOne(mask));
+            && i.Operands is [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable klass } flag, { } mask]
+            && flag.Addend == initialisedFlagOffset && IsOne(mask) && IsRuntimeClassPointer(cfg, klass));
 
         // Either successor could be the init entry; the other is then the merge.
         var first = guard.Successors[0];
         var second = guard.Successors[1];
 
-        return TryExcise(cfg, guard, first, second, initialisedFlagTest)
-            || TryExcise(cfg, guard, second, first, initialisedFlagTest);
+        return TryExcise(cfg, guard, first, second, initialisedFlagTest, removedClassInits)
+            || TryExcise(cfg, guard, second, first, initialisedFlagTest, removedClassInits);
     }
 
     private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
 
-    private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, bool initialisedFlagTest)
+    private static bool IsRuntimeClassPointer(ISILControlFlowGraph cfg, LocalVariable local)
+    {
+        var seen = new HashSet<LocalVariable>();
+        while (seen.Add(local))
+        {
+            if (local.Type is RuntimeClassTypeAnalysisContext)
+                return true;
+            var definitions = cfg.Instructions.Where(i => ReferenceEquals(i.Destination, local)).ToList();
+            if (definitions.Count != 1 || definitions[0] is not { OpCode: OpCode.Move, Operands: [_, var source] })
+                return false;
+            if (source is TypeAnalysisContext and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext))
+                return true;
+            if (source is not LocalVariable copy)
+                return false;
+            local = copy;
+        }
+        return false;
+    }
+
+    private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, bool initialisedFlagTest,
+        HashSet<Instruction>? removedClassInits = null)
     {
         if (merge == cfg.EntryBlock || merge == cfg.ExitBlock)
             return false;
 
-        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region))
+        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region, removedClassInits))
             return false;
+
+        // Retry only after dead init arguments have been collected. A live
+        // branch-defined value (including a merge phi input) must not be lost.
+        if (removedClassInits != null)
+        {
+            var definitions = region.SelectMany(b => b.Instructions)
+                .Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
+            if (cfg.Blocks.Where(b => !region.Contains(b)).SelectMany(b => b.Instructions)
+                .Any(i => i.Operands.Any(o => !(o is LocalVariable && ReferenceEquals(o, i.Destination))
+                    && ReferencesDefinition(o, definitions))))
+                return false;
+        }
 
         Excise(cfg, guard, initEntry, merge, region);
         return true;
     }
 
+    private static bool ReferencesDefinition(IOperand? operand, HashSet<LocalVariable> definitions) => operand switch
+    {
+        LocalVariable local => definitions.Contains(local),
+        MemoryOperand memory => ReferencesDefinition(memory.Base, definitions) || ReferencesDefinition(memory.Index, definitions),
+        AddressOf address => ReferencesDefinition(address.Target, definitions),
+        ArrayAccess access => definitions.Contains(access.Array) || ReferencesDefinition(access.Index, definitions),
+        ArrayLength length => definitions.Contains(length.Array),
+        FieldReference field => definitions.Contains(field.Local) || ReferencesDefinition(field.Parent, definitions),
+        _ => false,
+    };
+
     private static bool TryCollectRegion(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
-        bool initialisedFlagTest, out HashSet<Block> region)
+        bool initialisedFlagTest, out HashSet<Block> region, HashSet<Instruction>? removedClassInits = null)
     {
         region = [];
 
@@ -189,7 +238,7 @@ public static class MetadataInitGuardRemover
             if (!region.Add(block))
                 continue;
 
-            if (!ClassifyBlock(block, initialisedFlagTest, ref sawMetadataInit, ref sawClassInit, ref sawFlagStore))
+            if (!ClassifyBlock(block, initialisedFlagTest, ref sawMetadataInit, ref sawClassInit, ref sawFlagStore, removedClassInits))
                 return false;
 
             foreach (var successor in block.Successors)
@@ -214,18 +263,23 @@ public static class MetadataInitGuardRemover
     // A region block is acceptable only if every instruction is intra-region control flow, an init
     // call, the flag store, or otherwise side-effect-free (writes a local, not memory). A managed call
     // or any other store would have an effect we cannot silently drop, so it disqualifies the region.
-    private static bool ClassifyBlock(Block block, bool initialisedFlagTest, ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore)
+    private static bool ClassifyBlock(Block block, bool initialisedFlagTest, ref bool sawMetadataInit, ref bool sawClassInit,
+        ref bool sawFlagStore, HashSet<Instruction>? removedClassInits = null)
     {
         foreach (var instruction in block.Instructions)
         {
             switch (instruction.OpCode)
             {
+                case OpCode.Nop when removedClassInits?.Contains(instruction) == true:
+                    sawClassInit = true;
+                    break;
                 case OpCode.Jump:
+                case OpCode.ConditionalJump:
                     break;
 
                 // Behind an initialized_and_no_error test the callee is the class initializer, even if we didn't resolve it.
                 // If we didn't, that's fine, just skip.
-                case OpCode.Call or OpCode.CallVoid when initialisedFlagTest:
+                case OpCode.Call or OpCode.CallVoid when initialisedFlagTest && removedClassInits == null:
                     sawClassInit = true;
                     break;
 
@@ -243,6 +297,10 @@ public static class MetadataInitGuardRemover
                     break;
 
                 case OpCode.Move when instruction.Operands is [MemoryOperand { IsConstant: true }, _]:
+                    // A retry is justified only by known class-init calls, not
+                    // by guessing that arbitrary absolute stores are metadata flags.
+                    if (removedClassInits != null)
+                        return false;
                     sawFlagStore = true;
                     break;
 

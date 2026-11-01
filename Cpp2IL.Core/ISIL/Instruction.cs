@@ -20,16 +20,116 @@ public class Instruction : IOperand
                 return;
 
             field = value;
+            _arm64IndirectArgumentSnapshot = null;
+            _arm64DirectArgumentSnapshot = null;
             ResetSources();
         }
     }
 
     private List<IOperand> _operands;
 
+    // Ordered physical argument slots are established ONLY on a raw ARM64
+    // BR/BLR snapshot. SSA may substitute a value from another register into
+    // an existing slot; that does not change the slot's physical position.
+    // Keep a storage witness too: externally aliased constructor lists cannot
+    // silently reorder a previously certified snapshot.
+    private IOperand[]? _arm64IndirectArgumentSnapshot;
+    private IOperand[]? _arm64DirectArgumentSnapshot;
+
+    // Direct unmanaged BL calls have the same ordered X0..X7/V0..V7
+    // storage contract. Record it in the lifter before SSA substitutes values.
+    internal bool HasArm64DirectArgumentSnapshot
+    {
+        get
+        {
+            if (OpCode != OpCode.Call || NativeDirectCallTarget == 0
+                || _operands.Count != 18 || _arm64DirectArgumentSnapshot is not { Length: 18 } witness
+                || _operands[0] is not Immediate target || target.UnsignedValue != NativeDirectCallTarget) return false;
+            for (var i = 0; i < 18; i++)
+                if (!ReferenceEquals(_operands[i], witness[i])) return false;
+            return true;
+        }
+    }
+
+    internal bool MarkArm64DirectArgumentSnapshot()
+    {
+        _arm64DirectArgumentSnapshot = null;
+        if (OpCode != OpCode.Call || NativeDirectCallTarget == 0 || _operands.Count != 18
+            || _operands[0] is not Immediate target || target.UnsignedValue != NativeDirectCallTarget
+            || _operands[1] is not Register { Name: "X0" }) return false;
+        for (var i = 0; i < 16; i++)
+            if (_operands[2 + i] is not Register r
+                || r.Name != (i < 8 ? "X" + i : "V" + (i - 8))) return false;
+        _arm64DirectArgumentSnapshot = _operands.ToArray();
+        return true;
+    }
+
+    internal bool HasArm64IndirectArgumentSnapshot
+    {
+        get
+        {
+            if (OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump)
+                || _arm64IndirectArgumentSnapshot is not { Length: 18 } witness
+                || _operands.Count != 18) return false;
+            for (var i = 0; i < 18; i++)
+                if (!ReferenceEquals(_operands[i], witness[i])) return false;
+            return true;
+        }
+    }
+
+    internal bool MarkArm64IndirectArgumentSnapshot()
+    {
+        _arm64IndirectArgumentSnapshot = null;
+        if (OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump) || _operands.Count != 18)
+            return false;
+        for (var i = 0; i < 16; i++)
+            if (_operands[2 + i] is not Register r
+                || r.Name != (i < 8 ? "X" + i : "V" + (i - 8))) return false;
+        _arm64IndirectArgumentSnapshot = _operands.ToArray();
+        return true;
+    }
+
     public OperandList Operands => new(_operands);
 
     // Exists to clear the return register after a CallVoid, basically.
     public Register? ImplicitDefinition;
+    // Proven byte width of a lifted native store; zero means unknown.
+    public int NativeWriteSize;
+    // Proven native memory read width; destination register size can differ (LDRSW).
+    public int NativeReadSize;
+    // Proven width of a lifted integer arithmetic/shift result, not an inferred pointer/type.
+    public int NativeArithmeticSize;
+    // Original multiply input width/sign, retained without hiding affine
+    // address expressions behind scalar casts before array/field recovery.
+    public int NativeMultiplyInputSize;
+    public bool NativeMultiplySigned;
+    // Width of an unmodified native register/address copy; extensions are not copies.
+    public int NativeRegisterCopySize;
+    // Scalar floating result width proven by S/D operands, not inferred from a
+    // reused V register or from the eventual managed destination type.
+    public int NativeFloatingPointSize;
+    // Signedness is part of the comparison, not inferred from a C# type name.
+    public bool UnsignedComparison;
+    // Proven native INTEGER comparison operand width; not the boolean result
+    // width or an inferred managed signedness. Zero means unknown.
+    public int NativeComparisonSize;
+    // Integer extension reads a low-bit VIEW of a GPR. Its conversion source
+    // type must not retag the entire producer local (which may have X users).
+    public bool NativeIntegerSourceView;
+    // Width proven zero by native initialization or contiguous effect-free stack zero stores (not a scalar guess).
+    public int NativeZeroSize;
+    // Proven vtable/interface dispatch, distinct from a direct call to a virtual
+    // method (e.g. base.Method). Preserve that distinction in managed IL.
+    public bool NativeVirtualDispatch;
+    // A separately proven native null guard is carried by CIL callvirt on a
+    // NONvirtual method. This does not claim vtable or interface dispatch.
+    public bool NativeNullCheckedCall;
+    // Original direct native entry, captured before metadata replaces the raw
+    // call operand. Not inferred from a generic definition's boxed wrapper.
+    public ulong NativeDirectCallTarget;
+    // Exact pre-SSA result-storage extent, proved by unanimous native ABI or
+    // the call's own reaching MethodInfo and registered native entry.
+    public int NativeReturnStorageSize;
 
     public bool IsFallThrough =>
         OpCode switch
@@ -59,24 +159,36 @@ public class Instruction : IOperand
     [MemberNotNull(nameof(_operands))]
     public void SetOperands(params List<IOperand> operands)
     {
+        _arm64IndirectArgumentSnapshot = null;
+        _arm64DirectArgumentSnapshot = null;
         _operands = operands;
         ResetSources();
     }
 
     public void SetOperand(int index, IOperand value)
     {
+        var preserveSnapshot = HasArm64IndirectArgumentSnapshot;
+        var preserveDirectSnapshot = HasArm64DirectArgumentSnapshot;
         _operands[index] = value;
+        if (preserveSnapshot) _arm64IndirectArgumentSnapshot![index] = value;
+        else _arm64IndirectArgumentSnapshot = null;
+        if (preserveDirectSnapshot) _arm64DirectArgumentSnapshot![index] = value;
+        else _arm64DirectArgumentSnapshot = null;
         ResetSources();
     }
 
     public void AddOperands(IEnumerable<IOperand> operands)
     {
+        _arm64IndirectArgumentSnapshot = null;
+        _arm64DirectArgumentSnapshot = null;
         _operands.AddRange(operands);
         ResetSources();
     }
 
     public void RemoveOperandAt(int index)
     {
+        _arm64IndirectArgumentSnapshot = null;
+        _arm64DirectArgumentSnapshot = null;
         _operands.RemoveAt(index);
         ResetSources();
     }
@@ -100,11 +212,13 @@ public class Instruction : IOperand
             case OpCode.Modulo:
             case OpCode.ShiftLeft:
             case OpCode.ShiftRight:
+            case OpCode.ShiftRightUnsigned:
             case OpCode.And:
             case OpCode.Or:
             case OpCode.Xor:
             case OpCode.Not:
             case OpCode.Negate:
+            case OpCode.Absolute:
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
             case OpCode.CheckLess:
@@ -112,7 +226,15 @@ public class Instruction : IOperand
             case OpCode.CheckGreaterOrEqual:
             case OpCode.CheckLessOrEqual:
             case OpCode.Newobj:
+            case OpCode.NewArr:
             case OpCode.Box:
+            case OpCode.IsInst:
+            case OpCode.CastClass:
+            case OpCode.Unbox:
+            case OpCode.UnboxAny:
+            case OpCode.NumericConvert:
+            case OpCode.LoadVirtualFunction:
+            case OpCode.NewVirtualDelegate:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -150,14 +272,18 @@ public class Instruction : IOperand
         var sources = OpCode switch
         {
             OpCode.Move or OpCode.ConditionalJump
-                or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
+                or OpCode.ShiftStack or OpCode.Not or OpCode.Negate or OpCode.Absolute
                 or OpCode.Newobj
                 => [_operands[1]],
 
-            OpCode.Box => [_operands[2]],
+            OpCode.Box or OpCode.IsInst or OpCode.CastClass or OpCode.Unbox or OpCode.UnboxAny => [_operands[2]],
+            OpCode.ArrayNullCheck => [_operands[0]],
+            OpCode.NumericConvert => [_operands[3]],
+            OpCode.LoadVirtualFunction => [_operands[2]],
+            OpCode.NewVirtualDelegate => [_operands[3]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
-                or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
+                or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 => [_operands[2], _operands[1]],
 
@@ -168,7 +294,7 @@ public class Instruction : IOperand
                 ? _operands.Skip(2).Prepend(_operands[0]).ToList()
                 : _operands.Take(1).ToList(),
 
-            OpCode.CallVoid or OpCode.Phi => _operands.Skip(1).ToList(),
+            OpCode.CallVoid or OpCode.Phi or OpCode.NewArr => _operands.Skip(1).ToList(),
             OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
                 or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
                 => [_operands[1], _operands[2]],

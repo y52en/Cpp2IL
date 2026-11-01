@@ -18,7 +18,18 @@ public static class ThrowHelperRecovery
 
     public static TypeAnalysisContext? GetThrownException(ApplicationAnalysisContext appContext, ulong address)
     {
-        var name = ResolveName(appContext, address, 0);
+        // Publish only a completed ROOT query. Provisional nulls, cycle guards
+        // and depth-limited subqueries must never become other workers' answers.
+        var name = appContext.ThrowHelperNamesByAddress.GetOrAdd(address, root => ResolveNameGraph(root, candidate =>
+        {
+            if (!appContext.InstructionSet.HasExceptionWrapperShape(appContext, candidate)) return null;
+            var (references, calls) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, candidate);
+            if (calls.Any(target => appContext.MethodsByAddress.ContainsKey(target))) return null;
+            var targets = calls.ToList();
+            var thunk = appContext.InstructionSet.GetThunkTarget(appContext, candidate);
+            if (thunk != 0 && !targets.Contains(thunk)) targets.Add(thunk);
+            return new ExceptionHelperNode(FindExceptionName(appContext, references), targets);
+        }));
 
         if (name == null)
             return null;
@@ -38,62 +49,60 @@ public static class ThrowHelperRecovery
         if (appContext.ExceptionRaisersByAddress.TryGetValue(address, out var cached))
             return cached;
 
-        var raise = appContext.GetOrCreateKeyFunctionAddresses().il2cpp_vm_exception_raise;
-
-        if (raise == 0)
+        var keys = appContext.GetOrCreateKeyFunctionAddresses();
+        var raises = new HashSet<ulong> { keys.il2cpp_raise_exception,
+            keys.il2cpp_vm_exception_raise, keys.il2cpp_codegen_raise_exception };
+        raises.Remove(0);
+        if (raises.Count == 0)
             return false;
-
-        // grab the c++ exception raise method from the end of il2cpp::vm::Exception::Raise
-        var nativeThrow = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, raise).CallTargets.LastOrDefault();
-
-        // and then check if we're calling it
-        var result = nativeThrow != 0 && ReachesCall(appContext, address, nativeThrow, 0, []);
+        // A bounded scan past a noreturn call can encounter the next function's
+        // ordinary corlib lookup. That last call is NOT evidence of throwing.
+        // Reach the positively identified raiser itself, never an inferred
+        // final callee of its surrounding byte window.
+        var result = ReachesCall(appContext, address, raises, 0, []);
 
         appContext.ExceptionRaisersByAddress[address] = result;
         return result;
     }
 
-    private static bool ReachesCall(ApplicationAnalysisContext appContext, ulong address, ulong wanted, int depth, HashSet<ulong> visited)
+    private static bool ReachesCall(ApplicationAnalysisContext appContext, ulong address, ISet<ulong> raises, int depth, HashSet<ulong> visited)
     {
-        if (address == wanted)
+        if (raises.Contains(address))
             return true;
 
-        if (depth >= MaxRaiserDepth || !visited.Add(address))
+        if (depth >= MaxRaiserDepth || !visited.Add(address)
+            || !appContext.InstructionSet.HasExceptionWrapperShape(appContext, address))
             return false;
 
         var (_, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
 
-        return callTargets.Any(target => ReachesCall(appContext, target, wanted, depth + 1, visited));
+        // Only the last transport call can establish an unconditional raise.
+        // A function which merely calls a throwing routine along some path is not a raiser.
+        var last = callTargets.LastOrDefault();
+        var thunk = appContext.InstructionSet.GetThunkTarget(appContext, address);
+        return (thunk != 0 && ReachesCall(appContext, thunk, raises, depth + 1, visited))
+            || (last != 0 && ReachesCall(appContext, last, raises, depth + 1, visited));
     }
 
-    private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address, int depth)
+    internal readonly record struct ExceptionHelperNode(string? Name, IReadOnlyList<ulong> Targets);
+
+    internal static string? ResolveNameGraph(ulong root, Func<ulong, ExceptionHelperNode?> inspect)
     {
-        if (appContext.ThrowHelperNamesByAddress.TryGetValue(address, out var cached))
-            return cached;
-
-        if (address == 0 || depth >= MaxDepth)
-            return null;
-
-        // Insert before recursing so a cycle terminates
-        appContext.ThrowHelperNamesByAddress[address] = null;
-
-        var (dataReferences, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
-
-        var name = FindExceptionName(appContext, dataReferences);
-
-        if (name == null)
+        var path = new HashSet<ulong>();
+        return Walk(root, 0);
+        string? Walk(ulong address, int depth)
         {
-            foreach (var target in callTargets)
+            if (address == 0 || depth >= MaxDepth || !path.Add(address)) return null;
+            try
             {
-                name = ResolveName(appContext, target, depth + 1);
-
-                if (name != null)
-                    break;
+                if (inspect(address) is not { } node) return null;
+                if (node.Name != null) return node.Name;
+                foreach (var target in node.Targets)
+                    if (Walk(target, depth + 1) is { } name) return name;
+                return null;
             }
+            finally { path.Remove(address); }
         }
-
-        appContext.ThrowHelperNamesByAddress[address] = name;
-        return name;
     }
 
     private static string? FindExceptionName(ApplicationAnalysisContext appContext, IReadOnlyList<ulong> dataReferences)

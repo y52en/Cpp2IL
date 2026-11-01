@@ -86,7 +86,10 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
     protected override ulong GetObjectIsInstFromSystemType()
     {
         Logger.Verbose("\tTrying to use System.Type::IsInstanceOfType to find il2cpp::vm::Object::IsInst...");
-        var typeIsInstanceOfType = ReflectionCache.GetType("Type", "System")?.Methods?.FirstOrDefault(m => m.Name == "IsInstanceOfType");
+        // In Mono-based Unity (including 2018), System.Type is managed/virtual.
+        // The native icall lives behind RuntimeTypeHandle's static wrapper.
+        var typeIsInstanceOfType = ReflectionCache.GetType("RuntimeTypeHandle", "System")?.Methods?.FirstOrDefault(m => m.Name == "IsInstanceOfType" && m.Parameters?.Length == 2)
+            ?? ReflectionCache.GetType("Type", "System")?.Methods?.FirstOrDefault(m => m.Name == "IsInstanceOfType");
         if (typeIsInstanceOfType == null)
         {
             Logger.VerboseNewline("Type or method not found, aborting.");
@@ -101,16 +104,37 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         Logger.Verbose($"IsInstanceOfType found at 0x{typeIsInstanceOfType.MethodPointer:X}...");
         var instructions = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(_appContext, typeIsInstanceOfType.MethodPointer, false);
 
-        var lastCall = instructions.LastOrDefault(i => i.Mnemonic == Arm64Mnemonic.BL);
+        // An icall wrapper may be a single unconditional tail branch. Follow
+        // only that exact thunk, not arbitrary application calls or branches.
+        var visited = new HashSet<ulong> { typeIsInstanceOfType.MethodPointer };
+        for (var depth = 0; depth < 8 && instructions.Count == 1 && instructions[0].Mnemonic == Arm64Mnemonic.B
+            && instructions[0].MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL; depth++)
+        {
+            if (!visited.Add(instructions[0].BranchTarget))
+                return 0;
+            instructions = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(_appContext, instructions[0].BranchTarget, false);
+        }
 
-        if (lastCall.Mnemonic == Arm64Mnemonic.INVALID)
+        var target = FindIsInstAnchorCall(instructions);
+        if (target == 0)
         {
             Logger.VerboseNewline("Method does not match expected signature. Aborting.");
             return 0;
         }
 
-        Logger.VerboseNewline($"Success. IsInst found at 0x{lastCall.BranchTarget:X}");
-        return lastCall.BranchTarget;
+        Logger.VerboseNewline($"Success. IsInst found at 0x{target:X}");
+        return target;
+    }
+
+    internal static ulong FindIsInstAnchorCall(IEnumerable<Arm64Instruction> instructions)
+    {
+        // The unmanaged-body reader can include bytes beyond a RET. Never
+        // select a call from the adjacent function as this icall's helper.
+        var body = instructions.TakeWhile(i => i.Mnemonic is not (Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB)).ToList();
+        if (body.Any(i => i.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BR or Arm64Mnemonic.BLR
+            or Arm64Mnemonic.CBZ or Arm64Mnemonic.CBNZ or Arm64Mnemonic.TBZ or Arm64Mnemonic.TBNZ))
+            return 0;
+        return body.LastOrDefault(i => i.Mnemonic == Arm64Mnemonic.BL).BranchTarget;
     }
 
     protected override ulong FindFunctionThisIsAThunkOf(ulong thunkPtr, bool prioritiseCall = false)
